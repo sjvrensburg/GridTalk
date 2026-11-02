@@ -5,8 +5,8 @@
 [inference]
 # "local" (default, nothing leaves your PC) or "openai-compatible"
 backend = "local"
-# Local engine ladder: "candle" | "mistralrs" | "llamacpp"
-engine = "candle"
-# model_path = "/home/you/.cache/gridtalk/models/SmolLM2-135M-Instruct.Q4_K_M.gguf"  # llama-arch GGUF; Qwen3-MoE needs the mistral.rs rung
+# The only local engine is llama.cpp over Vulkan.
+engine = "llamacpp"
+# model_path = "/home/you/.cache/gridtalk/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"  # any GGUF, incl. MoE
 # base_url = "http://127.0.0.1:11434/v1"   # external backend / redacting proxy
 # api_key_env = "GRIDTALK_API_KEY"

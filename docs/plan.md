@@ -81,3 +81,11 @@ with a version gate). Remaining known limits are unchanged and
 documented: mistral.rs / llama-cpp rungs not yet compiled in,
 Qwen3-MoE rejected by candle with a typed error, and the release
 workflow first exercised on a `v*` tag.
+
+## Single-engine pivot (feat/llama-cpp-vulkan, decision 0004)
+
+- [x] Local inference is llama.cpp over Vulkan only; candle and
+  mistral.rs backends and the engine ladder are removed
+- [x] Qwen3-30B-A3B MoE generates locally (~9.7 tok/s incl. load)
+- [x] Platforms: Linux + Windows; macOS dropped from CI/release
+- [ ] llama.cpp GPU-layer/context settings exposed in the UI

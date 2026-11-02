@@ -248,62 +248,46 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "generate" => {
-            #[cfg(feature = "candle-gen")]
-            {
-                let model = args
-                    .get(2)
-                    .ok_or("usage: gridtalk generate <model.gguf> <tokenizer.json> <prompt...>")?;
-                let tokenizer = args.get(3).ok_or("missing tokenizer.json path")?;
-                let prompt = args[4..].join(" ");
-                if prompt.trim().is_empty() {
-                    return Err("usage: gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (prompt must not be empty)".into());
-                }
-                let backend = gridtalk_infer::generate::CandleLlamaBackend {
-                    model_path: std::path::PathBuf::from(model),
-                    tokenizer_path: std::path::PathBuf::from(tokenizer),
-                    seed: 42,
-                    temperature: 0.7,
-                };
-                let req = ChatRequest {
-                    system: "You are a helpful spreadsheet assistant.".into(),
-                    user: prompt,
-                    max_tokens: 48,
-                };
-                let cancel = Arc::new(AtomicBool::new(false));
-                let stats = backend
-                    .generate_with_stats(&req, &cancel, &mut |t| print!("{t}"))
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "\n\n[bench] prompt_tokens={} generated={} first_token_ms={:?} total_ms={:.0} tok/s={:.1}",
-                    stats.prompt_tokens,
-                    stats.generated_tokens,
-                    stats.first_token_ms.map(|v| (v * 10.0).round() / 10.0),
-                    stats.total_ms,
-                    stats.tokens_per_sec
-                );
-                Ok(())
-            }
-            #[cfg(not(feature = "candle-gen"))]
-            {
-                Err(
-                    "generate requires a candle-gen build: cargo run -p gridtalk-app --features candle-gen -- generate ..."
+            let model = args
+                .get(2)
+                .ok_or("usage: gridtalk generate <model.gguf> <prompt...>")?;
+            let prompt = args[3..].join(" ");
+            if prompt.trim().is_empty() {
+                return Err(
+                    "usage: gridtalk generate <model.gguf> <prompt...> (prompt must not be empty)"
                         .into(),
-                )
+                );
             }
+            let backend = gridtalk_infer::llama_backend::LlamaCppBackend {
+                model_path: std::path::PathBuf::from(model),
+                ..gridtalk_infer::llama_backend::LlamaCppBackend::default()
+            };
+            let req = ChatRequest {
+                system: "You are a helpful spreadsheet assistant.".into(),
+                user: prompt,
+                max_tokens: 128,
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stats = backend
+                .generate_with_stats(&req, &cancel, &mut |tok| print!("{tok}"))
+                .map_err(|e| e.to_string())?;
+            println!(
+                "\n\n[bench] llama.cpp/Vulkan prompt_tokens={} generated={} first_token_ms={:?} total_ms={:.0} tok/s={:.1}",
+                stats.prompt_tokens,
+                stats.generated_tokens,
+                stats.first_token_ms.map(|v| (v * 10.0).round() / 10.0),
+                stats.total_ms,
+                stats.tokens_per_sec
+            );
+            Ok(())
         }
         "spike" => {
             let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
-            for report in gridtalk_infer::probe::probe_ladder(std::path::Path::new(file)) {
-                println!(
-                    "{:?}: compiled_in={} loads={} arch={:?} tensors={:?} — {}",
-                    report.engine,
-                    report.compiled_in,
-                    report.loads,
-                    report.gguf_arch,
-                    report.tensor_count,
-                    report.detail
-                );
-            }
+            let report = gridtalk_infer::probe::probe_model(std::path::Path::new(file));
+            println!(
+                "{}: loads={} arch={:?} tensors={:?} — {}",
+                report.engine, report.loads, report.gguf_arch, report.tensor_count, report.detail
+            );
             Ok(())
         }
         "models" => {
@@ -352,7 +336,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (candle-gen builds)\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),
