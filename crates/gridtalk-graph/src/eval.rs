@@ -49,7 +49,7 @@ pub fn eval_cell_in_workbook(
     let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
     let idx = sheets
         .iter()
-        .position(|s| s.name.eq_ignore_ascii_case(sheet_name))
+        .position(|s| crate::sheet_name_eq(&s.name, sheet_name))
         .ok_or_else(|| EvalError::Ref(format!("unknown sheet {sheet_name}")))?;
     let mut state = EvalState::default();
     eval_cell_inner(&sheets, idx, row, col, &mut state, 0)
@@ -460,7 +460,7 @@ impl<'a> Parser<'a> {
         let idx = self
             .sheets
             .iter()
-            .position(|s| s.name.eq_ignore_ascii_case(&name))?;
+            .position(|s| crate::sheet_name_eq(&s.name, &name))?;
         Some((idx, i + 1))
     }
 
@@ -555,6 +555,137 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn collect_range(
+        &mut self,
+        values: &mut Vec<f64>,
+        sheet: usize,
+        r0: usize,
+        c0: usize,
+        r1: usize,
+        c1: usize,
+    ) -> Result<(), EvalError> {
+        for r in r0.min(r1)..=r0.max(r1) {
+            for c in c0.min(c1)..=c0.max(c1) {
+                if let Some((os, orow, ocol, value)) = self.state.override_cell {
+                    if (os, orow, ocol) == (sheet, r, c) {
+                        values.push(value);
+                        continue;
+                    }
+                }
+                let cell = self.sheets[sheet].get_ref(r, c);
+                if matches!(
+                    cell,
+                    CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
+                ) {
+                    continue;
+                }
+                values.push(eval_cell_inner(
+                    self.sheets,
+                    sheet,
+                    r,
+                    c,
+                    self.state,
+                    self.depth + 1,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whole-column (A:A) / whole-row (1:1) range at the current
+    /// position, bounded to the target sheet's used extents.
+    /// Consumes the token on success; restores position otherwise.
+    fn try_whole_range(&mut self) -> Option<(usize, usize, usize, usize, usize)> {
+        let save = self.pos;
+        let mut target = self.sheet_idx;
+        if matches!(self.peek(), Some('\''))
+            || matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_')
+        {
+            if let Some((idx, next)) = self.try_sheet_qualifier() {
+                target = idx;
+                self.pos = next;
+            }
+        }
+        let sheet = self.sheets[target];
+        let col_of = |letters: &str| -> Option<usize> {
+            let mut col = 0usize;
+            for c in letters.to_ascii_uppercase().chars() {
+                if !c.is_ascii_alphabetic() {
+                    return None;
+                }
+                col = col
+                    .checked_mul(26)?
+                    .checked_add(c as usize - 'A' as usize + 1)?;
+            }
+            if col == 0 || col > 16_384 {
+                return None;
+            }
+            Some(col - 1)
+        };
+        let take_letters = |p: &mut Self| -> String {
+            let st = p.pos;
+            if p.peek() == Some('$') {
+                p.bump();
+            }
+            while matches!(p.peek(), Some(c) if c.is_ascii_alphabetic()) {
+                p.bump();
+            }
+            p.chars[st..p.pos]
+                .iter()
+                .collect::<String>()
+                .replace('$', "")
+        };
+        let take_digits = |p: &mut Self| -> String {
+            let st = p.pos;
+            if p.peek() == Some('$') {
+                p.bump();
+            }
+            while matches!(p.peek(), Some(c) if c.is_ascii_digit()) {
+                p.bump();
+            }
+            p.chars[st..p.pos]
+                .iter()
+                .collect::<String>()
+                .replace('$', "")
+        };
+        // Column form: AA:BB
+        let after_qual = self.pos;
+        let first = take_letters(self);
+        if !first.is_empty() && self.peek() == Some(':') {
+            self.bump();
+            // An end qualifier, if present, must match (skip it
+            // syntactically; the start sheet governs).
+            if let Some((_, next)) = self.try_sheet_qualifier() {
+                self.pos = next;
+            }
+            let second = take_letters(self);
+            if let (Some(c0), Some(c1)) = (col_of(&first), col_of(&second)) {
+                if !sheet.cells.is_empty() {
+                    return Some((target, 0, c0, sheet.cells.len() - 1, c1));
+                }
+            }
+            self.pos = save;
+            return None;
+        }
+        // Row form: 1:3
+        self.pos = after_qual;
+        let first = take_digits(self);
+        if !first.is_empty() && self.peek() == Some(':') {
+            self.bump();
+            if let Some((_, next)) = self.try_sheet_qualifier() {
+                self.pos = next;
+            }
+            let second = take_digits(self);
+            if let (Ok(r0), Ok(r1)) = (first.parse::<usize>(), second.parse::<usize>()) {
+                if r0 >= 1 && r1 >= 1 && r0 <= 1_048_576 && r1 <= 1_048_576 && sheet.max_col() > 0 {
+                    return Some((target, r0 - 1, 0, r1 - 1, sheet.max_col() - 1));
+                }
+            }
+        }
+        self.pos = save;
+        None
+    }
+
     fn parse_function(&mut self, name: &str) -> Result<f64, EvalError> {
         // Unsupported names fail BEFORE any argument is evaluated,
         // so an argument error cannot mask the cached-value
@@ -567,8 +698,12 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             let save = self.pos;
-            // Try range A1:B9 first.
-            if let Ok((t0, r0, c0, _)) = self.parse_ref_token() {
+            // Whole-column/row ranges (A:A, 1:1) bounded to the
+            // sheet's used extents.
+            if let Some((t, r0, c0, r1, c1)) = self.try_whole_range() {
+                self.collect_range(&mut values, t, r0, c0, r1, c1)?;
+            // Try range A1:B9 next.
+            } else if let Ok((t0, r0, c0, _)) = self.parse_ref_token() {
                 self.skip_ws();
                 if self.peek() == Some(':') {
                     self.bump();
@@ -589,39 +724,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     let range_sheet = t0;
-                    for r in r0.min(r1)..=r0.max(r1) {
-                        for c in c0.min(c1)..=c0.max(c1) {
-                            // Excel semantics: aggregates ignore empty
-                            // and text cells in ranges, but formula
-                            // errors (e.g. #DIV/0!) propagate.
-                            // A simulated override wins over the
-                            // stored cell, whatever its type.
-                            if let Some((os, orow, ocol, value)) = self.state.override_cell {
-                                if (os, orow, ocol) == (range_sheet, r, c) {
-                                    values.push(value);
-                                    continue;
-                                }
-                            }
-                            // Borrowed access: cloning every
-                            // cell (incl. long Text) just to
-                            // discard most of them is wasteful.
-                            let cell = self.sheets[range_sheet].get_ref(r, c);
-                            if matches!(
-                                cell,
-                                CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
-                            ) {
-                                continue;
-                            }
-                            values.push(eval_cell_inner(
-                                self.sheets,
-                                range_sheet,
-                                r,
-                                c,
-                                self.state,
-                                self.depth + 1,
-                            )?);
-                        }
-                    }
+                    self.collect_range(&mut values, range_sheet, r0, c0, r1, c1)?;
                 } else {
                     self.pos = save;
                     self.push_scalar(&mut values)?;
@@ -650,16 +753,21 @@ impl<'a> Parser<'a> {
                     Ok(values.iter().sum::<f64>() / values.len() as f64)
                 }
             }
-            "MIN" => values
+            // Excel returns 0 for MIN/MAX over no numbers.
+            "MIN" => Ok(values
                 .iter()
                 .copied()
-                .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.min(v))))
-                .ok_or_else(|| EvalError::Type("MIN of nothing".into())),
-            "MAX" => values
+                .fold(None, |a: Option<f64>, v| {
+                    Some(a.map_or(v, |x: f64| x.min(v)))
+                })
+                .unwrap_or(0.0)),
+            "MAX" => Ok(values
                 .iter()
                 .copied()
-                .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.max(v))))
-                .ok_or_else(|| EvalError::Type("MAX of nothing".into())),
+                .fold(None, |a: Option<f64>, v| {
+                    Some(a.map_or(v, |x: f64| x.max(v)))
+                })
+                .unwrap_or(0.0)),
             "COUNT" => Ok(values.len() as f64),
             other => Err(EvalError::Parse(format!("unsupported function {other}"))),
         }
@@ -688,7 +796,7 @@ pub fn eval_cell_with_override(
     let find = |name: &str| {
         sheets
             .iter()
-            .position(|s| s.name.eq_ignore_ascii_case(name))
+            .position(|s| crate::sheet_name_eq(&s.name, name))
             .ok_or_else(|| EvalError::Ref(format!("unknown sheet {name}")))
     };
     let mut state = EvalState {
@@ -726,7 +834,7 @@ pub fn eval_many_in_workbook(
     let Some(idx) = wb
         .sheets
         .iter()
-        .position(|s| s.name.eq_ignore_ascii_case(sheet_name))
+        .position(|s| crate::sheet_name_eq(&s.name, sheet_name))
     else {
         return coords
             .iter()
@@ -759,7 +867,11 @@ pub fn what_if_in_workbook(
                 "what-if coordinates beyond the evaluation grid on {sheet}"
             )));
         }
-        if !wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(sheet)) {
+        if !wb
+            .sheets
+            .iter()
+            .any(|s| crate::sheet_name_eq(&s.name, sheet))
+        {
             return Err(EvalError::Ref(format!("unknown sheet {sheet}")));
         }
     }
@@ -922,6 +1034,10 @@ mod tests {
         assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 42.0);
         let wb = parse_delimited("d", "S", "A\n=TRUE()+FALSE()\n", ',');
         assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 1.0);
+        // Whole-column ranges and empty MIN.
+        let wb = parse_delimited("d", "S", "A,B\n1,=SUM(A:A)\n2,=MIN(C1)\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 3.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 2, 1).unwrap(), 0.0);
         // Long dependency chains: 120 cells deep, no depth error.
         let mut csv = String::from("A\n1\n");
         for i in 3..=121 {

@@ -184,6 +184,50 @@ fn connect_timeout(host_port: &str) -> Result<std::net::TcpStream, InferError> {
     Err(last.unwrap_or_else(|| InferError::Http(format!("cannot resolve {host_port}"))))
 }
 
+/// True when `body` contains a complete chunked message: walks
+/// real chunk boundaries (size lines at chunk offsets) and
+/// accepts a terminal 0-chunk with optional trailers.
+fn chunked_complete(body: &[u8]) -> bool {
+    let mut rest = body;
+    loop {
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let size_str = String::from_utf8_lossy(&rest[..line_end]);
+        let Ok(size) = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        let after = &rest[line_end + 2..];
+        if size == 0 {
+            // Terminal chunk: complete once the trailer section
+            // ends with an empty line.
+            return after == b"\r\n" || after.windows(4).any(|w| w == b"\r\n\r\n");
+        }
+        let Some(need) = size.checked_add(2) else {
+            return false;
+        };
+        if after.len() < need {
+            return false;
+        }
+        rest = &after[need..];
+    }
+}
+
+/// Transfer-Encoding contains a `chunked` token (any spacing/case,
+/// possibly `gzip, chunked`).
+fn is_chunked(head: &str) -> bool {
+    head.lines().any(|l| {
+        let Some((name, value)) = l.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
 fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -201,11 +245,15 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
         if size == 0 {
             return Ok(out);
         }
-        if rest.len() < size + 2 {
+        let need = size
+            .checked_add(2)
+            .filter(|n| *n <= 16 * 1024 * 1024 + 2)
+            .ok_or_else(|| InferError::Http(format!("chunk size {size} exceeds cap")))?;
+        if rest.len() < need {
             return Err(InferError::Http("truncated chunk".into()));
         }
         out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
+        rest = &rest[need..];
         if out.len() > 16 * 1024 * 1024 {
             return Err(InferError::Http("response exceeds 16 MiB cap".into()));
         }
@@ -233,7 +281,8 @@ fn read_http_response(
     let mut last_progress_at = std::time::Instant::now();
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
-    let mut term_search_from = 0usize;
+    let mut chunked = false;
+    let mut header_search_from = 0usize;
     loop {
         if std::time::Instant::now() > deadline {
             return Err(InferError::Http(
@@ -277,7 +326,14 @@ fn read_http_response(
                 // Complete as soon as Content-Length bytes of body
                 // have arrived; never wait for connection close.
                 if header_end.is_none() {
-                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    // Incremental search: only new bytes + overlap.
+                    let search_from = header_search_from.min(raw.len());
+                    let found = raw[search_from..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|rel| search_from + rel);
+                    header_search_from = raw.len().saturating_sub(3);
+                    if let Some(pos) = found {
                         header_end = Some(pos + 4);
                         // The stall window measures from the last
                         // arrival, not from connect.
@@ -292,6 +348,7 @@ fn read_http_response(
                                 None
                             }
                         });
+                        chunked = is_chunked(&head);
                     }
                 }
                 if let (Some(he), Some(cl)) = (header_end, content_length) {
@@ -299,17 +356,11 @@ fn read_http_response(
                         break;
                     }
                 }
-                // Chunked bodies: the terminal 0-chunk completes the
-                // response in-loop; do not wait for EOF/stall.
+                // Chunked bodies: a chunk-aligned terminal 0-chunk
+                // (with optional trailers) completes in-loop.
                 if let Some(he) = header_end {
-                    if content_length.is_none() {
-                        // Scan only new bytes plus a 4-byte overlap
-                        // (the terminator can straddle reads).
-                        let from = term_search_from.max(he);
-                        if raw[from..].windows(5).any(|w| w == b"0\r\n\r\n") {
-                            break;
-                        }
-                        term_search_from = raw.len().saturating_sub(4).max(he);
+                    if chunked && chunked_complete(&raw[he..]) {
+                        break;
                     }
                 }
             }
@@ -374,9 +425,8 @@ fn read_http_response(
                 .collect::<String>()
         )));
     }
-    let lower = head.to_ascii_lowercase();
     let body = &raw[split + 4..];
-    let decoded = if lower.contains("transfer-encoding: chunked") {
+    let decoded = if is_chunked(&head) {
         decode_chunked(body)?
     } else {
         body.to_vec()

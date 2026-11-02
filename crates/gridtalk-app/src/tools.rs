@@ -430,7 +430,7 @@ impl<'a> Tools<'a> {
     /// parses `key=value;key=value` and renders the typed result.
     pub fn execute(&self, tool: &str, args: &str) -> String {
         let arg = |key: &str| -> Option<String> {
-            args.split(';').find_map(|kv| {
+            split_legacy_args(args).iter().find_map(|kv| {
                 let (k, v) = kv.split_once('=')?;
                 if k.trim() == key {
                     Some(v.trim().to_string())
@@ -482,6 +482,32 @@ impl<'a> Tools<'a> {
         };
         self.call(&req).text
     }
+}
+
+/// Legacy `key=value;key=value` splitting that does not split on
+/// semicolons inside single-quoted sheet names.
+fn split_legacy_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = args.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if in_quote && chars.peek() == Some(&'\'') {
+                cur.push(c);
+                cur.push(chars.next().unwrap());
+                continue;
+            }
+            in_quote = !in_quote;
+            cur.push(c);
+        } else if c == ';' && !in_quote {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
 }
 
 fn cell_json(cell: &CellValue) -> serde_json::Value {

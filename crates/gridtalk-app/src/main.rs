@@ -637,7 +637,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!(
                     "[tool] {} ({}) -> {}",
                     step.tool,
-                    step.args,
+                    // Args carry the raw question: flatten newlines
+                    // so they cannot forge citations/answer markers.
+                    step.args.replace('\n', " | "),
                     step.result.replace('\n', " | ")
                 );
             }

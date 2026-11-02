@@ -189,6 +189,16 @@ pub fn optimise_round(
             adapter,
         )
         .map_err(|e| e.to_string())?;
+        // Errored tasks (backend/tool failures folded into results
+        // by run_bench_with) contaminate accuracy: no gate decision
+        // may be made on them.
+        if let Some(failed) = report.results.iter().find(|r| r.error.is_some()) {
+            return Err(format!(
+                "scoring {split} had backend/tool errors (first: task {}: {})",
+                failed.id,
+                failed.error.as_deref().unwrap_or("")
+            ));
+        }
         let acc = report.accuracy(split);
         cache.insert(key, (acc, report.results.clone()));
         Ok((acc, report.results))

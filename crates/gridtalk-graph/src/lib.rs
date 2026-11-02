@@ -4,6 +4,14 @@
 //! to snapshots so downstream code never touches live grid cells.
 
 use serde::{Deserialize, Serialize};
+
+/// Sheet-name equality with Unicode case folding (ASCII-only
+/// folding never matches café vs CAFÉ).
+pub fn sheet_name_eq(a: &str, b: &str) -> bool {
+    a.chars()
+        .flat_map(|c| c.to_lowercase())
+        .eq(b.chars().flat_map(|c| c.to_lowercase()))
+}
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,7 +235,7 @@ pub fn node_for_cell_in(
             .filter(|n| n.id == *id)
             .or_else(|| g.nodes.iter().find(|n| n.id == *id));
         node.and_then(|n| n.range.as_ref())
-            .map(|r| r.sheet.eq_ignore_ascii_case(sheet) && r.contains(row, col))
+            .map(|r| crate::sheet_name_eq(&r.sheet, sheet) && r.contains(row, col))
             .unwrap_or(false)
     })
 }
@@ -246,7 +254,7 @@ impl Graph {
             .filter(|n| {
                 n.range
                     .as_ref()
-                    .map(|r| r.sheet.eq_ignore_ascii_case(sheet) && r.contains(row, col))
+                    .map(|r| crate::sheet_name_eq(&r.sheet, sheet) && r.contains(row, col))
                     .unwrap_or(false)
             })
             .min_by_key(|n| n.range.as_ref().map(range_area).unwrap_or(u128::MAX))
@@ -646,6 +654,141 @@ fn parse_a1_at(chars: &[char], mut i: usize) -> Option<(usize, usize, usize)> {
 /// interior cell. String literals and numbers (including scientific
 /// notation like 1E5) never produce references. Sheet-qualified
 /// refs (`Sheet2!A1`, `'My Sheet'!A1:B2`) keep their sheet.
+/// Push refs for a rectangle, capped: full expansion to 100k
+/// cells, interior sample grid beyond that.
+fn push_range_refs(
+    refs: &mut Vec<QualifiedRef>,
+    sheet: &Option<String>,
+    lo_r: usize,
+    lo_c: usize,
+    hi_r: usize,
+    hi_c: usize,
+) {
+    if (hi_r - lo_r + 1).saturating_mul(hi_c - lo_c + 1) <= 100_000 {
+        for r in lo_r..=hi_r {
+            for cc in lo_c..=hi_c {
+                refs.push(QualifiedRef {
+                    sheet: sheet.clone(),
+                    row: r,
+                    col: cc,
+                });
+            }
+        }
+    } else {
+        // Over the cap: emit the same interior
+        // sample grid check_invariants uses
+        // (rows/8 x cols/8 from the low corner), so
+        // lifted edges reach interior columns and
+        // regions instead of only the corners.
+        let rows = hi_r - lo_r + 1;
+        let cols = hi_c - lo_c + 1;
+        let rstep = (rows / 8).max(1);
+        let cstep = (cols / 8).max(1);
+        let mut rr = lo_r;
+        while rr <= hi_r {
+            let mut cc = lo_c;
+            while cc <= hi_c {
+                refs.push(QualifiedRef {
+                    sheet: sheet.clone(),
+                    row: rr,
+                    col: cc,
+                });
+                cc += cstep;
+            }
+            rr += rstep;
+        }
+        // The stepped grid may stop short of the
+        // high corner; the independent extractor
+        // includes range endpoints, so emit it too.
+        if (hi_r != lo_r || hi_c != lo_c)
+            && !refs
+                .iter()
+                .any(|q| q.row == hi_r && q.col == hi_c && &q.sheet == sheet)
+        {
+            refs.push(QualifiedRef {
+                sheet: sheet.clone(),
+                row: hi_r,
+                col: hi_c,
+            });
+        }
+    }
+}
+
+/// Whole-column (A:A) / whole-row (1:1) range at `at`, as
+/// (lo_r, lo_c, hi_r, hi_c, next). Bounds are the Excel grid; the
+/// capped sampler in push_range_refs keeps expansion bounded.
+fn parse_whole_range_at(chars: &[char], at: usize) -> Option<(usize, usize, usize, usize, usize)> {
+    let col_of = |letters: &[char]| -> Option<usize> {
+        if letters.is_empty() || letters.len() > 3 {
+            return None;
+        }
+        let mut col = 0usize;
+        for c in letters {
+            if !c.is_ascii_alphabetic() {
+                return None;
+            }
+            col = col
+                .checked_mul(26)?
+                .checked_add(c.to_ascii_uppercase() as usize - 'A' as usize + 1)?;
+        }
+        if col == 0 || col > 16_384 {
+            return None;
+        }
+        Some(col - 1)
+    };
+    let mut j = at;
+    if chars.get(j) == Some(&'$') {
+        j += 1;
+    }
+    let lstart = j;
+    while j < chars.len() && chars[j].is_ascii_alphabetic() {
+        j += 1;
+    }
+    if j > lstart && chars.get(j) == Some(&':') {
+        let first: Vec<char> = chars[lstart..j].to_vec();
+        let mut k = j + 1;
+        if chars.get(k) == Some(&'$') {
+            k += 1;
+        }
+        let estart = k;
+        while k < chars.len() && chars[k].is_ascii_alphabetic() {
+            k += 1;
+        }
+        let second: Vec<char> = chars[estart..k].to_vec();
+        if let (Some(c0), Some(c1)) = (col_of(&first), col_of(&second)) {
+            return Some((0, c0.min(c1), 1_048_575, c0.max(c1), k));
+        }
+        return None;
+    }
+    // Row form: digits ':' digits
+    let mut j = at;
+    if chars.get(j) == Some(&'$') {
+        j += 1;
+    }
+    let dstart = j;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j > dstart && chars.get(j) == Some(&':') {
+        let first: String = chars[dstart..j].iter().collect();
+        let mut k = j + 1;
+        if chars.get(k) == Some(&'$') {
+            k += 1;
+        }
+        let estart = k;
+        while k < chars.len() && chars[k].is_ascii_digit() {
+            k += 1;
+        }
+        let second: String = chars[estart..k].iter().collect();
+        if let (Ok(r0), Ok(r1)) = (first.parse::<usize>(), second.parse::<usize>()) {
+            if (1..=1_048_576).contains(&r0) && (1..=1_048_576).contains(&r1) {
+                return Some((r0.min(r1) - 1, 0, r0.max(r1) - 1, 16_383, k));
+            }
+        }
+    }
+    None
+}
+
 pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
     let chars: Vec<char> = expr.chars().collect();
     let mut refs = Vec::new();
@@ -703,7 +846,7 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                 sheet = Some(name);
                 start = j + 2;
             }
-        } else if c.is_ascii_alphabetic() || c == '_' {
+        } else if c.is_alphabetic() || c == '_' {
             let mut j = i;
             while j < chars.len()
                 && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
@@ -722,10 +865,28 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
             continue;
         }
         let at = if sheet.is_some() { start } else { i };
+        if let Some((lo_r, lo_c, hi_r, hi_c, wnext)) = parse_whole_range_at(&chars, at) {
+            // Require a token boundary after the range.
+            if wnext >= chars.len() || !(chars[wnext].is_alphanumeric() || chars[wnext] == '_') {
+                push_range_refs(&mut refs, &sheet, lo_r, lo_c, hi_r, hi_c);
+                i = wnext;
+                continue;
+            }
+        }
         if let Some((r0, c0, next)) = parse_a1_at(&chars, at) {
-            // A ref-shaped token immediately followed by '(' is a
-            // function name (LOG10(...)), not a cell reference.
-            if next < chars.len() && chars[next] == '(' {
+            // A ref-shaped PREFIX of a longer token (A1A, B2C) is
+            // not a reference.
+            if next < chars.len() && (chars[next].is_alphanumeric() || chars[next] == '_') {
+                i = next;
+                continue;
+            }
+            // A ref-shaped token followed by '(' (whitespace
+            // allowed) is a function name (LOG10 (...)).
+            let mut paren_at = next;
+            while paren_at < chars.len() && chars[paren_at] == ' ' {
+                paren_at += 1;
+            }
+            if paren_at < chars.len() && chars[paren_at] == '(' {
                 i = next;
                 continue;
             }
@@ -773,54 +934,7 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                     let (lo_c, hi_c) = (c0.min(c1), c0.max(c1));
                     // Cap expansion; huge ranges are represented by corners + interior sampling is wrong,
                     // so refuse to expand beyond 100k cells and emit corners only with full expansion below that.
-                    if (hi_r - lo_r + 1).saturating_mul(hi_c - lo_c + 1) <= 100_000 {
-                        for r in lo_r..=hi_r {
-                            for cc in lo_c..=hi_c {
-                                refs.push(QualifiedRef {
-                                    sheet: sheet.clone(),
-                                    row: r,
-                                    col: cc,
-                                });
-                            }
-                        }
-                    } else {
-                        // Over the cap: emit the same interior
-                        // sample grid check_invariants uses
-                        // (rows/8 x cols/8 from the low corner), so
-                        // lifted edges reach interior columns and
-                        // regions instead of only the corners.
-                        let rows = hi_r - lo_r + 1;
-                        let cols = hi_c - lo_c + 1;
-                        let rstep = (rows / 8).max(1);
-                        let cstep = (cols / 8).max(1);
-                        let mut rr = lo_r;
-                        while rr <= hi_r {
-                            let mut cc = lo_c;
-                            while cc <= hi_c {
-                                refs.push(QualifiedRef {
-                                    sheet: sheet.clone(),
-                                    row: rr,
-                                    col: cc,
-                                });
-                                cc += cstep;
-                            }
-                            rr += rstep;
-                        }
-                        // The stepped grid may stop short of the
-                        // high corner; the independent extractor
-                        // includes range endpoints, so emit it too.
-                        if (hi_r != lo_r || hi_c != lo_c)
-                            && !refs
-                                .iter()
-                                .any(|q| q.row == hi_r && q.col == hi_c && q.sheet == sheet)
-                        {
-                            refs.push(QualifiedRef {
-                                sheet: sheet.clone(),
-                                row: hi_r,
-                                col: hi_c,
-                            });
-                        }
-                    }
+                    push_range_refs(&mut refs, &sheet, lo_r, lo_c, hi_r, hi_c);
                     i = end;
                     continue;
                 }
@@ -1047,7 +1161,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             match wb
                 .sheets
                 .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(&r.sheet))
+                .find(|s| crate::sheet_name_eq(&s.name, &r.sheet))
             {
                 None => problems.push(format!("node {} range on unknown sheet {}", n.id, r.sheet)),
                 Some(s) => {
@@ -1078,7 +1192,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                 .find(|n| n.id == e.to)
                 .and_then(|n| n.range.as_ref());
             if let (Some(pa), Some(ch)) = (parent, child) {
-                if pa.sheet.eq_ignore_ascii_case(&ch.sheet)
+                if crate::sheet_name_eq(&pa.sheet, &ch.sheet)
                     && !(pa.r0 <= ch.r0 && pa.c0 <= ch.c0 && pa.r1 >= ch.r1 && pa.c1 >= ch.c1)
                 {
                     problems.push(format!(
@@ -1147,11 +1261,10 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                             // extractor's job; this check covers
                             // same-sheet refs only.
                             if tok.contains('!')
-                                && !tok
-                                    .rsplit('!')
-                                    .nth(1)
-                                    .unwrap_or("")
-                                    .eq_ignore_ascii_case(&sheet.name)
+                                && !crate::sheet_name_eq(
+                                    tok.rsplit('!').nth(1).unwrap_or(""),
+                                    &sheet.name,
+                                )
                             {
                                 continue;
                             }
@@ -1165,10 +1278,15 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                     let t = t.replace('$', "");
                                     let sp = t.find(|ch: char| ch.is_ascii_digit())?;
                                     let (letters, digits) = t.split_at(sp);
-                                    Some((
-                                        digits.parse::<usize>().ok()?.checked_sub(1)?,
-                                        col_from_letters(letters)?,
-                                    ))
+                                    let row1: usize = digits.parse().ok()?;
+                                    if row1 == 0 || row1 > 1_048_576 {
+                                        return None;
+                                    }
+                                    let col = col_from_letters(letters)?;
+                                    if col >= 16_384 {
+                                        return None;
+                                    }
+                                    Some((row1 - 1, col))
                                 };
                                 if let (Some((r0, c0)), Some((r1, c1))) =
                                     (parse_end(a), parse_end(b))
@@ -1181,6 +1299,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                     while rr <= r1 {
                                         let mut cc = c0;
                                         while cc <= c1 {
+                                            // (stepping is checked below)
                                             if let Some(t) = node_for_cell_in(
                                                 g,
                                                 &specificity,
@@ -1192,9 +1311,15 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                                     independent.insert((src, t));
                                                 }
                                             }
-                                            cc += cstep;
+                                            match cc.checked_add(cstep) {
+                                                Some(n) => cc = n,
+                                                None => break,
+                                            }
                                         }
-                                        rr += rstep;
+                                        match rr.checked_add(rstep) {
+                                            Some(n) => rr = n,
+                                            None => break,
+                                        }
                                     }
                                 }
                             }
@@ -1343,7 +1468,7 @@ impl IncrementalSnapshot {
                     .snapshot
                     .sheets
                     .iter()
-                    .any(|s| s.name.eq_ignore_ascii_case(&edit.sheet))
+                    .any(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
             {
                 dropped_ranges.push(RangeRef {
                     sheet: edit.sheet.clone(),
@@ -1369,7 +1494,7 @@ impl IncrementalSnapshot {
                 .snapshot
                 .sheets
                 .iter()
-                .any(|s| s.name.eq_ignore_ascii_case(&edit.sheet));
+                .any(|s| crate::sheet_name_eq(&s.name, &edit.sheet));
             if !known {
                 self.dropped += 1;
                 continue;
@@ -1379,7 +1504,7 @@ impl IncrementalSnapshot {
                 .snapshot
                 .sheets
                 .iter_mut()
-                .find(|s| s.name.eq_ignore_ascii_case(&edit.sheet))
+                .find(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
             {
                 while sheet.cells.len() <= edit.row {
                     sheet.cells.push(Vec::new());
@@ -1625,6 +1750,16 @@ mod tests {
         let (g, violations) = build_graph(&wb);
         assert!(violations.is_empty(), "{violations:?}");
         let _ = g;
+    }
+
+    #[test]
+    fn whole_range_and_unicode_qualifier_extraction() {
+        let refs = formula_refs_qualified("SUM(A:A)");
+        assert!(refs.iter().any(|q| q.col == 0), "{refs:?}");
+        let refs = formula_refs_qualified("\u{dc}bung!A1");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].sheet.as_deref(), Some("\u{dc}bung"));
+        assert!(formula_refs_qualified("A1A+1").is_empty());
     }
 
     #[test]

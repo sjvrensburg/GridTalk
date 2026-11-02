@@ -112,9 +112,22 @@ fn valid_adapter_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
+        && name != "__invalid__"
+        && !name.starts_with('.')
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+}
+
+/// Bound assembled adapter text like the CLI does
+/// (investigate.rs MAX_SYSTEM_CHARS = 12_000).
+fn cap_adapter_text(mut text: String) -> String {
+    const MAX_SYSTEM_CHARS: usize = 12_000;
+    if text.chars().count() > MAX_SYSTEM_CHARS {
+        text = text.chars().take(MAX_SYSTEM_CHARS).collect();
+        text.push_str("\n[adapter content truncated]");
+    }
+    text
 }
 
 /// Mirror of gridtalk-app's `gridcraft_binary` resolution.
@@ -335,6 +348,7 @@ pub struct GridTalkApp {
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
     frame_revision: u64,
+    scrolled_for: Option<String>,
     show_adapters: bool,
     adapter_cache: Vec<(String, String)>,
     adapter_card_cache: String,
@@ -408,6 +422,7 @@ impl Default for GridTalkApp {
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
             frame_revision: u64::MAX,
+            scrolled_for: None,
             layout_size: (0.0, 0.0),
             chat_cancel: None,
             chat_workbook: String::new(),
@@ -521,10 +536,13 @@ fn validate_wizard(backend: &str, model_path: &str, base_url: &str) -> Result<()
             Ok(())
         }
         "openai-compatible" => {
-            if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            if base_url.starts_with("https://") {
                 return Err(format!(
-                    "base URL must start with http:// or https://: {base_url}"
+                    "https endpoints are not supported (the client speaks plain http;                      put a local proxy in front): {base_url}"
                 ));
+            }
+            if !base_url.starts_with("http://") {
+                return Err(format!("base URL must start with http://: {base_url}"));
             }
             Ok(())
         }
@@ -566,7 +584,7 @@ impl GridTalkApp {
                     .unwrap_or_default();
                 let inc = IncrementalSnapshot::new(wb);
                 self.saved_revision = inc.revision;
-                self.rebuild(inc.snapshot().clone());
+                let violations = self.rebuild(inc.snapshot().clone());
                 self.inc = Some(inc);
                 self.current_path = Some(path.to_path_buf());
                 self.selected_sheet = 0;
@@ -582,20 +600,22 @@ impl GridTalkApp {
                 self.chat_rx = None;
                 self.chat_busy = false;
                 self.chat_started = None;
-                // rebuild() may have recorded invariant violations
-                // and dropped the index; do not paper over it.
-                if self.status.contains("invariant") {
-                    let prior = self.status.clone();
-                    self.status = format!("Opened {} — but {prior}", path.display());
-                } else {
+                // rebuild() reports invariant violations explicitly;
+                // surface them instead of papering over the status.
+                if violations.is_empty() {
                     self.status = format!("Opened {}", path.display());
+                } else {
+                    self.status = format!(
+                        "Opened {} — but graph invariants violated: {violations:?}; search index disabled",
+                        path.display()
+                    );
                 }
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
     }
 
-    fn rebuild(&mut self, snapshot: gridtalk_graph::WorkbookSnapshot) {
+    fn rebuild(&mut self, snapshot: gridtalk_graph::WorkbookSnapshot) -> Vec<String> {
         let (graph, violations) = build_graph(&snapshot);
         self.graph_version += 1;
         self.positions.clear();
@@ -606,6 +626,7 @@ impl GridTalkApp {
         // Selection refers to the previous graph; drop it.
         self.sync.selected_range = None;
         self.sync.highlighted_node = None;
+        self.scrolled_for = None;
         if violations.is_empty() {
             // Refresh incrementally when possible (unchanged regions
             // keep their embedding vectors).
@@ -616,18 +637,36 @@ impl GridTalkApp {
         } else {
             // Never keep serving a stale index for a broken graph.
             self.index = None;
-            self.status = format!("Graph invariants violated: {violations:?}");
         }
         self.graph = graph;
         self.layout_revision = u64::MAX; // force fresh layout for the new graph
+        violations
     }
 
     /// Load the active adapter for chat, mirroring the app
     /// crate's prompt assembly: rules, trigger-matched skills,
     /// then the per-workbook sidecar last.
+    /// Per-workbook `.gridtalk.md` sidecar text, formatted for the
+    /// prompt (empty when absent/blank). Applies with or without an
+    /// active adapter.
+    fn sidecar_text(&self) -> String {
+        if let Some(path) = &self.current_path {
+            let sidecar = std::path::PathBuf::from(format!("{}.gridtalk.md", path.display()));
+            if let Ok(notes) = std::fs::read_to_string(&sidecar) {
+                if !notes.trim().is_empty() {
+                    return format!(
+                        "\n\nWorkbook notes (from the .gridtalk.md sidecar):\n{}",
+                        notes.trim()
+                    );
+                }
+            }
+        }
+        String::new()
+    }
+
     fn active_adapter_prompt(&self, question: &str) -> (String, usize) {
         if self.active_adapter.is_empty() {
-            return (String::new(), 3);
+            return (cap_adapter_text(self.sidecar_text()), 3);
         }
         let dir = adapters_root().join(&self.active_adapter);
         let knobs = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
@@ -691,7 +730,7 @@ impl GridTalkApp {
                 rules.trim()
             ));
         }
-        // Skills: a `Triggers:` line in the first three lines
+        // Skills: the first `Triggers:` line anywhere in the file
         // scopes the skill (word-boundary match); none = always.
         let q_words: Vec<String> = question
             .to_lowercase()
@@ -709,15 +748,15 @@ impl GridTalkApp {
                 let Ok(body) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                // Mirror load_skills: a Triggers line in the first
-                // three lines is metadata (stripped from the body);
+                // Mirror load_skills: the first Triggers line anywhere
+                // in the file is metadata (stripped from the body);
                 // an explicit empty one means never auto-apply.
                 let mut triggers: Vec<String> = Vec::new();
                 let mut has_header = false;
                 let mut found_header = false;
                 let mut body_lines: Vec<&str> = Vec::new();
-                for (idx, line) in body.lines().enumerate() {
-                    let parsed = if idx < 3 && !found_header {
+                for line in body.lines() {
+                    let parsed = if !found_header {
                         line.trim()
                             .strip_prefix("Triggers:")
                             .or_else(|| line.trim().strip_prefix("triggers:"))
@@ -765,18 +804,9 @@ impl GridTalkApp {
             }
         }
         // Per-workbook sidecar applies last.
-        if let Some(path) = &self.current_path {
-            let sidecar = std::path::PathBuf::from(format!("{}.gridtalk.md", path.display()));
-            if let Ok(notes) = std::fs::read_to_string(&sidecar) {
-                if !notes.trim().is_empty() {
-                    text.push_str(&format!(
-                        "\n\nWorkbook notes (from the .gridtalk.md sidecar):\n{}",
-                        notes.trim()
-                    ));
-                }
-            }
-        }
-        (text, top_k.clamp(1, 25))
+        let sidecar = self.sidecar_text();
+        text.push_str(&sidecar);
+        (cap_adapter_text(text), top_k.clamp(1, 25))
     }
 
     /// Refresh the adapter picker cache (filesystem reads happen
@@ -793,6 +823,7 @@ impl GridTalkApp {
             })
             .unwrap_or_default();
         names.sort();
+        names.retain(|n| valid_adapter_name(n));
         self.adapter_cache = names
             .iter()
             .map(|name| {
@@ -1031,7 +1062,10 @@ impl eframe::App for GridTalkApp {
             if inc.poll(std::time::Instant::now()) {
                 let snapshot = inc.snapshot().clone();
                 let revision = inc.revision;
-                self.rebuild(snapshot);
+                let violations = self.rebuild(snapshot);
+                if !violations.is_empty() {
+                    self.status = format!("Graph invariants violated: {violations:?}");
+                }
                 self.layout_revision = revision;
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             } else if inc.pending_edits() > 0 {
@@ -1121,6 +1155,19 @@ impl eframe::App for GridTalkApp {
         // revision or selected sheet changes — never a whole-workbook
         // clone per frame.
         if let Some(inc) = &self.inc {
+            // A graph-side selection may name another sheet: follow
+            // it (sheet names compare case-insensitively, as the
+            // rest of the app treats them).
+            if let Some(sel) = &self.sync.selected_range {
+                if let Some(idx) = inc
+                    .snapshot()
+                    .sheets
+                    .iter()
+                    .position(|sh| sh.name.eq_ignore_ascii_case(&sel.sheet))
+                {
+                    self.selected_sheet = idx;
+                }
+            }
             if inc.revision != self.frame_revision
                 || self.selected_sheet != self.frame_sheet_idx
                 || self.frame_sheet.is_none()
@@ -1168,6 +1215,7 @@ impl eframe::App for GridTalkApp {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Excel workbook", &["xlsx"])
                         .add_filter("CSV", &["csv"])
+                        .add_filter("TSV", &["tsv"])
                         .save_file()
                     {
                         self.save_as(&path);
@@ -1244,6 +1292,7 @@ impl eframe::App for GridTalkApp {
 
         if !self.prefs.first_run_done {
             let mut finish = false;
+            let mut skip = false;
             egui::Window::new("Welcome to GridTalk")
                 .collapsible(false)
                 .show(&ctx, |ui| {
@@ -1304,7 +1353,18 @@ impl eframe::App for GridTalkApp {
                             });
                         }
                     }
+                    ui.separator();
+                    if ui.button("Skip setup").clicked() {
+                        skip = true;
+                    }
                 });
+            if skip {
+                // Skipping is a completed first run: never trap the
+                // user in the wizard on every launch.
+                self.prefs.first_run_done = true;
+                self.prefs.save();
+                self.status = "Setup skipped — no inference backend configured yet.".into();
+            }
             if finish {
                 // Validation failure must not abort the frame: set
                 // the status and keep rendering the rest of the UI.
@@ -1479,6 +1539,13 @@ impl GridTalkApp {
             let col_w = 90.0f32;
             let total_w = 34.0 + display_cols as f32 * col_w;
             let total_h = (display_rows + 1) as f32 * row_height;
+            if selected.is_none() {
+                self.scrolled_for = None;
+            }
+            let scroll_target = selected.clone().filter(|sel| {
+                sel.sheet.eq_ignore_ascii_case(&sheet_name)
+                    && self.scrolled_for.as_deref() != Some(sel.a1().as_str())
+            });
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show_viewport(ui, |ui, viewport| {
@@ -1534,7 +1601,10 @@ impl GridTalkApp {
                                 let cell = sheet.get(r, c);
                                 let is_selected = selected
                                     .as_ref()
-                                    .map(|s| s.sheet == sheet_name && s.contains(r, c))
+                                    .map(|s| {
+                                        s.sheet.eq_ignore_ascii_case(&sheet_name)
+                                            && s.contains(r, c)
+                                    })
                                     .unwrap_or(false);
                                 // Index key: no sheet-name String
                                 // allocated per visible cell per frame.
@@ -1583,7 +1653,22 @@ impl GridTalkApp {
                     if remaining > 0 {
                         ui.add_space(remaining as f32 * row_height);
                     }
+                    if let Some(sel) = &scroll_target {
+                        let origin = ui.min_rect().min;
+                        let rect = egui::Rect::from_min_size(
+                            origin
+                                + egui::vec2(
+                                    34.0 + sel.c0 as f32 * col_w,
+                                    (sel.r0 as f32 + 1.0) * row_height,
+                                ),
+                            egui::vec2(col_w, row_height),
+                        );
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
                 });
+            if scroll_target.is_some() {
+                self.scrolled_for = scroll_target.as_ref().map(|sel| sel.a1());
+            }
         }
         if let Some((sheet, r, c)) = clicked_cell {
             self.sync.select_cell(&self.graph, &sheet, r, c);
@@ -1850,6 +1935,7 @@ mod tests {
         assert!(validate_wizard("local", "", "").is_err());
         assert!(validate_wizard("local", "/definitely/missing.gguf", "").is_err());
         assert!(validate_wizard("openai-compatible", "", "ftp://x").is_err());
+        assert!(validate_wizard("openai-compatible", "", "https://api.example.com/v1").is_err());
         assert!(validate_wizard("openai-compatible", "", "http://127.0.0.1:1/v1").is_ok());
 
         // Save must flush a pending (not yet debounced) edit.

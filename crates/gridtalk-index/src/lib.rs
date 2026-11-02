@@ -96,7 +96,7 @@ impl Index {
                 });
             let assigned = if ordinal_ok {
                 sheet_of_region(region_idx)
-                    .filter(|sheet| sheet.name.eq_ignore_ascii_case(&region.range.sheet))
+                    .filter(|sheet| gridtalk_graph::sheet_name_eq(&sheet.name, &region.range.sheet))
             } else {
                 None
             };
@@ -245,6 +245,10 @@ pub struct HybridIndex {
 }
 
 impl HybridIndex {
+    /// Regions dropped while building (stale/mismatched graph).
+    pub fn dropped_regions(&self) -> usize {
+        self.lexical.dropped_regions
+    }
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let lexical = Index::build(wb, graph);
         let model = NGramEmbedding::default();

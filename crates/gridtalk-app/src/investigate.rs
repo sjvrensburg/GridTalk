@@ -156,30 +156,41 @@ pub fn investigate_with(
                     } else {
                         parse_cell_ref(&format!("{sheet}!{cell}"))
                     };
+                    // Dependent = a formula whose value actually
+                    // CHANGES under the override (trial what-if):
+                    // captures transitive dependencies and needs no
+                    // range expansion. Bounded candidate count.
                     let dependent_target = || -> Option<String> {
                         let (osheet, orow, ocol) = override_coord.clone()?;
                         let (_, r0, c0, r1, c1) = crate::tools::parse_range_uncapped(range)?;
                         let sheet_obj = tools.sheet_for(&sheet)?;
+                        let mut tried = 0usize;
                         for r in r0..=r1 {
                             for c in c0..=c1 {
-                                if let CellValue::Formula { expr, .. } = sheet_obj.get(r, c) {
-                                    let refs = gridtalk_graph::formula_refs_qualified(&expr);
-                                    // A qualified ref names the
-                                    // OVERRIDE's sheet; an unqualified
-                                    // one means the formula's own sheet.
-                                    let depends = refs.iter().any(|q| {
-                                        let ref_sheet = q.sheet.as_deref().unwrap_or(&sheet);
-                                        ref_sheet.eq_ignore_ascii_case(&osheet)
-                                            && q.row == orow
-                                            && q.col == ocol
-                                    });
-                                    if depends {
-                                        return Some(format!(
-                                            "{}!{}{}",
-                                            sheet,
-                                            gridtalk_graph::col_name(c),
-                                            r + 1
-                                        ));
+                                if tried >= 200 {
+                                    return None;
+                                }
+                                if (sheet.as_str(), r, c) == (osheet.as_str(), orow, ocol) {
+                                    continue;
+                                }
+                                if let CellValue::Formula { .. } = sheet_obj.get(r, c) {
+                                    tried += 1;
+                                    if let Ok((before, after)) =
+                                        gridtalk_graph::eval::what_if_in_workbook(
+                                            tools.wb,
+                                            (&osheet, orow, ocol),
+                                            value,
+                                            (&sheet, r, c),
+                                        )
+                                    {
+                                        if (after - before).abs() > 1e-9 {
+                                            return Some(format!(
+                                                "{}!{}{}",
+                                                sheet,
+                                                gridtalk_graph::col_name(c),
+                                                r + 1
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -244,7 +255,11 @@ pub fn investigate_with(
     }
     // Citation guarantee: the printed answer must cite a range we
     // actually retrieved.
-    if !citations.is_empty() && !citations.iter().any(|c| answer.contains(c)) {
+    if !citations.is_empty()
+        && !citations
+            .iter()
+            .any(|c| crate::bench::contains_bounded(&answer, c))
+    {
         answer.push_str(&format!("\n\nSources: {}", citations.join(", ")));
     }
 
@@ -324,13 +339,39 @@ pub fn qualified_refs(question: &str) -> Vec<String> {
 /// parseable number within `window` tokens that is either
 /// immediate or introduced by is/becomes/equals/to/set/at/=.
 fn value_after(tokens: &[&str], window: usize) -> Option<f64> {
+    fn is_cell_ref_like(word: &str) -> bool {
+        let cell = word.rsplit('!').next().unwrap_or(word).replace('$', "");
+        let letters = cell.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+        (1..=3).contains(&letters)
+            && letters < cell.len()
+            && cell[letters..].chars().all(|c| c.is_ascii_digit())
+            && !cell[letters..].is_empty()
+    }
     for (j, next) in tokens.iter().take(window).enumerate() {
+        // A subsequent cell ref (the target) ends the value scan:
+        // its trailing digits are not the override value.
+        let word = next
+            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
+        if is_cell_ref_like(word) {
+            return None;
+        }
+        // Letter-starting tokens are never values.
+        if next
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic())
+        {
+            continue;
+        }
         let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
         if let Ok(v) = n.parse::<f64>() {
             let introduced = j == 0
                 || tokens[..j].iter().rev().take(3).any(|t| {
                     matches!(
-                        t.trim_matches(|c: char| !c.is_alphanumeric()),
+                        t.trim_matches(|c: char| !c.is_alphanumeric())
+                            .to_ascii_lowercase()
+                            .as_str(),
                         "is" | "becomes" | "equals" | "to" | "set" | "at"
                     ) || t.contains('=')
                 });

@@ -108,7 +108,11 @@ pub fn tokenize(text: &str) -> Vec<String> {
         if c.is_alphanumeric()
             || (c == '.' && (prev_digit || cur.is_empty()) && (next_digit || prev_digit))
             || (c == ',' && prev_digit && next_digit)
-            || (c == '-' && cur.is_empty() && next_digit)
+            || (c == '-'
+                && cur.is_empty()
+                && (next_digit
+                    || (chars.get(i + 1) == Some(&'.')
+                        && chars.get(i + 2).is_some_and(|n| n.is_ascii_digit()))))
         {
             cur.push(c);
         } else if c == '%'

@@ -113,6 +113,9 @@ impl LlamaCppBackend {
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<GenerationStats, InferError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(InferError::Cancelled);
+        }
         let started = Instant::now();
         if !(0.0..=2.0).contains(&self.temperature) {
             return Err(InferError::EngineUnavailable(format!(
@@ -175,6 +178,9 @@ impl LlamaCppBackend {
         let backend = &state.backend;
         let model = &state.model.as_ref().unwrap().model;
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(InferError::Cancelled);
+        }
 
         // Prompt via the model's own chat template when it has one.
         let prompt = match model.chat_template(None) {
@@ -281,7 +287,9 @@ impl LlamaCppBackend {
             let token = sampler.sample(&ctx, -1);
             sampler.accept(token);
             if first_token_ms.is_none() {
-                first_token_ms = Some(decode_started.elapsed().as_secs_f64() * 1000.0);
+                // TTFT includes prefill (from generation start,
+                // still excluding model load).
+                first_token_ms = Some(gen_started.elapsed().as_secs_f64() * 1000.0);
             }
             // Stop on EOG, and on end-of-turn (<|im_end|> etc.) which
             // some GGUFs do not register as EOG.
@@ -402,7 +410,6 @@ impl LlamaCppBackend {
 
         let total_ms = started.elapsed().as_secs_f64() * 1000.0;
         let gen_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-        let _ = gen_started;
         Ok(GenerationStats {
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: generated,

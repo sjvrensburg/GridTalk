@@ -13,7 +13,7 @@ Task rows come from `gridtalk bench generate`. Convert them to
 hermit's JSONL + split-id files with `prepare_data` below, or:
 
     gridtalk bench generate book.xlsx --out tasks-array.json
-    python3 -c "import gridtalk_task; gridtalk_task.prepare_data('tasks-array.json', 'data/')"
+    .venv/bin/python -c "import sys; sys.path.insert(0, 'scripts/hermit'); import gridtalk_task; gridtalk_task.prepare_data('tasks-array.json', 'data/')"
 
 Environment:
     GRIDTALK_BIN   path to the gridtalk binary (default: `gridtalk`)
@@ -87,7 +87,11 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
     return RunOutput(
         output=answer,
         wall_s=wall,
-        extra={"stdout_tail": text[-500:], "stdout": citations_text},
+        extra={
+            "stdout_tail": text[-500:],
+            "stdout": citations_text,
+            "stderr_tail": proc.stderr.strip()[-500:],
+        },
     )
 
 
@@ -151,8 +155,29 @@ _CELL = re.compile(r"([A-Za-z]{1,3})([0-9]+)$")
 
 def _parse_cell(ref: str):
     """'Sheet1!B12' or 'B12' -> (sheet|None, row, col)."""
-    sheet, _, cell = str(ref).rpartition("!")
-    sheet = sheet.strip("'") or None
+    text = str(ref).strip()
+    sheet = None
+    cell = text
+    if text.startswith("'"):
+        # Quoted sheet with '' escapes, like _parse_cited_range.
+        i = 1
+        name = ""
+        while i < len(text):
+            if text[i] == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    name += "'"
+                    i += 2
+                    continue
+                i += 1
+                break
+            name += text[i]
+            i += 1
+        if i < len(text) and text[i] == "!":
+            sheet = name
+            cell = text[i + 1:]
+    elif "!" in text:
+        sheet_part, _, cell = text.rpartition("!")
+        sheet = sheet_part.strip("'") or None
     m = _CELL.match(cell.strip().replace("$", ""))
     if not m:
         return None
@@ -243,6 +268,8 @@ def _parse_cited_range(c: str):
             hi = _parse_cell(hi_s or lo_s)
             if lo is None or hi is None:
                 return None, None
+            if hi[0] is not None and hi[0].casefold() != sheet.casefold():
+                return None, None
             return (sheet, lo[1], lo[2]), hi
         return None, None
     lo_full, _, hi_full = text.partition(":")
@@ -285,10 +312,8 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
         sheet = lo[0]
         if sheet is None or sheet.casefold() != esheet.casefold():
             continue
-        # parse_range rejects reversed ranges and >10000 cells.
+        # parse_range_uncapped rejects reversed ranges (no size cap).
         if hi[1] < lo[1] or hi[2] < lo[2]:
-            continue
-        if (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 10000:
             continue
         if lo[1] <= erow <= hi[1] and lo[2] <= ecol <= hi[2]:
             return True
@@ -353,6 +378,13 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             raise ValueError("each bench row needs id/question/expected")
         if not isinstance(row["id"], str) or not row["id"]:
             raise ValueError("bench task id must be a non-empty string")
+        if (
+            row["id"] != row["id"].strip()
+            or "\n" in row["id"]
+            or "\r" in row["id"]
+            or row["id"].startswith("#")
+        ):
+            raise ValueError(f"bench task id {row['id']!r} cannot round-trip hermit's split files")
         if not isinstance(row["question"], str) or not row["question"].strip():
             raise ValueError(f"task {row['id']}: question must be a non-empty string")
         exp = row["expected"]

@@ -103,9 +103,28 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                 ));
                             }
                             // One what-if task per formula: walk
-                            // numeric precedents until one produces
-                            // a non-trivial, finite outcome.
+                            // deduplicated numeric precedents (range
+                            // expansion repeats cells) with a bounded
+                            // number of what-if attempts.
+                            let mut seen_prects: std::collections::BTreeSet<(usize, usize, usize)> =
+                                std::collections::BTreeSet::new();
+                            let mut attempts = 0usize;
                             for q in formula_refs_qualified(expr) {
+                                if attempts >= 64 {
+                                    break;
+                                }
+                                let sheet_idx_of = wb
+                                    .sheets
+                                    .iter()
+                                    .position(|s| {
+                                        s.name.eq_ignore_ascii_case(
+                                            q.sheet.as_deref().unwrap_or(&sheet.name),
+                                        )
+                                    })
+                                    .unwrap_or(usize::MAX);
+                                if !seen_prects.insert((sheet_idx_of, q.row, q.col)) {
+                                    continue;
+                                }
                                 let osheet_name =
                                     q.sheet.clone().unwrap_or_else(|| sheet.name.clone());
                                 let Some(osheet) = wb
@@ -116,6 +135,7 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                     continue;
                                 };
                                 if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
+                                    attempts += 1;
                                     let new_value = orig + 10.0;
                                     if let Ok((before, after)) = what_if_in_workbook(
                                         wb,
@@ -125,7 +145,10 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                     ) {
                                         // Trivial tasks (outcome
                                         // unchanged) teach nothing.
-                                        if after.is_finite() && (after - before).abs() > 1e-9 {
+                                        // `v` is the pre-computed before
+                                        // value for this formula.
+                                        let _ = before;
+                                        if after.is_finite() && (after - v).abs() > 1e-9 {
                                             drafts.push((
                                                 "what_if".into(),
                                                 format!(
@@ -264,10 +287,15 @@ pub struct TaskResult {
 /// answer merely restating the question's citation does not.
 /// `answer` mentions `needle` as a standalone reference, not as a
 /// substring of a longer ref (Sheet1!A1 inside Sheet1!A10:B20).
-fn contains_bounded(answer: &str, needle: &str) -> bool {
+pub(crate) fn contains_bounded(answer: &str, needle: &str) -> bool {
+    // ASCII case-insensitive (offsets preserved; matches the
+    // case-insensitive sheet comparison in citation_hit).
+    let answer = &answer.to_ascii_lowercase();
+    let needle = &needle.to_ascii_lowercase();
     let boundary = |c: char| !(c.is_alphanumeric() || matches!(c, '!' | ':' | '.' | '$'));
+    let first_char_len = needle.chars().next().map_or(1, |c| c.len_utf8());
     let mut from = 0;
-    while let Some(pos) = answer[from..].find(needle) {
+    while let Some(pos) = answer[from..].find(needle.as_str()) {
         let start = from + pos;
         let end = start + needle.len();
         let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
@@ -275,7 +303,7 @@ fn contains_bounded(answer: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        from = start + first_char_len;
         if from >= answer.len() {
             break;
         }

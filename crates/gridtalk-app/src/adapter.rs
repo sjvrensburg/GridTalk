@@ -136,9 +136,13 @@ fn dirs_path() -> Option<PathBuf> {
 /// (separators, `..`, empty) is rejected so a name from the CLI,
 /// prefs or a tasks file can never escape the adapters root.
 pub fn valid_adapter_name(name: &str) -> bool {
+    // One contract everywhere (commit/load/list/rollback): no
+    // leading dot, no reserved __invalid__ alias target.
     !name.is_empty()
         && name != "."
         && name != ".."
+        && name != "__invalid__"
+        && !name.starts_with('.')
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
@@ -198,7 +202,11 @@ fn parse_knobs_seeded(
                     Ok(v) => max_steps = v.clamp(1, 64),
                     Err(_) => warn("max_steps"),
                 },
-                "ref_context" => ref_context = value == "true",
+                "ref_context" => match value.to_ascii_lowercase().as_str() {
+                    "true" => ref_context = true,
+                    "false" => ref_context = false,
+                    _ => warn("ref_context"),
+                },
                 _ => {}
             }
         }
@@ -231,11 +239,14 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("skill")
                 .to_string();
+            // A stem commit_version would reject makes every later
+            // commit of this adapter fail; skip it loudly instead.
+            if !valid_adapter_name(&name) {
+                eprintln!("gridtalk: warning: skipping skill with invalid name {name:?}");
+                continue;
+            }
             let mut triggers = Vec::new();
             let mut body_lines = Vec::new();
-            // A Triggers line in the first three lines is
-            // metadata (hand-written skills may lead with a title
-            // or blank line; docs/adapters.md promises this).
             let mut found_header = false;
             for line in text.lines() {
                 // The FIRST Triggers line anywhere in the file is
@@ -440,8 +451,13 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
             if !valid_adapter_name(&skill.name) || skill.name.starts_with('.') {
                 return Err(format!("invalid skill name {:?}", skill.name));
             }
-            // "(always)" is the reserved always-apply marker.
-            if skill.triggers.len() == 1 && skill.triggers[0] == "(always)" {
+            // "(always)" is the reserved always-apply marker, in
+            // any case/padding or position (load lowercases).
+            if skill
+                .triggers
+                .iter()
+                .any(|t| t.trim().to_lowercase() == "(always)")
+            {
                 return Err(
                     "trigger '(always)' is reserved; use empty triggers for always-apply".into(),
                 );
@@ -492,11 +508,55 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
         return Err(format!("invalid adapter name {name:?}"));
     }
     let current = load_adapter(root, name);
-    if current.version == 0 {
+    let dir = adapter_dir(root, name);
+    // Recovery path: if the pointer's version dir is gone (or the
+    // knob is malformed) load_adapter coerces to v0, which would
+    // strand earlier versions. Derive the effective version from
+    // the raw pointer / highest vN on disk instead.
+    let effective = if current.version > 0 {
+        current.version
+    } else {
+        let raw = std::fs::read_to_string(dir.join("adapter.toml"))
+            .map(|t| parse_knobs(&t).0)
+            .unwrap_or(0);
+        let on_disk_max = std::fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| {
+                        e.file_name()
+                            .to_str()?
+                            .strip_prefix('v')?
+                            .parse::<u32>()
+                            .ok()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        // +1 when recovering from raw disk state so target lands
+        // on the highest surviving version.
+        raw.max(on_disk_max.saturating_add(1))
+    };
+    if effective == 0 {
         return Err(format!("adapter {name} has no committed versions"));
     }
-    let dir = adapter_dir(root, name);
-    let target = current.version - 1;
+    let mut target = effective - 1;
+    // Walk down past incomplete version dirs ONLY on the recovery
+    // path (coerced v0); a healthy pointer with a missing target
+    // is an error, not a silent skip to an older version.
+    while current.version == 0 && target > 0 {
+        let vdir = dir.join(format!("v{target}"));
+        let complete = vdir.is_dir()
+            && std::fs::read_to_string(vdir.join("adapter.toml"))
+                .is_ok_and(|t| !t.trim().is_empty())
+            && vdir.join("ADAPTER.md").is_file();
+        if complete {
+            break;
+        }
+        target -= 1;
+    }
     if target > 0 {
         let vdir = dir.join(format!("v{target}"));
         let toml_ok =

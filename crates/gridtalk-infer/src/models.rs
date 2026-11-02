@@ -263,7 +263,7 @@ fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelErr
         Some(v) => v
             .parse::<u64>()
             .ok()
-            .filter(|a| a.is_power_of_two())
+            .filter(|a| a.is_power_of_two() && *a <= 65_536)
             .ok_or_else(|| ModelError::NotGguf(format!("invalid general.alignment {v:?}")))?,
         None => 32,
     };

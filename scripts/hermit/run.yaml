@@ -9,7 +9,7 @@
 #   .venv/bin/python -c "import sys; sys.path.insert(0, 'scripts/hermit'); \
 #       import gridtalk_task; gridtalk_task.prepare_data('tasks-array.json', 'scripts/hermit/data')"
 #
-# The pipeline is GridTalk's JSON CLI; the judge is deterministic
+# The pipeline is GridTalk's text CLI (scraping its printed markers); the judge is deterministic
 # (final-number match against evaluator ground truth).
 # A hermit template supplies the adapter skeleton the evolver
 # mutates. continual-harness is hermit's general harness template
