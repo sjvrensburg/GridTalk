@@ -44,7 +44,16 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc glslang-tools
+        shell: bash
+        run: |
+          # Full LunarG SDK: apt fragments miss SPIRV-Headers, which
+          # ggml-vulkan's shader generator requires.
+          curl -sL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
+          mkdir -p "$HOME/vulkan-sdk"
+          tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          echo "VULKAN_SDK=$HOME/vulkan-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/vulkan-sdk/bin" >> "$GITHUB_PATH"
+          echo "CMAKE_PREFIX_PATH=$HOME/vulkan-sdk" >> "$GITHUB_ENV"
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -52,6 +61,7 @@ jobs:
           choco install vulkan-sdk -y
           $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
           "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CMAKE_PREFIX_PATH=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Build release binaries
         run: cargo build --locked --release -p gridtalk-app -p gridtalk-ui
