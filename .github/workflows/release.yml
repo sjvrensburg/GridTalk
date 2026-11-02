@@ -122,7 +122,7 @@ jobs:
           # MSBuild's vcvars batch breaks in the vulkan-shaders-gen
           # subproject on GitHub runners ("cannot find batch label
           # VCEnd"); Ninja avoids that path entirely.
-          choco install ninja -y --version 1.12.1
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --version 1.12.1 }
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Get-ChildItem "$env:VULKAN_SDK" | Select-Object -First 5

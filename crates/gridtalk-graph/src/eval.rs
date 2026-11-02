@@ -688,17 +688,9 @@ mod tests {
             name: "Sheet2".into(),
             cells: vec![vec![CellValue::Number(1.0)], vec![CellValue::Number(21.0)]],
         });
-        assert_eq!(
-            eval_cell_in_workbook(&wb, "Sheet1", 1, 0).unwrap(),
-            42.0
-        );
-        let (before, after) = what_if_in_workbook(
-            &wb,
-            ("Sheet2", 1, 0),
-            10.0,
-            ("Sheet1", 1, 0),
-        )
-        .unwrap();
+        assert_eq!(eval_cell_in_workbook(&wb, "Sheet1", 1, 0).unwrap(), 42.0);
+        let (before, after) =
+            what_if_in_workbook(&wb, ("Sheet2", 1, 0), 10.0, ("Sheet1", 1, 0)).unwrap();
         assert_eq!((before, after), (42.0, 20.0));
     }
 
