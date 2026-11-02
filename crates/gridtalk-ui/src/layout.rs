@@ -73,7 +73,9 @@ pub fn compute_layout_cancellable(
                 pair_count += 1;
                 // Poll cancellation inside the O(n^2) loop too, so
                 // huge graphs stop promptly, not after a full sweep.
-                if pair_count.is_multiple_of(4096) && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if pair_count.is_multiple_of(4096)
+                    && cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return pos;
                 }
                 let (a, b) = (pos[&ids[i]], pos[&ids[j]]);
