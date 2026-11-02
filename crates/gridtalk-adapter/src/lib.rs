@@ -45,7 +45,6 @@ pub struct Adapter {
 }
 
 impl Adapter {
-    #[allow(dead_code)] // used by tests and future adapter creation UI
     pub fn empty(name: &str) -> Adapter {
         Adapter {
             name: name.into(),
@@ -681,6 +680,39 @@ pub fn sidecar_rules(workbook_path: &Path) -> Option<String> {
         .filter(|t| !t.trim().is_empty())
 }
 
+/// Upper bound on assembled system-prompt text: adapter, skill
+/// and sidecar text are user input.
+pub const MAX_SYSTEM_CHARS: usize = 12_000;
+
+/// Prompt text appended to a front end's built-in system prompt:
+/// adapter rules, trigger-matched skills, then the per-workbook
+/// sidecar last. Shared by the CLI and the UI so both build the
+/// same prompt from the same adapter.
+pub fn prompt_text(adapter: Option<&Adapter>, question: &str, sidecar: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(a) = adapter {
+        out.push_str(&a.prompt_for(question));
+    }
+    if let Some(sidecar) = sidecar {
+        if !sidecar.trim().is_empty() {
+            out.push_str("\n\nWorkbook notes (from the .gridtalk.md sidecar):\n");
+            out.push_str(sidecar.trim());
+        }
+    }
+    out
+}
+
+/// Truncate prompt text to [`MAX_SYSTEM_CHARS`], marking the cut.
+pub fn cap_prompt(text: String) -> String {
+    if text.chars().count() > MAX_SYSTEM_CHARS {
+        let mut out: String = text.chars().take(MAX_SYSTEM_CHARS).collect();
+        out.push_str("\n[adapter content truncated]");
+        out
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +859,36 @@ mod tests {
         let p2 = loaded.prompt_for("total qty?");
         assert!(!p2.contains("Check the Provision row."));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_text_orders_rules_skills_then_sidecar() {
+        let mut a = Adapter::empty("demo");
+        a.rules = "- rule".into();
+        a.skills.push(Skill {
+            name: "tax".into(),
+            triggers: vec!["vat".into()],
+            body: "Use 15%.".into(),
+        });
+        let text = prompt_text(Some(&a), "what is the VAT total", Some(" notes "));
+        let r = text.find("- rule").unwrap();
+        let k = text.find("Skill: tax").unwrap();
+        let n = text.find("Workbook notes").unwrap();
+        assert!(r < k && k < n, "{text}");
+        assert!(text.ends_with("notes"));
+        assert!(!prompt_text(Some(&a), "revenue", None).contains("Skill: tax"));
+        assert_eq!(prompt_text(None, "q", Some("   ")), "");
+    }
+
+    #[test]
+    fn cap_prompt_truncates_and_marks() {
+        let long = "x".repeat(MAX_SYSTEM_CHARS + 5);
+        let capped = cap_prompt(long);
+        assert!(capped.ends_with("[adapter content truncated]"));
+        assert_eq!(
+            capped.chars().filter(|c| *c == 'x').count(),
+            MAX_SYSTEM_CHARS
+        );
+        assert_eq!(cap_prompt("short".into()), "short");
     }
 }

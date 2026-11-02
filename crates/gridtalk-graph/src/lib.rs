@@ -189,6 +189,12 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub regions: Vec<Region>,
+    /// Index into `WorkbookSnapshot::sheets` of each entry in
+    /// `regions`, recorded by `build_graph` so consumers need not
+    /// re-detect regions to map them to sheets. Empty for
+    /// hand-built graphs.
+    #[serde(default)]
+    pub region_sheets: Vec<usize>,
 }
 
 /// Region/Column node ids sorted by ascending range area, so the
@@ -286,11 +292,13 @@ impl From<std::io::Error> for IngestError {
     }
 }
 
-/// Load a workbook snapshot from a path. CSV/TSV are fully supported.
-/// XLSX/ODS are routed to the Gridcraft engine once integrated; until
-/// then they return a typed error instead of silently mis-parsing.
-/// XLSB/XLS are explicitly out of scope (see plan Phase 2).
-pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError> {
+/// Ingestion cap for CSV/TSV files.
+const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
+/// Ingestion cap for XLSX/ODS packages.
+const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Lowercased extension and workbook name (file stem) of a path.
+fn ext_and_name(path: &std::path::Path) -> (String, String) {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -301,38 +309,57 @@ pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError
         .and_then(|s| s.to_str())
         .unwrap_or("workbook")
         .to_string();
-    match ext.as_str() {
-        "csv" | "tsv" => {
-            const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
-            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            if len > MAX_DELIMITED_BYTES {
-                return Err(IngestError::Parse(format!(
-                    "delimited file is {len} bytes, over the {MAX_DELIMITED_BYTES}-byte ingestion cap"
-                )));
-            }
-            let text = std::fs::read_to_string(path)?;
-            let delim = if ext == "tsv" { '\t' } else { ',' };
-            parse_delimited_strict(&name, "Sheet1", &text, delim)
-        }
+    (ext, name)
+}
+
+/// Format check and size cap for an ingestible file of `len` bytes.
+fn check_ingestible(ext: &str, len: u64) -> Result<(), IngestError> {
+    match ext {
+        "csv" | "tsv" if len > MAX_DELIMITED_BYTES => Err(IngestError::Parse(format!(
+            "delimited file is {len} bytes, over the {MAX_DELIMITED_BYTES}-byte ingestion cap"
+        ))),
+        "csv" | "tsv" => Ok(()),
         "xlsb" | "xls" | "xlsm" => Err(IngestError::UnsupportedFormat {
-            ext,
+            ext: ext.into(),
             hint: "GridTalk does not support Excel binary/legacy formats; save as .xlsx or .csv and re-open".into(),
         }),
-        "xlsx" | "ods" => {
-            const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
-            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            if len > MAX_PACKAGE_BYTES {
-                return Err(IngestError::Parse(format!(
-                    "spreadsheet package is {len} bytes, over the {MAX_PACKAGE_BYTES}-byte ingestion cap"
-                )));
-            }
-            let bytes = std::fs::read(path)?;
-            load_gridcraft_bytes(&name, &ext, &bytes)
-        }
+        "xlsx" | "ods" if len > MAX_PACKAGE_BYTES => Err(IngestError::Parse(format!(
+            "spreadsheet package is {len} bytes, over the {MAX_PACKAGE_BYTES}-byte ingestion cap"
+        ))),
+        "xlsx" | "ods" => Ok(()),
         _ => Err(IngestError::UnsupportedFormat {
-            ext,
+            ext: ext.into(),
             hint: "expected .csv, .tsv, .xlsx or .ods".into(),
         }),
+    }
+}
+
+/// Load a workbook snapshot from a path. CSV/TSV are fully supported.
+/// XLSX/ODS go through the Gridcraft engine. XLSB/XLS are explicitly
+/// out of scope (see plan Phase 2). Unsupported or oversized files
+/// are rejected from metadata, before the file is read.
+pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError> {
+    let (ext, _) = ext_and_name(path);
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    check_ingestible(&ext, len)?;
+    let bytes = std::fs::read(path)?;
+    load_bytes(path, &bytes)
+}
+
+/// Parse a workbook from bytes already read from `path`. The path
+/// supplies only the format (extension) and workbook name, so a
+/// caller that also needs the raw bytes (e.g. to hash them) reads
+/// the file once.
+pub fn load_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<WorkbookSnapshot, IngestError> {
+    let (ext, name) = ext_and_name(path);
+    check_ingestible(&ext, bytes.len() as u64)?;
+    if ext == "csv" || ext == "tsv" {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let delim = if ext == "tsv" { '\t' } else { ',' };
+        parse_delimited_strict(&name, "Sheet1", text, delim)
+    } else {
+        load_gridcraft_bytes(&name, &ext, bytes)
     }
 }
 
@@ -1060,7 +1087,7 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             id
         };
     let wb_id = push(&mut g, NodeKind::Workbook, wb.name.clone(), None);
-    for sheet in &wb.sheets {
+    for (sheet_idx, sheet) in wb.sheets.iter().enumerate() {
         let srange = if sheet.cells.is_empty() {
             None
         } else {
@@ -1103,6 +1130,7 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
                 });
             }
             g.regions.push(region);
+            g.region_sheets.push(sheet_idx);
         }
     }
     // Lifted dependency edges, re-derived from formulas. Targets are
@@ -1551,6 +1579,28 @@ pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_bytes_matches_load_path_and_checks_format() {
+        let dir = std::env::temp_dir().join(format!("gt-load-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.csv");
+        let text = "Item,Qty\nApples,2\n";
+        std::fs::write(&path, text).unwrap();
+        let from_path = load_path(&path).unwrap();
+        let from_bytes = load_bytes(&path, text.as_bytes()).unwrap();
+        assert_eq!(from_path, from_bytes);
+        assert_eq!(from_bytes.name, "book");
+        assert!(matches!(
+            load_bytes(&path, &[0xff, 0xfe]),
+            Err(IngestError::Io(_))
+        ));
+        assert!(matches!(
+            load_bytes(std::path::Path::new("x.xls"), b""),
+            Err(IngestError::UnsupportedFormat { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sample() -> WorkbookSnapshot {
         parse_delimited(

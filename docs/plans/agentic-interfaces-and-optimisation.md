@@ -211,7 +211,7 @@ echoes context but never answers — which is the floor). A real-local-model run
 the same command with a model configured.
 
 **Phase D (adapter format + loop) — SHIPPED:** adapter
-directories (`adapter.rs`), loading into investigate/chat (plus
+directories (`gridtalk-adapter` crate), loading into investigate/chat (plus
 per-workbook `<workbook>.gridtalk.md` sidecars), `gridtalk
 optimise` (deterministic failure-driven proposer → train eval →
 dev gate → commit/reject as versioned adapters, CARD.md record),

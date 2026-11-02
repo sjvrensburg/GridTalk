@@ -47,7 +47,7 @@ pub fn investigate_with(
     tools: &Tools,
     backend: &dyn ChatBackend,
     max_steps: usize,
-    adapter: Option<&crate::adapter::Adapter>,
+    adapter: Option<&gridtalk_adapter::Adapter>,
     sidecar: Option<&str>,
 ) -> Result<Investigation, gridtalk_infer::InferError> {
     let mut trail: Vec<TrailStep> = Vec::new();
@@ -222,21 +222,8 @@ pub fn investigate_with(
     }
 
     let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
-    if let Some(a) = adapter {
-        system.push_str(&a.prompt_for(question));
-    }
-    if let Some(sidecar) = sidecar {
-        if !sidecar.trim().is_empty() {
-            system.push_str("\n\nWorkbook notes (from the .gridtalk.md sidecar):\n");
-            system.push_str(sidecar.trim());
-        }
-    }
-    // Bound the prompt: adapter/skill/sidecar text is user input.
-    const MAX_SYSTEM_CHARS: usize = 12_000;
-    if system.chars().count() > MAX_SYSTEM_CHARS {
-        system = system.chars().take(MAX_SYSTEM_CHARS).collect();
-        system.push_str("\n[adapter content truncated]");
-    }
+    system.push_str(&gridtalk_adapter::prompt_text(adapter, question, sidecar));
+    let system = gridtalk_adapter::cap_prompt(system);
     let req = ChatRequest {
         system,
         user: format!("Question: {question}\n\nTool results:\n{context}"),
