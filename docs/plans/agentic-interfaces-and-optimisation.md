@@ -1,6 +1,6 @@
 # Future development: agentic interfaces + self-optimisation
 
-Status: Phases A+B merged (`feat/agentic-mcp`, typed tool core, `gridtalk tools call <file> '<json>'`, MCP server over stdio with session/content-hash invalidation, harness recipes in `docs/mcp.md`); Phase C merged (bench generator). Phases D-E remain future work. Companion to `docs/plan.md`.
+Status: Phases A-C merged; Phase D implemented on `feat/adapter-optimise`. Phase E remains future work. Companion to `docs/plan.md`.
 Main CI at time of writing: run 41423800953 (post-merge) — check
 `gh run list --branch main` for the terminal result.
 
@@ -210,12 +210,15 @@ scores 0% accuracy under the strict final-number judge — it
 echoes context but never answers — which is the floor). A real-local-model run uses
 the same command with a model configured.
 
-**Phase D (adapter format + loop, ~2 wks):** adapter directories,
-loading into investigate/chat, `gridtalk optimise` (propose →
-eval → commit/reject), adapter picker + CARD viewer in the UI.
-Acceptance: on a synthetic workbook with known weaknesses, one
-optimise cycle measurably improves dev accuracy and the
-improvement is visible as an ADAPTER.md diff.
+**Phase D (adapter format + loop) — SHIPPED:** adapter
+directories (`adapter.rs`), loading into investigate/chat (plus
+per-workbook `<workbook>.gridtalk.md` sidecars), `gridtalk
+optimise` (deterministic failure-driven proposer → train eval →
+dev gate → commit/reject as versioned adapters, CARD.md record),
+adapter picker + CARD viewer in the UI. Acceptance met: the demo
+workbook optimise cycle accepts v1 (`formula-number` rule +
+`ref_context` knob), train 0% → 16.7%, dev 16.7% → 50%, visible
+as an ADAPTER.md diff (`docs/adapters.md`).
 
 **Phase E (hermit interop, optional):** document/validate
 driving GridTalk from hermit's Python evolvers via the JSON CLI;

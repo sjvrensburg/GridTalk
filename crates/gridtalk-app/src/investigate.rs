@@ -29,11 +29,26 @@ pub struct Investigation {
 /// search -> cells -> formulas (plus what_if when the question asks
 /// for it); the backend then composes the final cited answer from
 /// the gathered context. Every step lands in the trail.
+#[allow(dead_code)] // convenience wrapper over investigate_with
 pub fn investigate(
     question: &str,
     tools: &Tools,
     backend: &dyn ChatBackend,
     max_steps: usize,
+) -> Result<Investigation, gridtalk_infer::InferError> {
+    investigate_with(question, tools, backend, max_steps, None, None)
+}
+
+/// Adapter-aware variant: the adapter's rules/skills are appended
+/// to the system prompt, its `top_k` sizes the search, and an
+/// optional per-workbook sidecar's rules are appended last.
+pub fn investigate_with(
+    question: &str,
+    tools: &Tools,
+    backend: &dyn ChatBackend,
+    max_steps: usize,
+    adapter: Option<&crate::adapter::Adapter>,
+    sidecar: Option<&str>,
 ) -> Result<Investigation, gridtalk_infer::InferError> {
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
@@ -58,7 +73,8 @@ pub fn investigate(
     // Citations come from the structured hits, never scraped from
     // display text. The search step reuses this one search (it is
     // recorded in the trail, not re-executed).
-    let hits = tools.hybrid.search(question, 3);
+    let top_k = adapter.map(|a| a.top_k).unwrap_or(3);
+    let hits = tools.hybrid.search(question, top_k);
     let citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
     let search_result = if hits.is_empty() {
@@ -76,6 +92,20 @@ pub fn investigate(
     });
 
     let mut context = format!("search results:\n{search_result}");
+    // Adapter knob: a question naming a cell gets that cell's
+    // formulas/cells directly, even when retrieval missed it.
+    if adapter.is_some_and(|a| a.ref_context) && trail.len() < max_steps {
+        for tok in question.split_whitespace() {
+            let clean = tok.trim_matches(|c: char| {
+                !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$')
+            });
+            if clean.contains('!') && parse_cell_ref(clean).is_some() {
+                let formulas = run("formulas", &format!("range={clean}"), &mut trail);
+                context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
+                break;
+            }
+        }
+    }
     if let Some(range) = &top_range {
         if trail.len() < max_steps {
             let expanded = run("expand", &format!("range={range}"), &mut trail);
@@ -149,8 +179,18 @@ pub fn investigate(
         }
     }
 
+    let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
+    if let Some(a) = adapter {
+        system.push_str(&a.prompt_for(question));
+    }
+    if let Some(sidecar) = sidecar {
+        if !sidecar.trim().is_empty() {
+            system.push_str("\n\nWorkbook notes (from the .gridtalk.md sidecar):\n");
+            system.push_str(sidecar.trim());
+        }
+    }
     let req = ChatRequest {
-        system: "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".into(),
+        system,
         user: format!("Question: {question}\n\nTool results:\n{context}"),
         max_tokens: 512,
     };

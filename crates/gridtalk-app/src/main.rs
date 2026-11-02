@@ -3,9 +3,11 @@
 //! the grid<->graph two-way sync state machine that the egui front
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
+mod adapter;
 mod bench;
 mod investigate;
 mod mcp;
+mod optimise;
 mod tools;
 
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
@@ -61,6 +63,7 @@ fn main() {
 }
 
 const COMMANDS: &[&str] = &[
+    "adapter",
     "ask",
     "bench",
     "investigate",
@@ -72,6 +75,7 @@ const COMMANDS: &[&str] = &[
     "generate",
     "models",
     "open-in-gridcraft",
+    "optimise",
     "help",
     "--help",
     "-h",
@@ -208,6 +212,134 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        "adapter" => {
+            let root = adapter::adapters_root();
+            match args.get(2).map(|s| s.as_str()) {
+                Some("list") => {
+                    let names = adapter::list_adapters(&root);
+                    if names.is_empty() {
+                        println!("no adapters in {}", root.display());
+                    }
+                    for name in &names {
+                        let a = adapter::load_adapter(&root, name);
+                        println!(
+                            "{name}: v{} top_k={} max_steps={}",
+                            a.version, a.top_k, a.max_steps
+                        );
+                    }
+                    Ok(())
+                }
+                Some("show") => {
+                    let name = args.get(3).ok_or("usage: gridtalk adapter show <name>")?;
+                    let a = adapter::load_adapter(&root, name);
+                    println!(
+                        "adapter {name} v{} top_k={} max_steps={} ref_context={}",
+                        a.version, a.top_k, a.max_steps, a.ref_context
+                    );
+                    println!("--- ADAPTER.md ---");
+                    println!("{}", a.rules);
+                    let card = root.join(name).join("CARD.md");
+                    if card.exists() {
+                        println!("--- CARD.md ---");
+                        println!(
+                            "{}",
+                            std::fs::read_to_string(&card).map_err(|e| e.to_string())?
+                        );
+                    }
+                    Ok(())
+                }
+                Some("rollback") => {
+                    let name = args
+                        .get(3)
+                        .ok_or("usage: gridtalk adapter rollback <name>")?;
+                    let v = adapter::rollback(&root, name)?;
+                    println!("adapter {name} rolled back to v{v}");
+                    Ok(())
+                }
+                _ => Err("usage: gridtalk adapter list|show <name>|rollback <name>".into()),
+            }
+        }
+        "optimise" => {
+            // gridtalk optimise <file> [--adapter <name>] [--rounds 3]
+            let file = args
+                .get(2)
+                .ok_or("usage: gridtalk optimise <file> [--adapter <name>] [--rounds 3]")?;
+            let mut name = "default".to_string();
+            let mut rounds = 3usize;
+            {
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--adapter" => {
+                            name = args.get(i + 1).ok_or("--adapter needs a value")?.clone();
+                            i += 2;
+                        }
+                        "--rounds" => {
+                            rounds = args
+                                .get(i + 1)
+                                .and_then(|v| v.parse().ok())
+                                .filter(|n| *n >= 1)
+                                .ok_or("--rounds must be a positive integer")?;
+                            i += 2;
+                        }
+                        other => return Err(format!("unknown optimise flag {other}")),
+                    }
+                }
+            }
+            let wb = load_workbook(file)?;
+            let (graph, violations) = build_graph(&wb);
+            if !violations.is_empty() {
+                return Err(format!("graph invariants violated: {violations:?}"));
+            }
+            let hybrid = HybridIndex::build(&wb, &graph);
+            let toolset = tools::Tools {
+                wb: &wb,
+                graph: &graph,
+                hybrid: &hybrid,
+            };
+            let gen = bench::generate_tasks_ex(&wb, 100);
+            let cfg = config_from_env();
+            let backend = backend_from_config(&cfg.inference);
+            warn_if_external(&cfg);
+            let root = adapter::adapters_root();
+            let mut current = adapter::load_adapter(&root, &name);
+            println!(
+                "optimise adapter {name} (v{}) on {} tasks with backend {}",
+                current.version,
+                gen.tasks.len(),
+                backend.name()
+            );
+            for round in 1..=rounds {
+                let outcome = optimise::optimise_round(
+                    &root,
+                    &gen.tasks,
+                    &toolset,
+                    backend.as_ref(),
+                    &current,
+                    round,
+                )?;
+                match &outcome.accepted {
+                    Some((label, train, dev)) => {
+                        println!(
+                            "round {round}: ACCEPTED {label} (train {:.1}%, dev {:.1}%)",
+                            train * 100.0,
+                            dev * 100.0
+                        );
+                        current = adapter::load_adapter(&root, &name);
+                    }
+                    None => {
+                        println!(
+                            "round {round}: no candidate beat train {:.1}% (dev {:.1}%); stopping",
+                            outcome.baseline_train * 100.0,
+                            outcome.baseline_dev * 100.0
+                        );
+                        break;
+                    }
+                }
+            }
+            println!("adapter {name} is now v{}", current.version);
+            Ok(())
+        }
         "bench" => {
             // gridtalk bench generate <file> [--out tasks.json] [--max 100]
             // gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]
@@ -216,7 +348,14 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut flags: std::collections::BTreeMap<String, String> =
                 std::collections::BTreeMap::new();
             {
-                let known = ["--out", "--max", "--tasks", "--split", "--card"];
+                let known = [
+                    "--out",
+                    "--max",
+                    "--tasks",
+                    "--split",
+                    "--card",
+                    "--adapter",
+                ];
                 let mut i = 4;
                 while i < args.len() {
                     let name = &args[i];
@@ -341,8 +480,17 @@ fn run(args: &[String]) -> Result<(), String> {
                     let cfg = config_from_env();
                     let backend = backend_from_config(&cfg.inference);
                     warn_if_external(&cfg);
-                    let report = bench::run_bench(&tasks, &toolset, backend.as_ref(), &split, 8)
-                        .map_err(|e| format!("bench run failed: {e}"))?;
+                    let bench_adapter = flag("--adapter")
+                        .map(|name| adapter::load_adapter(&adapter::adapters_root(), &name));
+                    let report = bench::run_bench_with(
+                        &tasks,
+                        &toolset,
+                        backend.as_ref(),
+                        &split,
+                        bench_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
+                        bench_adapter.as_ref(),
+                    )
+                    .map_err(|e| format!("bench run failed: {e}"))?;
                     let card =
                         bench::render_card_with_skipped(&report, tasks.len(), skipped_formulas);
                     match flag("--card") {
@@ -369,10 +517,29 @@ fn run(args: &[String]) -> Result<(), String> {
         "investigate" => {
             let file = args
                 .get(2)
-                .ok_or("usage: gridtalk investigate <file> <question...>")?;
-            let question = args[3..].join(" ");
+                .ok_or("usage: gridtalk investigate <file> [--adapter <name>] <question...>")?;
+            // Extract an optional --adapter <name> pair before the
+            // question words are joined.
+            let mut adapter_name: Option<String> = None;
+            let mut question_words: Vec<String> = Vec::new();
+            {
+                let mut i = 3;
+                while i < args.len() {
+                    if args[i] == "--adapter" {
+                        adapter_name =
+                            Some(args.get(i + 1).ok_or("--adapter needs a value")?.clone());
+                        i += 2;
+                    } else {
+                        question_words.push(args[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+            let question = question_words.join(" ");
             if question.is_empty() {
-                return Err("usage: gridtalk investigate <file> <question...>".into());
+                return Err(
+                    "usage: gridtalk investigate <file> [--adapter <name>] <question...>".into(),
+                );
             }
             let wb = load_workbook(file)?;
             let (graph, violations) = build_graph(&wb);
@@ -388,8 +555,19 @@ fn run(args: &[String]) -> Result<(), String> {
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
-            let inv = investigate::investigate(&question, &tools, backend.as_ref(), 8)
-                .map_err(|e| format!("backend failed: {e}"))?;
+            let cli_adapter = adapter_name
+                .as_ref()
+                .map(|n| adapter::load_adapter(&adapter::adapters_root(), n));
+            let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
+            let inv = investigate::investigate_with(
+                &question,
+                &tools,
+                backend.as_ref(),
+                cli_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
+                cli_adapter.as_ref(),
+                sidecar.as_deref(),
+            )
+            .map_err(|e| format!("backend failed: {e}"))?;
             for step in &inv.trail {
                 println!(
                     "[tool] {} ({}) -> {}",
@@ -579,7 +757,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

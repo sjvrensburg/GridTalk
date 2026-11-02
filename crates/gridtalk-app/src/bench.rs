@@ -6,7 +6,7 @@
 //! over the tasks and writes a CARD.md score report, for the echo
 //! backend (the floor) or the configured local model.
 
-use crate::investigate::investigate;
+use crate::investigate::investigate_with;
 use crate::tools::Tools;
 use gridtalk_graph::eval::{eval_cell_in_workbook, what_if_in_workbook};
 use gridtalk_graph::{formula_refs_qualified, CellValue, WorkbookSnapshot};
@@ -307,6 +307,7 @@ impl BenchReport {
 }
 
 /// Run tasks through the investigate harness and score them.
+#[allow(dead_code)] // convenience wrapper over run_bench_with
 pub fn run_bench(
     tasks: &[BenchTask],
     tools: &Tools,
@@ -314,13 +315,24 @@ pub fn run_bench(
     split: &str,
     max_steps: usize,
 ) -> Result<BenchReport, gridtalk_infer::InferError> {
+    run_bench_with(tasks, tools, backend, split, max_steps, None)
+}
+
+pub fn run_bench_with(
+    tasks: &[BenchTask],
+    tools: &Tools,
+    backend: &dyn ChatBackend,
+    split: &str,
+    max_steps: usize,
+    adapter: Option<&crate::adapter::Adapter>,
+) -> Result<BenchReport, gridtalk_infer::InferError> {
     let mut results = Vec::new();
     for task in tasks.iter().filter(|t| split == "all" || t.split == split) {
         let started = std::time::Instant::now();
         // A backend error fails that one task; the run still
         // produces a (partial) CARD for the rest.
         let (passed, cited, steps, error) =
-            match investigate(&task.question, tools, backend, max_steps) {
+            match investigate_with(&task.question, tools, backend, max_steps, adapter, None) {
                 Ok(inv) => (
                     judge_number(&inv.answer, task.expected),
                     citation_hit(&inv.citations, &task.citation),

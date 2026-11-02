@@ -44,6 +44,9 @@ pub struct UiPrefs {
     pub first_run_done: bool,
     #[serde(default)]
     pub config_path: String,
+    /// Active adapter name ("" = none).
+    #[serde(default)]
+    pub active_adapter: String,
 }
 
 /// GridTalk's config directory: `$GRIDTALK_CONFIG_DIR` when set,
@@ -157,6 +160,8 @@ pub struct GridTalkApp {
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
     frame_revision: u64,
+    show_adapters: bool,
+    active_adapter: String,
     layout_size: (f32, f32),
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
@@ -175,6 +180,7 @@ impl Default for GridTalkApp {
         } else {
             std::env::var("GRIDTALK_CONFIG").unwrap_or_default()
         };
+        let saved_adapter = prefs.active_adapter.clone();
         GridTalkApp {
             inc: None,
             graph: Graph::default(),
@@ -190,6 +196,8 @@ impl Default for GridTalkApp {
             status: "Open a workbook (File > Open, or pass a path as argv[1]).".into(),
             show_settings: false,
             config_path,
+            show_adapters: false,
+            active_adapter: saved_adapter,
             current_path: None,
             saved_revision: 0,
             selected_sheet: 0,
@@ -402,6 +410,43 @@ impl GridTalkApp {
         self.layout_revision = u64::MAX; // force fresh layout for the new graph
     }
 
+    /// Load the active adapter's rules/top_k for chat (minimal
+    /// reader mirroring the app crate's adapter format).
+    fn active_adapter_prompt(&self) -> (String, usize) {
+        if self.active_adapter.is_empty() {
+            return (String::new(), 3);
+        }
+        let dir = config_dir().join("adapters").join(&self.active_adapter);
+        let knobs = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
+        let get = |key: &str| {
+            knobs.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == key {
+                    Some(v.trim().trim_matches('"').to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let version: u32 = get("version").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let top_k: usize = get("top_k").and_then(|v| v.parse().ok()).unwrap_or(3);
+        let rules_dir = if version > 0 && dir.join(format!("v{version}")).is_dir() {
+            dir.join(format!("v{version}"))
+        } else {
+            dir
+        };
+        let rules = std::fs::read_to_string(rules_dir.join("ADAPTER.md")).unwrap_or_default();
+        let text = if rules.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nAdapter rules (learned for this workbook shape):\n{}",
+                rules.trim()
+            )
+        };
+        (text, top_k.clamp(1, 25))
+    }
+
     fn ask(&mut self) {
         let question = self.chat_input.trim().to_string();
         if question.is_empty() || self.chat_busy {
@@ -413,7 +458,8 @@ impl GridTalkApp {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
-        let hits = index.search(&question, 3);
+        let (adapter_prompt, adapter_top_k) = self.active_adapter_prompt();
+        let hits = index.search(&question, adapter_top_k);
         if hits.is_empty() {
             self.push_chat(
                 "gridtalk",
@@ -453,7 +499,9 @@ impl GridTalkApp {
             };
             let backend = backend_from_config(&cfg.inference);
             let req = ChatRequest {
-                system: "You answer questions about a spreadsheet using only the cited context. Always cite the range.".into(),
+                system: format!(
+                    "You answer questions about a spreadsheet using only the cited context. Always cite the range.{adapter_prompt}"
+                ),
                 user: format!("Question: {question}\n\nContext:\n{context}"),
                 max_tokens: 512,
             };
@@ -730,6 +778,14 @@ impl eframe::App for GridTalkApp {
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
+                let adapter_label = if self.active_adapter.is_empty() {
+                    "Adapter: none".to_string()
+                } else {
+                    format!("Adapter: {}", self.active_adapter)
+                };
+                if ui.button(adapter_label).clicked() {
+                    self.show_adapters = !self.show_adapters;
+                }
                 ui.label(egui::RichText::new(&self.status).small())
                     .on_hover_text(&self.status);
             });
@@ -822,6 +878,67 @@ impl eframe::App for GridTalkApp {
                         )
                     }
                 }
+            }
+        }
+
+        if self.show_adapters {
+            let root = config_dir().join("adapters");
+            let mut names: Vec<String> = std::fs::read_dir(&root)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.path().is_dir())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            let mut chosen: Option<String> = None;
+            let active = self.active_adapter.clone();
+            egui::Window::new("Adapters")
+                .open(&mut self.show_adapters)
+                .show(&ctx, |ui| {
+                    ui.label(format!("Adapters in {}", root.display()));
+                    if ui.selectable_label(active.is_empty(), "(none)").clicked() {
+                        chosen = Some(String::new());
+                    }
+                    for name in &names {
+                        // Read the version pointer for display.
+                        let version = std::fs::read_to_string(root.join(name).join("adapter.toml"))
+                            .ok()
+                            .and_then(|text| {
+                                text.lines().find_map(|l| {
+                                    l.trim()
+                                        .strip_prefix("version")
+                                        .and_then(|v| v.split('=').nth(1))
+                                        .map(|v| v.trim().to_string())
+                                })
+                            })
+                            .unwrap_or_else(|| "0".into());
+                        if ui
+                            .selectable_label(active == *name, format!("{name} (v{version})"))
+                            .clicked()
+                        {
+                            chosen = Some(name.clone());
+                        }
+                    }
+                    if !active.is_empty() {
+                        ui.separator();
+                        ui.label("CARD.md:");
+                        let card = std::fs::read_to_string(root.join(&active).join("CARD.md"))
+                            .unwrap_or_else(|_| "(no eval record yet)".into());
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.label(card);
+                            });
+                    }
+                    ui.label("Optimise from the CLI: gridtalk optimise <workbook>");
+                });
+            if let Some(name) = chosen {
+                self.active_adapter = name;
+                self.prefs.active_adapter = self.active_adapter.clone();
+                self.prefs.save();
             }
         }
 
