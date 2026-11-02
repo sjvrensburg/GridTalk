@@ -104,7 +104,9 @@ pub fn adapters_root() -> PathBuf {
     }
     if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
         if let Some(parent) = PathBuf::from(cfg).parent() {
-            return parent.join("adapters");
+            if !parent.as_os_str().is_empty() {
+                return parent.join("adapters");
+            }
         }
     }
     if let Some(d) = dirs_path() {
@@ -255,9 +257,13 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                         .filter(|t| !t.is_empty())
                         .collect();
                     // An explicit empty Triggers line means
-                    // "never auto-apply", not "always".
+                    // "never auto-apply"; "(always)" is the explicit
+                    // always-apply marker commit_version writes for
+                    // empty triggers (so bodies round-trip).
                     triggers = if parsed.is_empty() {
                         vec!["\u{1}never".to_string()]
+                    } else if parsed == ["(always)"] {
+                        Vec::new()
                     } else {
                         parsed
                     };
@@ -307,6 +313,10 @@ fn load_from_dir(
 /// Load the active version of an adapter. A missing adapter is an
 /// empty adapter (version 0), not an error — chat works unadapted.
 pub fn load_adapter(root: &Path, name: &str) -> Adapter {
+    if !valid_adapter_name(name) {
+        // Never alias an invalid name onto the __invalid__ adapter.
+        return Adapter::empty(name);
+    }
     let dir = adapter_dir(root, name);
     let knobs_text = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
     let (version, top_k, max_steps, ref_context) = parse_knobs(&knobs_text);
@@ -426,7 +436,13 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
                 return Err(format!("invalid skill name {:?}", skill.name));
             }
             let mut text = String::new();
-            if !skill.triggers.is_empty() {
+            if skill.triggers.iter().any(|t| t == "\u{1}never") {
+                // Explicit empty line maps back to the sentinel on
+                // load; never write the raw 0x01 byte to disk.
+                text.push_str("Triggers:\n");
+            } else if skill.triggers.is_empty() {
+                text.push_str("Triggers: (always)\n");
+            } else {
                 text.push_str(&format!("Triggers: {}\n", skill.triggers.join(", ")));
             }
             text.push_str(&skill.body);
@@ -461,6 +477,9 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
 
 /// Move the active pointer back one version (no history rewrite).
 pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
+    if !valid_adapter_name(name) {
+        return Err(format!("invalid adapter name {name:?}"));
+    }
     let current = load_adapter(root, name);
     if current.version == 0 {
         return Err(format!("adapter {name} has no committed versions"));
@@ -505,6 +524,9 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
 
 /// Append an eval record to the adapter's CARD.md.
 pub fn append_card(root: &Path, name: &str, markdown: &str) -> Result<(), String> {
+    if !valid_adapter_name(name) {
+        return Err(format!("invalid adapter name {name:?}"));
+    }
     let dir = adapter_dir(root, name);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     use std::io::Write as _;
@@ -643,6 +665,38 @@ mod tests {
         }];
         let md = export_agents_md(&b);
         assert!(!md.contains("NEVER BODY"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skill_trigger_markers_round_trip() {
+        let root = temp_root("markers");
+        let mut a = Adapter::empty("demo");
+        a.skills = vec![
+            Skill {
+                name: "always".into(),
+                triggers: vec![],
+                body: "Triggers: x\nAlways body.".into(),
+            },
+            Skill {
+                name: "never".into(),
+                triggers: vec!["\u{1}never".into()],
+                body: "Never body.".into(),
+            },
+        ];
+        commit_version(&root, &a).unwrap();
+        // No raw sentinel byte is written to disk.
+        let on_disk = std::fs::read_to_string(root.join("demo/v1/skills/never.md")).unwrap();
+        assert!(!on_disk.contains('\u{1}'));
+        let loaded = load_adapter(&root, "demo");
+        let always = loaded.skills.iter().find(|s| s.name == "always").unwrap();
+        assert!(
+            always.triggers.is_empty(),
+            "always stays always: {always:?}"
+        );
+        assert!(always.body.contains("Always body."));
+        let never = loaded.skills.iter().find(|s| s.name == "never").unwrap();
+        assert!(never.triggers.iter().any(|t| t == "\u{1}never"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

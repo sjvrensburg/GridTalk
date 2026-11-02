@@ -81,9 +81,9 @@ pub fn adapters_root() -> std::path::PathBuf {
     }
     if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
         if let Some(parent) = std::path::PathBuf::from(&cfg).parent() {
-            // Matches gridtalk-app: a bare filename's parent is
-            // Some(""), which joins to a CWD-relative "adapters".
-            return parent.join("adapters");
+            if !parent.as_os_str().is_empty() {
+                return parent.join("adapters");
+            }
         }
     }
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
@@ -96,7 +96,14 @@ pub fn adapters_root() -> std::path::PathBuf {
             return std::path::PathBuf::from(xdg).join("gridtalk/adapters");
         }
     }
-    config_dir().join("adapters")
+    // adapter.rs dirs_path fallback: HOME/.config (not the Roaming
+    // config_dir), so the mirror is exact.
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => {
+            std::path::PathBuf::from(home).join(".config/gridtalk/adapters")
+        }
+        _ => config_dir().join("adapters"),
+    }
 }
 
 /// Mirror of gridtalk-app's adapter-name rule: a single path
@@ -697,9 +704,10 @@ impl GridTalkApp {
                 // an explicit empty one means never auto-apply.
                 let mut triggers: Vec<String> = Vec::new();
                 let mut has_header = false;
+                let mut found_header = false;
                 let mut body_lines: Vec<&str> = Vec::new();
                 for (idx, line) in body.lines().enumerate() {
-                    let parsed = if idx < 3 {
+                    let parsed = if idx < 3 && !found_header {
                         line.trim()
                             .strip_prefix("Triggers:")
                             .or_else(|| line.trim().strip_prefix("triggers:"))
@@ -708,6 +716,7 @@ impl GridTalkApp {
                     };
                     if let Some(rest) = parsed {
                         has_header = true;
+                        found_header = true;
                         let parsed: Vec<String> = rest
                             .split(',')
                             .map(|t| t.trim().to_lowercase())
@@ -715,6 +724,8 @@ impl GridTalkApp {
                             .collect();
                         triggers = if parsed.is_empty() {
                             vec!["\u{1}never".to_string()]
+                        } else if parsed == ["(always)"] {
+                            Vec::new()
                         } else {
                             parsed
                         };
@@ -847,7 +858,15 @@ impl GridTalkApp {
         // a worker thread; the UI polls the channel each frame.
         std::thread::spawn(move || {
             let cfg = if config_path.is_empty() {
-                Config::default()
+                // Blank means the platform default the docs
+                // promise (<config dir>/gridtalk/config.toml),
+                // matching the CLI's discovery.
+                let platform = config_dir().join("config.toml");
+                if platform.exists() {
+                    Config::load(&platform)
+                } else {
+                    Config::default()
+                }
             } else {
                 Config::load(std::path::Path::new(&config_path))
             };
@@ -1353,7 +1372,7 @@ impl eframe::App for GridTalkApp {
 
         if self.show_settings {
             egui::Window::new("Settings").show(&ctx, |ui| {
-                ui.label("Config file (blank = local echo backend):");
+                ui.label("Config file (blank = platform config dir, else local echo backend):");
                 let resp = ui.text_edit_singleline(&mut self.config_path);
                 // Persist on Enter/focus loss, not on every keystroke,
                 // so a half-typed path is never saved mid-edit.
@@ -1732,8 +1751,18 @@ fn parse_cell_input(text: &str) -> CellValue {
             expr: expr.to_string(),
             cached: None,
         }
+    } else if t.eq_ignore_ascii_case("true") {
+        CellValue::Bool(true)
+    } else if t.eq_ignore_ascii_case("false") {
+        CellValue::Bool(false)
     } else if let Ok(n) = t.parse::<f64>() {
-        CellValue::Number(n)
+        // NaN/inf parse as f64 but are not cell numbers (ingest
+        // treats them as text); mirror that.
+        if n.is_finite() {
+            CellValue::Number(n)
+        } else {
+            CellValue::Text(t.to_string())
+        }
     } else {
         CellValue::Text(t.to_string())
     }

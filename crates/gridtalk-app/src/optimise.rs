@@ -244,7 +244,24 @@ pub fn optimise_round(
             row.2 = dev_acc;
         }
         if dev_acc >= baseline_dev - 1e-9 {
-            let version = commit_version(root, &cand.adapter)?;
+            // A commit failure still records the round in CARD.md
+            // (the documented contract) before propagating.
+            let version = match commit_version(root, &cand.adapter) {
+                Ok(v) => v,
+                Err(e) => {
+                    card_best_effort(
+                        root,
+                        &current.name,
+                        &format!(
+                            "\n## Round {round}: COMMIT FAILED {} (train {:.1}%, dev {:.1}%)\n\n- error: {e}\n",
+                            cand.label,
+                            train_acc * 100.0,
+                            dev_acc * 100.0
+                        ),
+                    );
+                    return Err(e);
+                }
+            };
             let mut entry = format!(
                 "\n## Round {round}: ACCEPTED {} as v{version}\n\n- train: {:.1}% -> {:.1}%\n- dev: {:.1}% -> {:.1}%\n",
                 cand.label,
@@ -295,13 +312,20 @@ pub fn optimise_round(
         }
     }
 
+    // Dev-rejected rounds must be distinguishable by the caller
+    // from no-improvement rounds.
+    let note = if accepted.is_none() && tried.iter().any(|(_, t, _, _)| *t > baseline_train) {
+        Some("candidates improved train but were rejected by the dev gate".to_string())
+    } else {
+        None
+    };
     Ok(RoundOutcome {
         round,
         baseline_train,
         baseline_dev,
         accepted,
         tried,
-        note: None,
+        note,
     })
 }
 

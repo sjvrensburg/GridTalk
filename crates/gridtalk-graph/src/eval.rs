@@ -317,10 +317,10 @@ impl<'a> Parser<'a> {
                 s.parse::<f64>()
                     .map_err(|_| EvalError::Parse(format!("bad number {s}")))?
             }
-            Some(c) if c.is_ascii_alphabetic() || c == '$' || c == '\'' => {
+            Some(c) if c.is_alphabetic() || c == '_' || c == '$' || c == '\'' => {
                 // Optional sheet qualifier: Name! or 'My Sheet'!
                 let mut target_sheet = self.sheet_idx;
-                if c == '\'' || c.is_ascii_alphabetic() {
+                if c == '\'' || c.is_alphabetic() || c == '_' {
                     if let Some((idx, next)) = self.try_sheet_qualifier() {
                         target_sheet = idx;
                         self.pos = next;
@@ -512,7 +512,7 @@ impl<'a> Parser<'a> {
         let mut target = self.sheet_idx;
         let mut qualified = false;
         if matches!(self.peek(), Some('\''))
-            || matches!(self.peek(), Some(c) if c.is_ascii_alphabetic())
+            || matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_')
         {
             if let Some((idx, next)) = self.try_sheet_qualifier() {
                 target = idx;

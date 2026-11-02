@@ -256,13 +256,17 @@ fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelErr
         };
         tensor_extents.push((name, offset, size.unwrap_or(0)));
     }
-    // GGUF requires a power-of-two alignment; bound it so hostile
-    // metadata cannot overflow the data_start computation.
-    let alignment: u64 = metadata
-        .get("general.alignment")
-        .and_then(|v| v.parse().ok())
-        .filter(|a: &u64| a.is_power_of_two() && *a <= 4096)
-        .unwrap_or(32);
+    // gguf.cpp rejects zero / non-power-of-two alignment outright;
+    // mirror that instead of silently substituting 32. Any
+    // power-of-two is accepted (checked_mul guards overflow).
+    let alignment: u64 = match metadata.get("general.alignment") {
+        Some(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|a| a.is_power_of_two())
+            .ok_or_else(|| ModelError::NotGguf(format!("invalid general.alignment {v:?}")))?,
+        None => 32,
+    };
     let data_start = (r.pos as u64)
         .div_ceil(alignment)
         .checked_mul(alignment)
@@ -454,7 +458,7 @@ impl ModelManager {
     /// header. Copies to a temp file and renames, so a crash never
     /// leaves a half-written model in the cache.
     pub fn import(&self, src: &Path) -> Result<ModelEntry, ModelError> {
-        let info = parse_gguf_file(src)?;
+        parse_gguf_file(src)?; // validate the source up front
         std::fs::create_dir_all(&self.dir)?;
         let file_name = src
             .file_name()
@@ -464,18 +468,19 @@ impl ModelManager {
         let name = Self::checked_name(&file_name)?;
         let dest = self.dir.join(&name);
         let (tmp, mut tmp_file) = unique_tmp(&self.dir, &name)?;
-        let copy_result = (|| -> Result<u64, ModelError> {
+        let copy_result = (|| -> Result<(u64, GgufInfo), ModelError> {
             let mut from = std::fs::File::open(src)?;
             let n = std::io::copy(&mut from, &mut tmp_file)?;
             tmp_file.sync_all()?;
             drop(tmp_file);
             // Re-validate the copied bytes, not just the source
-            // (the source may have changed during the copy).
-            parse_gguf_file(&tmp)?;
-            Ok(n)
+            // (the source may have changed during the copy), and
+            // return the COPY's info, not the pre-copy parse.
+            let copied_info = parse_gguf_file(&tmp)?;
+            Ok((n, copied_info))
         })();
-        let bytes = match copy_result {
-            Ok(n) => n,
+        let (bytes, info) = match copy_result {
+            Ok(pair) => pair,
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);

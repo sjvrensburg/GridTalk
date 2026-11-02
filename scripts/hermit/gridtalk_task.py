@@ -53,7 +53,7 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
     cmd.append(str(task["question"]))
     started = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return RunOutput(
             output="",
@@ -145,7 +145,7 @@ def _parse_cell(ref: str):
     """'Sheet1!B12' or 'B12' -> (sheet|None, row, col)."""
     sheet, _, cell = str(ref).rpartition("!")
     sheet = sheet.strip("'") or None
-    m = _CELL.match(cell.strip())
+    m = _CELL.match(cell.strip().replace("$", ""))
     if not m:
         return None
     col = 0
@@ -214,6 +214,8 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     if expected is None:
         return False
     esheet, erow, ecol = expected
+    if esheet is None:
+        return False  # Rust parse_cell_ref requires a sheet
     cited: list[str] = []
     for line in str((extra or {}).get("stdout", "")).splitlines():
         if line.strip().startswith("citations:"):
@@ -223,15 +225,23 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
         # standalone reference) and contain the expected cell.
         if not c or "!" not in c or not _contains_bounded(answer or "", c):
             continue
-        rng = c.rpartition("!")[2] if "!" in c else c
-        sheet = c.rpartition("!")[0].strip("'") or None if "!" in c else None
-        lo_s, _, hi_s = rng.partition(":")
-        lo, hi = _parse_cell(lo_s), _parse_cell(hi_s or lo_s)
+        # Mirror tools::parse_range: Sheet!Lo[:End], where the end
+        # may repeat the sheet qualifier (Sheet1!A1:Sheet1!B2).
+        lo_full, _, hi_full = c.partition(":")
+        lo, hi = _parse_cell(lo_full), _parse_cell(hi_full or lo_full)
+        sheet = lo[0] if lo else None
+        if hi is not None and hi[0] is not None and hi[0] != sheet:
+            continue
         if lo is None or hi is None:
             continue
-        if sheet is not None and esheet is not None and sheet != esheet:
+        if sheet != esheet:
             continue
-        if lo[1] <= erow <= hi[1] and min(lo[2], hi[2]) <= ecol <= max(lo[2], hi[2]):
+        # parse_range rejects reversed ranges and >10000 cells.
+        if hi[1] < lo[1] or hi[2] < lo[2]:
+            continue
+        if (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 10000:
+            continue
+        if lo[1] <= erow <= hi[1] and lo[2] <= ecol <= hi[2]:
             return True
     return False
 

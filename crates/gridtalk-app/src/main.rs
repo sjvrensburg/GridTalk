@@ -939,7 +939,9 @@ fn config_from_env() -> Config {
 }
 
 fn gridtalk_app_config_dir() -> std::path::PathBuf {
-    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+    // Mirrors dirs::config_dir (the UI's resolution): Roaming
+    // APPDATA on Windows, XDG_CONFIG_HOME on Linux.
+    if let Ok(appdata) = std::env::var("APPDATA") {
         if !appdata.is_empty() {
             return std::path::PathBuf::from(appdata).join("gridtalk");
         }
@@ -949,7 +951,7 @@ fn gridtalk_app_config_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(xdg).join("gridtalk");
         }
     }
-    if let Ok(appdata) = std::env::var("APPDATA") {
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
         if !appdata.is_empty() {
             return std::path::PathBuf::from(appdata).join("gridtalk");
         }

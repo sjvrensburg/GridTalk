@@ -55,11 +55,12 @@ impl Index {
         // sheet. Assign them to sheets by IDENTITY (region counts
         // re-derived per sheet), so duplicate sheet names render
         // from their own sheet instead of collapsing by name.
-        let region_counts: Vec<usize> = wb
+        let derived_regions: Vec<Vec<gridtalk_graph::Region>> = wb
             .sheets
             .iter()
-            .map(|sh| gridtalk_graph::detect_regions(sh).len())
+            .map(gridtalk_graph::detect_regions)
             .collect();
+        let region_counts: Vec<usize> = derived_regions.iter().map(|r| r.len()).collect();
         // Prefix sums: region idx -> sheet in O(log sheets).
         let mut prefix: Vec<usize> = Vec::with_capacity(region_counts.len() + 1);
         prefix.push(0);
@@ -73,8 +74,23 @@ impl Index {
         for (region_idx, region) in graph.regions.iter().enumerate() {
             // A stale/mismatched graph must not render one sheet's
             // cells under another sheet's citation range.
-            let assigned = sheet_of_region(region_idx)
-                .filter(|sheet| sheet.name.eq_ignore_ascii_case(&region.range.sheet));
+            // Validate beyond the name: the graph region must equal
+            // the re-derived region at its sheet-local ordinal, or
+            // a stale graph could cross-render duplicate sheets.
+            let sheet_idx = prefix
+                .partition_point(|end| *end <= region_idx)
+                .saturating_sub(1);
+            let local_ordinal = region_idx - prefix[sheet_idx];
+            let ordinal_ok = derived_regions
+                .get(sheet_idx)
+                .and_then(|rs| rs.get(local_ordinal))
+                .is_some_and(|derived| derived.range == region.range);
+            let assigned = if ordinal_ok {
+                sheet_of_region(region_idx)
+                    .filter(|sheet| sheet.name.eq_ignore_ascii_case(&region.range.sheet))
+            } else {
+                None
+            };
             if let Some(sheet) = assigned {
                 let passage = render_passage(sheet, region);
                 // Index the body only: the "Range Sheet1!A1:B2" header

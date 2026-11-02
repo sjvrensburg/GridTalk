@@ -3,7 +3,7 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_many, what_if_in_workbook};
+use gridtalk_graph::eval::{eval_cell_in_workbook, eval_many, what_if_in_workbook};
 use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
@@ -282,7 +282,14 @@ impl<'a> Tools<'a> {
                             .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
                             .filter(|(r, c)| matches!(sheet.get(*r, *c), CellValue::Formula { .. }))
                             .collect();
-                        let evaluated = eval_many(sheet, &coords);
+                        // Workbook-aware evaluation: cross-sheet
+                        // formulas must resolve their other sheet,
+                        // which the single-sheet eval_many cannot.
+                        let _ = eval_many;
+                        let evaluated: Vec<Result<f64, gridtalk_graph::eval::EvalError>> = coords
+                            .iter()
+                            .map(|(r, c)| eval_cell_in_workbook(self.wb, &sheet.name, *r, *c))
+                            .collect();
                         let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
                         let mut lines = Vec::new();
@@ -575,7 +582,7 @@ fn parse_range_inner(a1: &str, capped: bool) -> Option<(String, usize, usize, us
         // The end may repeat the sheet qualifier.
         let b_cell = if b.contains('!') {
             let (end_sheet, cell) = split_sheet_prefix(b)?;
-            if end_sheet != sheet {
+            if !end_sheet.eq_ignore_ascii_case(&sheet) {
                 return None;
             }
             cell

@@ -265,16 +265,13 @@ impl LlamaCppBackend {
         let mut first_token_ms: Option<f64> = None;
         let mut generated = 0usize;
         let mut text_bytes: Vec<u8> = Vec::new();
-        let mut emitted = String::new();
-        // Incremental decoded text for stop-marker scanning: only
-        // the new piece plus a small tail window is rescanned per
-        // token (the whole-buffer rescan was O(n^2)).
-        let mut cumulative = String::new();
-        let mut scanned_len = 0usize;
-        // Incrementally decoded output for emission: only new bytes
-        // are UTF-8-validated per token, never the whole buffer.
+        // Incrementally decoded output: stop-marker scanning and
+        // emission both work on this string, built from new bytes
+        // only per token (never a whole-buffer rescan).
         let mut decoded = String::new();
         let mut decoded_len = 0usize;
+        let mut scanned_len = 0usize;
+        let mut emitted_len = 0usize;
         let mut n_cur = prompt_tokens.len() as i32;
 
         while generated < req.max_tokens {
@@ -293,55 +290,9 @@ impl LlamaCppBackend {
             }
             let piece = vocab.token_to_piece(token, true, None);
             text_bytes.extend_from_slice(&piece);
-            // Stop markers can be split across BPE pieces, so scan
-            // the cumulative text (new piece + tail window only).
-            cumulative.push_str(&String::from_utf8_lossy(&piece));
-            let mut scan_from = scanned_len.saturating_sub(32).min(cumulative.len());
-            while scan_from > 0 && !cumulative.is_char_boundary(scan_from) {
-                scan_from -= 1;
-            }
-            let scan_window = &cumulative[scan_from..];
-            // Any "<|...|>" special in the *text* is a stop marker
-            // (possibly split across pieces, e.g. "<|im_end|").
-            let mut stop_marker = false;
-            for marker in [
-                "<|im_end|>",
-                "<|end_of_text|>",
-                "<|endoftext|>",
-                "<|eot_id|>",
-                "<end_of_turn>",
-                "<|end|>",
-            ] {
-                if let Some(rel_at) = scan_window.find(marker) {
-                    let at = scan_from + rel_at;
-                    // `at` indexes the decoded string; truncate there
-                    // and re-encode (a lossy offset into raw bytes
-                    // could split a UTF-8 sequence).
-                    text_bytes = cumulative.as_bytes()[..at].to_vec();
-                    if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                        if let Some(delta) = text.strip_prefix(emitted.as_str()) {
-                            if !delta.is_empty() {
-                                on_token(delta);
-                                emitted = text.to_string();
-                            }
-                        }
-                    }
-                    stop_marker = true;
-                    break;
-                }
-            }
-            if !stop_marker {
-                scanned_len = cumulative.len();
-            }
-            generated += 1;
-            if stop_marker {
-                break;
-            }
-            // Emit only complete UTF-8 so far (pieces can split a
-            // multi-byte character across tokens), and hold back a
-            // trailing "<|..." fragment that may complete into a
-            // stop marker on the next token. Validation is
-            // incremental: only bytes appended since the last token.
+            // Incremental decode: only new bytes are validated.
+            // A genuinely invalid sequence becomes U+FFFD and is
+            // skipped; only an incomplete trailing sequence waits.
             {
                 let pending = &text_bytes[decoded_len..];
                 match std::str::from_utf8(pending) {
@@ -355,25 +306,68 @@ impl LlamaCppBackend {
                             decoded.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or(""));
                             decoded_len += valid;
                         }
+                        if let Some(bad) = e.error_len() {
+                            decoded.push('\u{FFFD}');
+                            decoded_len += bad;
+                        }
                     }
                 }
-                let unemitted = &decoded[emitted.len()..];
+            }
+            // Stop markers can be split across BPE pieces, so scan
+            // the decoded text (new piece + tail window only). The
+            // scan runs on `decoded` (never a per-piece-lossy
+            // buffer), so split multi-byte characters survive.
+            let mut scan_from = scanned_len.saturating_sub(32).min(decoded.len());
+            while scan_from > 0 && !decoded.is_char_boundary(scan_from) {
+                scan_from -= 1;
+            }
+            let scan_window = &decoded[scan_from..];
+            let mut stop_marker = false;
+            for marker in [
+                "<|im_end|>",
+                "<|end_of_text|>",
+                "<|endoftext|>",
+                "<|eot_id|>",
+                "<end_of_turn>",
+                "<|end|>",
+            ] {
+                if let Some(rel_at) = scan_window.find(marker) {
+                    let at = scan_from + rel_at;
+                    decoded.truncate(at);
+                    text_bytes = decoded.as_bytes().to_vec();
+                    decoded_len = text_bytes.len();
+                    if at > emitted_len {
+                        on_token(&decoded[emitted_len..at]);
+                        emitted_len = at;
+                    }
+                    stop_marker = true;
+                    break;
+                }
+            }
+            if !stop_marker {
+                scanned_len = decoded.len();
+            }
+            generated += 1;
+            if stop_marker {
+                break;
+            }
+            // Hold back a trailing "<|..." fragment that may
+            // complete into a stop marker on the next token.
+            {
+                let unemitted = &decoded[emitted_len..];
                 let safe_end = match unemitted.rfind('<') {
                     Some(at)
                         if unemitted[at..].chars().all(|c| {
                             c == '<' || c == '|' || c.is_ascii_alphanumeric() || c == '_'
                         }) =>
                     {
-                        emitted.len() + at
+                        emitted_len + at
                     }
                     _ => decoded.len(),
                 };
-                if safe_end > emitted.len() {
-                    let delta = &decoded[emitted.len()..safe_end];
-                    if !delta.is_empty() {
-                        on_token(delta);
-                        emitted = decoded[..safe_end].to_string();
-                    }
+                if safe_end > emitted_len {
+                    on_token(&decoded[emitted_len..safe_end]);
+                    emitted_len = safe_end;
                 }
             }
             let mut next_batch = LlamaBatch::new(1, 1);
@@ -387,13 +381,8 @@ impl LlamaCppBackend {
 
         // Flush anything held back (a trailing "<|..." fragment
         // that never completed, or text after the last emit).
-        {
-            let text = String::from_utf8_lossy(&text_bytes).into_owned();
-            if let Some(delta) = text.strip_prefix(emitted.as_str()) {
-                if !delta.is_empty() {
-                    on_token(delta);
-                }
-            }
+        if decoded.len() > emitted_len {
+            on_token(&decoded[emitted_len..]);
         }
 
         let total_ms = started.elapsed().as_secs_f64() * 1000.0;

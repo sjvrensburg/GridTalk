@@ -100,7 +100,10 @@ impl OpenWorkbook {
             ));
         };
         if let Some((old_mtime, old_len, old_ctime, old_hash)) = self.stamp {
-            if (mtime, len, ctime) == (old_mtime, old_len, old_ctime) {
+            // Windows has no change counter in std metadata, so
+            // (mtime, len, file_index) cannot detect an in-place
+            // same-length edit: always fall through to the hash.
+            if !cfg!(windows) && (mtime, len, ctime) == (old_mtime, old_len, old_ctime) {
                 return Ok(());
             }
             if Self::hash_of(&self.path) == Some(old_hash) {

@@ -227,7 +227,7 @@ pub fn node_for_cell_in(
             .filter(|n| n.id == *id)
             .or_else(|| g.nodes.iter().find(|n| n.id == *id));
         node.and_then(|n| n.range.as_ref())
-            .map(|r| r.sheet == sheet && r.contains(row, col))
+            .map(|r| r.sheet.eq_ignore_ascii_case(sheet) && r.contains(row, col))
             .unwrap_or(false)
     })
 }
@@ -246,7 +246,7 @@ impl Graph {
             .filter(|n| {
                 n.range
                     .as_ref()
-                    .map(|r| r.sheet == sheet && r.contains(row, col))
+                    .map(|r| r.sheet.eq_ignore_ascii_case(sheet) && r.contains(row, col))
                     .unwrap_or(false)
             })
             .min_by_key(|n| n.range.as_ref().map(range_area).unwrap_or(u128::MAX))
@@ -1331,7 +1331,11 @@ impl IncrementalSnapshot {
         for edit in &edits {
             if edit.row > 10_000
                 || edit.col > 1_000
-                || !self.snapshot.sheets.iter().any(|s| s.name == edit.sheet)
+                || !self
+                    .snapshot
+                    .sheets
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(&edit.sheet))
             {
                 dropped_ranges.push(RangeRef {
                     sheet: edit.sheet.clone(),
@@ -1353,7 +1357,11 @@ impl IncrementalSnapshot {
                 self.dropped += 1;
                 continue;
             }
-            let known = self.snapshot.sheets.iter().any(|s| s.name == edit.sheet);
+            let known = self
+                .snapshot
+                .sheets
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(&edit.sheet));
             if !known {
                 self.dropped += 1;
                 continue;
@@ -1363,7 +1371,7 @@ impl IncrementalSnapshot {
                 .snapshot
                 .sheets
                 .iter_mut()
-                .find(|s| s.name == edit.sheet)
+                .find(|s| s.name.eq_ignore_ascii_case(&edit.sheet))
             {
                 while sheet.cells.len() <= edit.row {
                     sheet.cells.push(Vec::new());

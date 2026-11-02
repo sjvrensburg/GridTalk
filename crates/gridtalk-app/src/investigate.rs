@@ -5,7 +5,7 @@
 //! `search`, `expand`, `cells`, `formulas`, `what_if`.
 
 pub use crate::tools::parse_cell_ref;
-use crate::tools::{parse_range, Tools};
+use crate::tools::Tools;
 use gridtalk_graph::CellValue;
 use gridtalk_infer::{ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
@@ -144,7 +144,7 @@ pub fn investigate_with(
                 );
             }
             if let Some(range) = top_range.as_ref().or(explicit_target.as_ref()) {
-                if let Some((sheet, _, _, _, _)) = parse_range(range) {
+                if let Some((sheet, _, _, _, _)) = crate::tools::parse_range_uncapped(range) {
                     // Target: an explicit Sheet!Cell in the question,
                     // else the first formula cell in the top region,
                     // else the region's last cell.
@@ -158,7 +158,7 @@ pub fn investigate_with(
                     };
                     let dependent_target = || -> Option<String> {
                         let (osheet, orow, ocol) = override_coord.clone()?;
-                        let (_, r0, c0, r1, c1) = parse_range(range)?;
+                        let (_, r0, c0, r1, c1) = crate::tools::parse_range_uncapped(range)?;
                         let sheet_obj = tools.sheet_for(&sheet)?;
                         for r in r0..=r1 {
                             for c in c0..=c1 {
@@ -201,6 +201,10 @@ pub fn investigate_with(
                             );
                         }
                     }
+                } else {
+                    context.push_str(
+                        "\n\nwhat-if: skipped — the top region could not be parsed for target discovery.",
+                    );
                 }
             }
         }
@@ -354,10 +358,21 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
         let clean =
             tok.trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
         if clean.contains('!') && parse_cell_ref(clean).is_some() {
-            for next in tokens.iter().skip(i + 1).take(3) {
+            for (j, next) in tokens.iter().skip(i + 1).take(4).enumerate() {
                 let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
                 if let Ok(v) = n.parse::<f64>() {
-                    return Some((clean.to_string(), v));
+                    // Same introducer guard as the quoted path:
+                    // immediate value, or after is/becomes/=/to/set.
+                    let introduced = j == 0
+                        || tokens[..i + 1 + j].iter().rev().take(3).any(|t| {
+                            matches!(
+                                t.trim_matches(|c: char| !c.is_alphanumeric()),
+                                "is" | "becomes" | "equals" | "to" | "set" | "at"
+                            ) || t.contains('=')
+                        });
+                    if introduced {
+                        return Some((clean.to_string(), v));
+                    }
                 }
             }
         }
@@ -408,6 +423,7 @@ fn parse_what_if_target(question: &str, override_cell: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::parse_range;
     use gridtalk_graph::{build_graph, parse_delimited, Graph, WorkbookSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::EchoBackend;
