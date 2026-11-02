@@ -252,13 +252,36 @@ fn run(args: &[String]) -> Result<(), String> {
                     // gridtalk adapter export <name> [--out AGENTS.md]
                     let name = args
                         .get(3)
+                        .filter(|n| !n.starts_with("--"))
                         .ok_or("usage: gridtalk adapter export <name> [--out AGENTS.md]")?;
-                    let loaded = load_named_adapter(name);
+                    if !adapter::valid_adapter_name(name) || !root.join(name).is_dir() {
+                        return Err(format!("adapter {name:?} not found"));
+                    }
+                    // Strict flag parsing: at most one --out with a
+                    // non-flag value, nothing else.
+                    let mut out_path: Option<&String> = None;
+                    let mut i = 4;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--out" if out_path.is_none() => {
+                                let value = args
+                                    .get(i + 1)
+                                    .filter(|v| !v.starts_with("--"))
+                                    .ok_or("export flag --out needs a value")?;
+                                out_path = Some(value);
+                                i += 2;
+                            }
+                            other => {
+                                return Err(format!("unknown or duplicate export flag {other}"));
+                            }
+                        }
+                    }
+                    let loaded = adapter::load_adapter(&root, name);
                     let md = adapter::export_agents_md(&loaded);
-                    match args.windows(2).find(|w| w[0] == "--out") {
-                        Some(w) => {
-                            std::fs::write(&w[1], &md).map_err(|e| e.to_string())?;
-                            println!("wrote {} (adapter {name} v{})", w[1], loaded.version);
+                    match out_path {
+                        Some(path) => {
+                            std::fs::write(path, &md).map_err(|e| e.to_string())?;
+                            println!("wrote {} (adapter {name} v{})", path, loaded.version);
                         }
                         None => print!("{md}"),
                     }
@@ -398,6 +421,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     let value = args
                         .get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
                         .ok_or_else(|| format!("bench flag {name} needs a value"))?;
                     if flags.insert(name.clone(), value.clone()).is_some() {
                         return Err(format!("duplicate bench flag {name}"));
@@ -673,7 +697,11 @@ fn run(args: &[String]) -> Result<(), String> {
             // simulation-only), so it currently changes nothing.
             // Anything else is a typo and must not be silently ignored.
             for extra in &args[2..] {
-                if extra != "--allow-write" {
+                if extra == "--allow-write" {
+                    eprintln!(
+                        "gridtalk: warning: --allow-write is a no-op (no write tools exist yet)"
+                    );
+                } else {
                     return Err(format!(
                         "unknown argument {extra} for `gridtalk mcp` (only --allow-write is recognised)"
                     ));
@@ -696,6 +724,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("call") => {
+                    if args.len() > 5 {
+                        return Err("usage: gridtalk tools call <file> '<json>'".into());
+                    }
                     let file = args
                         .get(3)
                         .ok_or("usage: gridtalk tools call <file> '<json>'")?;
@@ -794,7 +825,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

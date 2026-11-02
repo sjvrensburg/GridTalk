@@ -76,7 +76,7 @@ by token id with incremental BPE decode, hybrid `vector_only`
 flagging, async (worker-thread) chat in the UI, formula-preserving
 cell editing with save-to-disk, sheet tabs, virtualised rows, a
 real file dialog, and CI/release hardening (least-privilege
-permissions, `--locked`, candle-gen CI job, create-once releases
+permissions, `--locked`, CI jobs for all crates, create-once releases
 with a version gate). Remaining known limits: the release
 workflow is first exercised on a `v*` tag, and Windows Vulkan
 runtime behaviour is verified only by inspection (no Windows test

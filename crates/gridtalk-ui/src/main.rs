@@ -80,6 +80,46 @@ pub fn adapters_root() -> std::path::PathBuf {
     config_dir().join("adapters")
 }
 
+/// Mirror of gridtalk-app's adapter-name rule: a single path
+/// component, never `.`/`..`/separators/NUL.
+fn valid_adapter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Write bytes atomically (unique temp + rename), like prefs save.
+fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Parsed-value equality for edit-buffer pruning: a formula buffer
+/// matches the stored cell when the expression matches, ignoring
+/// the stored cached value.
+fn edit_buffer_matches(
+    current: &gridtalk_graph::CellValue,
+    parsed: &gridtalk_graph::CellValue,
+) -> bool {
+    use gridtalk_graph::CellValue;
+    match (current, parsed) {
+        (CellValue::Formula { expr: a, .. }, CellValue::Formula { expr: b, .. }) => {
+            a.trim() == b.trim()
+        }
+        _ => current == parsed,
+    }
+}
+
 impl UiPrefs {
     pub fn path() -> std::path::PathBuf {
         config_dir().join("ui-state.json")
@@ -130,10 +170,26 @@ impl UiPrefs {
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                // Atomic: write temp, then rename over the target.
-                let tmp = p.with_extension("json.tmp");
-                let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &p));
+                // Atomic + durable: unique temp, fsync, rename, fsync
+                // the directory; clean the temp up on failure.
+                let tmp = p.with_extension(format!("json.tmp-{}", std::process::id()));
+                let result = (|| -> std::io::Result<()> {
+                    use std::io::Write as _;
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(text.as_bytes())?;
+                    f.sync_all()?;
+                    drop(f);
+                    std::fs::rename(&tmp, &p)?;
+                    #[cfg(unix)]
+                    if let Some(parent) = p.parent() {
+                        if let Ok(dir) = std::fs::File::open(parent) {
+                            let _ = dir.sync_all();
+                        }
+                    }
+                    Ok(())
+                })();
                 if let Err(e) = result {
+                    let _ = std::fs::remove_file(&tmp);
                     eprintln!("gridtalk-ui: warning: cannot save {}: {e}", p.display());
                 }
             }
@@ -212,6 +268,7 @@ pub struct GridTalkApp {
     graph_version: u64,
     chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
     chat_busy: bool,
+    chat_started: Option<std::time::Instant>,
 }
 
 impl Default for GridTalkApp {
@@ -223,9 +280,12 @@ impl Default for GridTalkApp {
             std::env::var("GRIDTALK_CONFIG").unwrap_or_default()
         };
         let saved_adapter = prefs.active_adapter.clone();
-        // A deleted/renamed adapter must not stay silently active.
+        // A deleted/renamed adapter must not stay silently active,
+        // and a hand-edited prefs value must never escape the
+        // adapters root (path traversal via prefs).
         let saved_adapter = if !saved_adapter.is_empty()
-            && !adapters_root().join(&saved_adapter).is_dir()
+            && (!valid_adapter_name(&saved_adapter)
+                || !adapters_root().join(&saved_adapter).is_dir())
         {
             eprintln!(
                 "gridtalk-ui: warning: active adapter {saved_adapter:?} no longer exists; clearing it"
@@ -268,6 +328,7 @@ impl Default for GridTalkApp {
             graph_version: 0,
             chat_rx: None,
             chat_busy: false,
+            chat_started: None,
             wizard_step: 0,
             wizard_backend: "local".into(),
             wizard_model_path: String::new(),
@@ -432,6 +493,7 @@ impl GridTalkApp {
                 self.chat.clear();
                 self.chat_rx = None;
                 self.chat_busy = false;
+                self.chat_started = None;
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Open failed: {e}"),
@@ -507,7 +569,12 @@ impl GridTalkApp {
         }
         // Skills: a `Triggers:` line in the first three lines
         // scopes the skill (word-boundary match); none = always.
-        let q_padded = format!(" {} ", question.to_lowercase());
+        let q_words: Vec<String> = question
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect();
         if let Ok(entries) = std::fs::read_dir(rules_dir.join("skills")) {
             let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
             paths.sort();
@@ -535,9 +602,17 @@ impl GridTalkApp {
                     }
                 }
                 let applies = !has_header
-                    || triggers
-                        .iter()
-                        .any(|t| q_padded.contains(&format!(" {t} ")));
+                    || triggers.iter().any(|t| {
+                        let tw: Vec<&str> = t
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|w| !w.is_empty())
+                            .collect();
+                        !tw.is_empty()
+                            && tw.len() <= q_words.len()
+                            && q_words
+                                .windows(tw.len())
+                                .any(|w| w.iter().map(|s| s.as_str()).collect::<Vec<_>>() == tw)
+                    });
                 if applies {
                     text.push_str(&format!("\n\nSkill:\n{}", body.trim()));
                 }
@@ -643,6 +718,7 @@ impl GridTalkApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_rx = Some(rx);
         self.chat_busy = true;
+        self.chat_started = Some(std::time::Instant::now());
         // Generation (potentially seconds on a local model) runs on
         // a worker thread; the UI polls the channel each frame.
         std::thread::spawn(move || {
@@ -712,7 +788,7 @@ impl GridTalkApp {
         let result: Result<(), String> = match ext.as_str() {
             "xlsx" => gridtalk_graph::to_xlsx_bytes(&snapshot)
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string())),
+                .and_then(|bytes| write_atomic_bytes(path, &bytes)),
             "csv" | "tsv" => {
                 if snapshot.sheets.len() > 1 {
                     Err(format!(
@@ -722,7 +798,7 @@ impl GridTalkApp {
                 } else {
                     let delim = if ext == "tsv" { '\t' } else { ',' };
                     let text = snapshot_to_delimited(&snapshot, delim);
-                    std::fs::write(path, text).map_err(|e| e.to_string())
+                    write_atomic_bytes(path, text.as_bytes())
                 }
             }
             "ods" => Err("ODS is read-only in GridTalk; use Save As to write .xlsx or .csv".into()),
@@ -787,6 +863,9 @@ impl eframe::App for GridTalkApp {
         // again (saved/opened), so it works more than once.
         if !self.dirty() {
             self.close_armed = false;
+            // A stale discard-confirmation must not survive a save:
+            // the next Open click would otherwise discard silently.
+            self.pending_open = None;
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.close_armed {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -805,6 +884,22 @@ impl eframe::App for GridTalkApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             }
         }
+        // Watchdog: a worker that never sends (hung backend, lost
+        // cancel flag) must not wedge chat forever.
+        if self.chat_busy
+            && self
+                .chat_started
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(600))
+        {
+            if let Some(cancel) = &self.chat_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.chat_rx = None;
+            self.chat_busy = false;
+            self.chat_started = None;
+            self.chat_cancel = None;
+            self.status = "Generation timed out after 10 minutes; chat is ready again.".into();
+        }
         // Collect finished chat generations (worker thread).
         if let Some(rx) = &self.chat_rx {
             match rx.try_recv() {
@@ -816,6 +911,7 @@ impl eframe::App for GridTalkApp {
                     }
                     self.chat_rx = None;
                     self.chat_busy = false;
+                    self.chat_started = None;
                     self.chat_cancel = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -826,6 +922,7 @@ impl eframe::App for GridTalkApp {
                     self.status = "Chat worker disconnected.".into();
                     self.chat_rx = None;
                     self.chat_busy = false;
+                    self.chat_started = None;
                     self.chat_cancel = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -846,7 +943,7 @@ impl eframe::App for GridTalkApp {
                         .get(*sheet_idx)
                         .map(|s| s.get(*r, *c))
                         .unwrap_or(gridtalk_graph::CellValue::Empty);
-                    parse_cell_input(buffer) != current
+                    !edit_buffer_matches(&current, &parse_cell_input(buffer))
                 });
             }
         }
@@ -861,7 +958,7 @@ impl eframe::App for GridTalkApp {
                         .get(*sheet_idx)
                         .map(|s| s.get(*r, *c))
                         .unwrap_or(gridtalk_graph::CellValue::Empty);
-                    parse_cell_input(buffer) != current
+                    !edit_buffer_matches(&current, &parse_cell_input(buffer))
                 });
             }
         }
@@ -925,9 +1022,20 @@ impl eframe::App for GridTalkApp {
                 if ui.button("Open in Gridcraft").clicked() {
                     match &self.current_path {
                         Some(path) => {
-                            self.status =
-                                "Use the CLI: gridtalk open-in-gridcraft <file> (Gridcraft is a companion app; see decision 0003).".into();
-                            let _ = path;
+                            let bin = std::env::var("GRIDTALK_GRIDCRAFT_BIN")
+                                .ok()
+                                .filter(|b| !b.is_empty())
+                                .unwrap_or_else(|| "gridcraft".into());
+                            match std::process::Command::new(&bin).arg(path).spawn() {
+                                Ok(_) => {
+                                    self.status = format!("Launched Gridcraft on {}", path.display())
+                                }
+                                Err(e) => {
+                                    self.status = format!(
+                                        "Could not launch Gridcraft ({bin}): {e}. Build it once with: cargo build --manifest-path vendor/gridcraft/Cargo.toml -p gridcraft (or set GRIDTALK_GRIDCRAFT_BIN)"
+                                    )
+                                }
+                            }
                         }
                         None => self.status = "Open a workbook first.".into(),
                     }
@@ -1026,33 +1134,35 @@ impl eframe::App for GridTalkApp {
                     }
                 });
             if finish {
-                if let Err(e) = validate_wizard(
+                // Validation failure must not abort the frame: set
+                // the status and keep rendering the rest of the UI.
+                match validate_wizard(
                     &self.wizard_backend,
                     &self.wizard_model_path,
                     &self.wizard_base_url,
                 ) {
-                    self.status = format!("Setup not saved: {e}");
-                    // Stay in the wizard (do not mark first run done).
-                    return;
-                }
-                match write_wizard_config(
-                    &self.wizard_backend,
-                    &self.wizard_model_path,
-                    &self.wizard_base_url,
-                ) {
-                    Ok(p) => {
-                        self.config_path = p.display().to_string();
-                        self.prefs.config_path = self.config_path.clone();
-                        self.status = format!("Setup saved to {}", p.display());
-                        // Only a successfully saved setup counts as done.
-                        self.prefs.first_run_done = true;
-                        self.prefs.save();
-                    }
                     Err(e) => {
-                        self.status = format!(
-                            "Could not save setup: {e} — fix the path and click Finish again."
-                        )
+                        self.status = format!("Setup not saved: {e}");
                     }
+                    Ok(()) => match write_wizard_config(
+                        &self.wizard_backend,
+                        &self.wizard_model_path,
+                        &self.wizard_base_url,
+                    ) {
+                        Ok(p) => {
+                            self.config_path = p.display().to_string();
+                            self.prefs.config_path = self.config_path.clone();
+                            self.status = format!("Setup saved to {}", p.display());
+                            // Only a successfully saved setup counts as done.
+                            self.prefs.first_run_done = true;
+                            self.prefs.save();
+                        }
+                        Err(e) => {
+                            self.status = format!(
+                                "Could not save setup: {e} — fix the path and click Finish again."
+                            )
+                        }
+                    },
                 }
             }
         }
@@ -1429,7 +1539,7 @@ impl GridTalkApp {
                     continue;
                 }
                 let node_rect = egui::Rect::from_center_size(centre, egui::vec2(120.0, 18.0));
-                let label = if n.label.len() > 16 {
+                let label = if n.label.chars().count() > 16 {
                     format!("{}…", n.label.chars().take(16).collect::<String>())
                 } else {
                     n.label.clone()

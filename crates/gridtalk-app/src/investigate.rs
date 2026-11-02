@@ -75,7 +75,7 @@ pub fn investigate_with(
     // recorded in the trail, not re-executed).
     let top_k = adapter.map(|a| a.top_k).unwrap_or(3);
     let hits = tools.hybrid.search(question, top_k);
-    let citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
+    let mut citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
     let search_result = if hits.is_empty() {
         format!("no regions matched \"{question}\"")
@@ -101,6 +101,10 @@ pub fn investigate_with(
             if trail.len() < max_steps {
                 let cells = run("cells", &format!("range={clean}"), &mut trail);
                 context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
+            }
+            // Directly-read ref_context cells are citations too.
+            if !citations.contains(&clean) {
+                citations.push(clean.clone());
             }
         }
     }
@@ -152,8 +156,16 @@ pub fn investigate_with(
                         for r in r0..=r1 {
                             for c in c0..=c1 {
                                 if let CellValue::Formula { expr, .. } = sheet_obj.get(r, c) {
-                                    let refs = gridtalk_graph::formula_refs(&expr);
-                                    if refs.contains(&(orow, ocol)) {
+                                    let refs = gridtalk_graph::formula_refs_qualified(&expr);
+                                    let depends = refs.iter().any(|q| {
+                                        (q.sheet.is_none()
+                                            || q.sheet
+                                                .as_deref()
+                                                .is_some_and(|qs| qs.eq_ignore_ascii_case(&sheet)))
+                                            && q.row == orow
+                                            && q.col == ocol
+                                    });
+                                    if depends {
                                         return Some(format!(
                                             "{}!{}{}",
                                             sheet,
@@ -297,6 +309,21 @@ pub fn qualified_refs(question: &str) -> Vec<String> {
 }
 
 fn parse_what_if(question: &str) -> Option<(String, f64)> {
+    // Quoted-sheet form first via the quote-aware parser:
+    // split_whitespace would shred 'My Sheet'!B2 into two tokens.
+    for qref in qualified_refs(question) {
+        if parse_cell_ref(&qref).is_some() {
+            if let Some(pos) = question.find(&qref) {
+                for next in question[pos + qref.len()..].split_whitespace().take(4) {
+                    let n =
+                        next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
+                    if let Ok(v) = n.parse::<f64>() {
+                        return Some((qref, v));
+                    }
+                }
+            }
+        }
+    }
     // "... B2 is 10 ..." / "... B2 = 10.5 ..." / "... Sheet1!B2 ..."
     let tokens: Vec<&str> = question.split_whitespace().collect();
     // Sheet-qualified form first (Sheet1!B2 / 'My Sheet'!B2): the

@@ -13,6 +13,7 @@ pub enum EvalError {
     Ref(String),
     Cycle(String),
     Type(String),
+    Depth(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -22,6 +23,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Ref(m) => write!(f, "bad reference: {m}"),
             EvalError::Cycle(m) => write!(f, "circular reference: {m}"),
             EvalError::Type(m) => write!(f, "type error: {m}"),
+            EvalError::Depth(m) => write!(f, "depth error: {m}"),
         }
     }
 }
@@ -29,7 +31,7 @@ impl std::error::Error for EvalError {}
 
 /// Evaluate one cell: numbers pass through, formulas are computed
 /// recursively, text/empty evaluate to errors in numeric context.
-pub const MAX_EVAL_DEPTH: usize = 64;
+pub const MAX_EVAL_DEPTH: usize = 256;
 
 pub fn eval_cell(sheet: &SheetSnapshot, row: usize, col: usize) -> Result<f64, EvalError> {
     let sheets: Vec<&SheetSnapshot> = vec![sheet];
@@ -71,8 +73,8 @@ fn eval_cell_inner(
     depth: usize,
 ) -> Result<f64, EvalError> {
     if depth > MAX_EVAL_DEPTH {
-        return Err(EvalError::Parse(format!(
-            "formula nesting deeper than {MAX_EVAL_DEPTH}"
+        return Err(EvalError::Depth(format!(
+            "dependency chain deeper than {MAX_EVAL_DEPTH} cells"
         )));
     }
     let key = (sheet_idx, row, col);
@@ -146,10 +148,19 @@ fn eval_cell_value(
             })();
             match evaluated {
                 Ok(v) => Ok(v),
-                Err(e) => match cached_num {
-                    Some(n) => Ok(n),
-                    None => Err(e),
-                },
+                Err(e) => {
+                    // Cached fallback ONLY for formulas we cannot
+                    // evaluate (unsupported functions). Genuine
+                    // errors — cycles, type/ref/parse failures in an
+                    // evaluable formula — must propagate, not be
+                    // masked by a stale cached value.
+                    let unevaluable =
+                        matches!(&e, EvalError::Parse(m) if m.contains("unsupported function"));
+                    match cached_num {
+                        Some(n) if unevaluable => Ok(n),
+                        _ => Err(e),
+                    }
+                }
             }
         }
         other => Err(EvalError::Type(format!(
@@ -222,18 +233,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_power(&mut self) -> Result<f64, EvalError> {
+        let base = self.parse_factor()?;
+        self.skip_ws();
+        if self.peek() == Some('^') {
+            self.bump();
+            self.enter()?;
+            let exp = self.parse_power()?;
+            self.nest -= 1;
+            return Ok(base.powf(exp));
+        }
+        Ok(base)
+    }
+
     fn parse_term(&mut self) -> Result<f64, EvalError> {
-        let mut v = self.parse_factor()?;
+        let mut v = self.parse_power()?;
         loop {
             self.skip_ws();
             match self.peek() {
                 Some('*') => {
                     self.bump();
-                    v *= self.parse_factor()?;
+                    v *= self.parse_power()?;
                 }
                 Some('/') => {
                     self.bump();
-                    let d = self.parse_factor()?;
+                    let d = self.parse_power()?;
                     if d == 0.0 {
                         return Err(EvalError::Type("division by zero".into()));
                     }
@@ -311,6 +335,12 @@ impl<'a> Parser<'a> {
                 }
                 let name: String = self.chars[start..self.pos].iter().collect();
                 self.skip_ws();
+                if self.peek() != Some('(') && name.eq_ignore_ascii_case("TRUE") {
+                    return Ok(1.0);
+                }
+                if self.peek() != Some('(') && name.eq_ignore_ascii_case("FALSE") {
+                    return Ok(0.0);
+                }
                 if self.peek() == Some('(') {
                     if target_sheet != self.sheet_idx {
                         return Err(EvalError::Parse(
@@ -477,7 +507,10 @@ impl<'a> Parser<'a> {
                 .is_some_and(|(os, orow, ocol, _)| (os, orow, ocol) == (t, r, c));
             if !overridden
                 && matches!(self.peek(), Some(',') | Some(')'))
-                && matches!(self.sheets[t].get(r, c), CellValue::Empty)
+                && matches!(
+                    self.sheets[t].get(r, c),
+                    CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
+                )
             {
                 return Ok(());
             }
@@ -787,6 +820,34 @@ mod tests {
         let (before, after) =
             what_if_in_workbook(&wb, ("Sheet2", 1, 0), 10.0, ("Sheet1", 1, 0)).unwrap();
         assert_eq!((before, after), (42.0, 20.0));
+    }
+
+    #[test]
+    fn eval_round5_power_literals_and_cached_errors() {
+        // Power operator (right-associative) and TRUE/FALSE literals.
+        let wb = parse_delimited("d", "S", "A\n=2^3^2\n=TRUE+FALSE+1\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 512.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 2, 0).unwrap(), 2.0);
+        // A genuine evaluation error (cycle) is NOT masked by a
+        // stale cached value; an unsupported function is.
+        let mut sh = sheet();
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "D2+1".into(),
+            cached: Some(Box::new(CellValue::Number(999.0))),
+        };
+        assert!(matches!(eval_cell(&sh, 1, 3), Err(EvalError::Cycle(_))));
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "MEDIAN(B2:C2)".into(),
+            cached: Some(Box::new(CellValue::Number(999.0))),
+        };
+        assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 999.0);
+        // Long dependency chains: 120 cells deep, no depth error.
+        let mut csv = String::from("A\n1\n");
+        for i in 3..=121 {
+            csv.push_str(&format!("=A{}+1\n", i - 1));
+        }
+        let wb = parse_delimited("d", "S", &csv, ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 120, 0).unwrap(), 120.0);
     }
 
     #[test]

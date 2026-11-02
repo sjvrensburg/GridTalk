@@ -77,7 +77,10 @@ impl OpenWorkbook {
         // all. Changed stat re-hashes; only a changed hash (real
         // content change) triggers the expensive reload.
         let Some((mtime, len)) = Self::stat_of(&self.path) else {
-            return Ok(());
+            return Err(format!(
+                "workbook {} was deleted or became unreadable",
+                self.path.display()
+            ));
         };
         if let Some((old_mtime, old_len, old_hash)) = self.stamp {
             if (mtime, len) == (old_mtime, old_len) {
@@ -314,10 +317,12 @@ impl McpServer {
                             self.next_id
                         );
                         self.next_id += 1;
+                        let mut evicted: Vec<String> = Vec::new();
                         while self.workbooks.len() >= MAX_WORKBOOKS {
                             match self.order.pop_front() {
                                 Some(old) => {
                                     self.workbooks.remove(&old);
+                                    evicted.push(old);
                                 }
                                 None => break,
                             }
@@ -337,7 +342,7 @@ impl McpServer {
                             .collect();
                         self.workbooks.insert(id.clone(), open);
                         structured_result(
-                            json!({"workbook_id": id, "sheets": sheets, "regions": regions}),
+                            json!({"workbook_id": id, "sheets": sheets, "regions": regions, "evicted_workbook_ids": evicted}),
                             false,
                         )
                     }

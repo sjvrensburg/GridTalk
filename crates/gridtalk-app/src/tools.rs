@@ -176,6 +176,36 @@ impl<'a> Tools<'a> {
                             self.graph.nodes.iter().find(|n| {
                                 n.range.as_ref().map(|r| r.a1()) == Some(wanted.to_string())
                             })
+                        })
+                        .or_else(|| {
+                            // "Region containing this range": smallest
+                            // Region/Column whose range covers it.
+                            let (sheet, r0, c0, r1, c1) = parse_range_uncapped(range)?;
+                            self.graph
+                                .nodes
+                                .iter()
+                                .filter(|n| {
+                                    matches!(
+                                        n.kind,
+                                        gridtalk_graph::NodeKind::Region
+                                            | gridtalk_graph::NodeKind::Column
+                                    )
+                                })
+                                .filter(|n| {
+                                    n.range.as_ref().is_some_and(|r| {
+                                        r.sheet.eq_ignore_ascii_case(&sheet)
+                                            && r.r0 <= r0
+                                            && r.c0 <= c0
+                                            && r.r1 >= r1
+                                            && r.c1 >= c1
+                                    })
+                                })
+                                .min_by_key(|n| {
+                                    n.range
+                                        .as_ref()
+                                        .map(|r| (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1))
+                                        .unwrap_or(usize::MAX)
+                                })
                         });
                 match node {
                     Some(n) => {
@@ -336,10 +366,15 @@ impl<'a> Tools<'a> {
                 }
             }
             ToolRequest::GraphOverview => {
+                const MAX_OVERVIEW_NODES: usize = 500;
+                const MAX_OVERVIEW_EDGES: usize = 2000;
+                let total_nodes = self.graph.nodes.len();
+                let total_edges = self.graph.edges.len();
                 let nodes: Vec<serde_json::Value> = self
                     .graph
                     .nodes
                     .iter()
+                    .take(MAX_OVERVIEW_NODES)
                     .map(|n| {
                         serde_json::json!({
                             "id": n.id, "kind": format!("{:?}", n.kind), "label": n.label,
@@ -351,12 +386,22 @@ impl<'a> Tools<'a> {
                     .graph
                     .edges
                     .iter()
+                    .take(MAX_OVERVIEW_EDGES)
                     .map(|e| serde_json::json!({"from": e.from, "to": e.to, "kind": e.kind}))
                     .collect();
-                let text = format!("{} nodes, {} edges", nodes.len(), edges.len());
+                let truncated = total_nodes > nodes.len() || total_edges > edges.len();
+                let text = if truncated {
+                    format!(
+                        "{total_nodes} nodes, {total_edges} edges (showing first {} nodes, {} edges)",
+                        nodes.len(),
+                        edges.len()
+                    )
+                } else {
+                    format!("{} nodes, {} edges", nodes.len(), edges.len())
+                };
                 ToolResult::ok(
                     "graph_overview",
-                    serde_json::json!({"nodes": nodes, "edges": edges}),
+                    serde_json::json!({"nodes": nodes, "edges": edges, "total_nodes": total_nodes, "total_edges": total_edges, "truncated": truncated}),
                     text,
                 )
             }

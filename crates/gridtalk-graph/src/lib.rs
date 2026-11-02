@@ -219,9 +219,14 @@ pub fn node_for_cell_in(
     col: usize,
 ) -> Option<usize> {
     index.iter().copied().find(|id| {
-        g.nodes
+        // Fast path: ids are sequential in built graphs; fall back
+        // to a by-id search for hand-built graphs.
+        let node = g
+            .nodes
             .get(*id)
-            .and_then(|n| n.range.as_ref())
+            .filter(|n| n.id == *id)
+            .or_else(|| g.nodes.iter().find(|n| n.id == *id));
+        node.and_then(|n| n.range.as_ref())
             .map(|r| r.sheet == sheet && r.contains(row, col))
             .unwrap_or(false)
     })
@@ -306,6 +311,13 @@ pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError
             hint: "GridTalk does not support Excel binary/legacy formats; save as .xlsx or .csv and re-open".into(),
         }),
         "xlsx" | "ods" => {
+            const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if len > MAX_PACKAGE_BYTES {
+                return Err(IngestError::Parse(format!(
+                    "spreadsheet package is {len} bytes, over the {MAX_PACKAGE_BYTES}-byte ingestion cap"
+                )));
+            }
             let bytes = std::fs::read(path)?;
             load_gridcraft_bytes(&name, &ext, &bytes)
         }
@@ -615,7 +627,7 @@ fn parse_a1_at(chars: &[char], mut i: usize) -> Option<(usize, usize, usize)> {
         return None;
     }
     let row1: usize = chars[ds..i].iter().collect::<String>().parse().ok()?;
-    if row1 == 0 {
+    if row1 == 0 || row1 > 1_048_576 {
         return None;
     }
     let mut col = 0usize;
@@ -623,6 +635,9 @@ fn parse_a1_at(chars: &[char], mut i: usize) -> Option<(usize, usize, usize)> {
         col = col
             .checked_mul(26)?
             .checked_add(c as usize - 'A' as usize + 1)?;
+    }
+    if col == 0 || col > 16_384 {
+        return None;
     }
     Some((row1 - 1, col - 1, i))
 }

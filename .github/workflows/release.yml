@@ -49,6 +49,8 @@ jobs:
       - name: Gate on tests and version match
         shell: bash
         run: |
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo test --locked --workspace
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CRATE_VERSION=$(grep -m1 '^version = ' crates/gridtalk-app/Cargo.toml | cut -d'"' -f2)

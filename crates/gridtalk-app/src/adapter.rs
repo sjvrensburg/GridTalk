@@ -66,10 +66,27 @@ impl Adapter {
             out.push_str("\n\nAdapter rules (learned for this workbook shape):\n");
             out.push_str(self.rules.trim());
         }
-        let q = question.to_lowercase();
+        let qlower = question.to_lowercase();
+        let qwords: Vec<&str> = qlower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
         for skill in &self.skills {
-            let applies =
-                skill.triggers.is_empty() || skill.triggers.iter().any(|t| q.contains(t.as_str()));
+            let applies = if skill.triggers.iter().any(|t| t == "\u{1}never") {
+                false
+            } else if skill.triggers.is_empty() {
+                true
+            } else {
+                skill.triggers.iter().any(|t| {
+                    let tw: Vec<&str> = t
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| !w.is_empty())
+                        .collect();
+                    !tw.is_empty()
+                        && tw.len() <= qwords.len()
+                        && qwords.windows(tw.len()).any(|w| w == tw.as_slice())
+                })
+            };
             if applies && !skill.body.trim().is_empty() {
                 out.push_str(&format!("\n\nSkill: {}\n{}", skill.name, skill.body.trim()));
             }
@@ -145,8 +162,17 @@ fn clean_value(raw: &str) -> String {
 }
 
 fn parse_knobs(text: &str) -> (u32, usize, usize, bool) {
-    let (mut version, mut top_k, mut max_steps) = (0u32, 3usize, 8usize);
-    let mut ref_context = false;
+    parse_knobs_seeded(text, 3, 8, false)
+}
+
+fn parse_knobs_seeded(
+    text: &str,
+    seed_top_k: usize,
+    seed_max_steps: usize,
+    seed_ref_context: bool,
+) -> (u32, usize, usize, bool) {
+    let (mut version, mut top_k, mut max_steps) = (0u32, seed_top_k, seed_max_steps);
+    let mut ref_context = seed_ref_context;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with('[') {
@@ -255,7 +281,7 @@ fn load_from_dir(
     // file holds only the version pointer plus a convenience copy).
     let (top_k, max_steps, ref_context) = match std::fs::read_to_string(dir.join("adapter.toml")) {
         Ok(text) if !text.is_empty() => {
-            let (_, tk, ms, rc) = parse_knobs(&text);
+            let (_, tk, ms, rc) = parse_knobs_seeded(&text, top_k, max_steps, ref_context);
             (tk, ms, rc)
         }
         _ => (top_k, max_steps, ref_context),
@@ -307,10 +333,21 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
     names
 }
 
-fn scopeguard_remove(path: &Path) -> impl FnOnce() {
-    let owned = path.to_path_buf();
-    move || {
-        let _ = owned;
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}-{n}",
+        path.file_name().and_then(|f| f.to_str()).unwrap_or("file"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.to_string())
+        }
     }
 }
 
@@ -327,6 +364,7 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         .map(|entries| {
             entries
                 .flatten()
+                .filter(|e| e.path().is_dir())
                 .filter_map(|e| {
                     e.file_name()
                         .to_str()
@@ -343,11 +381,12 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         return Err(format!("adapter version v{next} already exists"));
     }
     // Write into a temp dir and rename into place: no partial vN.
-    let tmp = dir.join(format!(".v{next}.tmp-{}", std::process::id()));
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".v{next}.tmp-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("skills")).map_err(|e| e.to_string())?;
     let vdir_tmp = tmp.clone();
-    let _guard = scopeguard_remove(&tmp);
     let mut committed = adapter.clone();
     committed.version = next;
     let write_result = (|| -> Result<(), String> {
@@ -355,6 +394,9 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         std::fs::write(vdir_tmp.join("adapter.toml"), knob_text(&committed))
             .map_err(|e| e.to_string())?;
         for skill in &committed.skills {
+            if !valid_adapter_name(&skill.name) || skill.name.contains('.') {
+                return Err(format!("invalid skill name {:?}", skill.name));
+            }
             let mut text = String::new();
             if !skill.triggers.is_empty() {
                 text.push_str(&format!("Triggers: {}\n", skill.triggers.join(", ")));
@@ -372,9 +414,10 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
     }
-    // Root pointer + a copy of the active files for easy reading.
-    std::fs::write(dir.join("adapter.toml"), knob_text(&committed)).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("ADAPTER.md"), &committed.rules).map_err(|e| e.to_string())?;
+    // Root pointer + a copy of the active files for easy reading,
+    // each swapped in atomically so a crash cannot truncate them.
+    write_atomic(&dir.join("adapter.toml"), &knob_text(&committed))?;
+    write_atomic(&dir.join("ADAPTER.md"), &committed.rules)?;
     Ok(next)
 }
 
@@ -386,9 +429,18 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     }
     let dir = adapter_dir(root, name);
     let target = current.version - 1;
-    let mut pointer = current.clone();
+    if target > 0 && !dir.join(format!("v{target}")).is_dir() {
+        return Err(format!(
+            "adapter {name} cannot roll back: v{target} is missing on disk"
+        ));
+    }
+    let mut pointer = if target == 0 {
+        Adapter::empty(name)
+    } else {
+        current.clone()
+    };
     pointer.version = target;
-    std::fs::write(dir.join("adapter.toml"), knob_text(&pointer)).map_err(|e| e.to_string())?;
+    write_atomic(&dir.join("adapter.toml"), &knob_text(&pointer))?;
     // Refresh the root convenience copy from the rolled-back
     // version (v0 clears it — no resurrected rules; note the root
     // copy itself must not be the source for v0).
@@ -397,7 +449,7 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     } else {
         load_adapter(root, name).rules
     };
-    std::fs::write(dir.join("ADAPTER.md"), &root_rules).map_err(|e| e.to_string())?;
+    write_atomic(&dir.join("ADAPTER.md"), &root_rules)?;
     Ok(target)
 }
 
@@ -424,11 +476,16 @@ pub fn append_card(root: &Path, name: &str, markdown: &str) -> Result<(), String
 /// Render an adapter as an AGENTS.md document, so external
 /// harnesses (Codex and friends) pick up the same learned rules
 /// when working in a directory with the workbook.
+fn clean_inline(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+}
+
 pub fn export_agents_md(adapter: &Adapter) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# AGENTS.md — GridTalk adapter `{}` (v{})\n\n",
-        adapter.name, adapter.version
+        clean_inline(&adapter.name),
+        adapter.version
     ));
     out.push_str("These rules were learned by `gridtalk optimise` against\n");
     out.push_str("deterministic spreadsheet ground truth. Apply them when\n");
@@ -444,11 +501,16 @@ pub fn export_agents_md(adapter: &Adapter) -> String {
         out.push('\n');
     }
     for skill in &adapter.skills {
-        out.push_str(&format!("\n## Skill: {}\n\n", skill.name));
+        // `Triggers:`-empty skills are never-apply sentinels: exporting
+        // them as unconditional sections would invert their meaning.
+        if skill.triggers.iter().any(|t| t == "\u{1}never") {
+            continue;
+        }
+        out.push_str(&format!("\n## Skill: {}\n\n", clean_inline(&skill.name)));
         if !skill.triggers.is_empty() {
             out.push_str(&format!(
                 "Applies when the question mentions: {}.\n\n",
-                skill.triggers.join(", ")
+                clean_inline(&skill.triggers.join(", "))
             ));
         }
         out.push_str(skill.body.trim());
@@ -501,6 +563,36 @@ mod tests {
         // Rolling back to v0 clears the rules entirely.
         assert_eq!(rollback(&root, "demo").unwrap(), 0);
         assert!(load_adapter(&root, "demo").rules.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_missing_version_and_never_export_round5() {
+        let root = temp_root("round5");
+        let mut a = Adapter::empty("demo");
+        a.rules = "- R1.\n".into();
+        commit_version(&root, &a).unwrap();
+        let mut a2 = load_adapter(&root, "demo");
+        a2.rules = "- R2.\n".into();
+        commit_version(&root, &a2).unwrap();
+        // Delete v1: rolling back (target v1) must fail, not fake it.
+        std::fs::remove_dir_all(root.join("demo").join("v1")).unwrap();
+        assert!(rollback(&root, "demo").is_err());
+        // v0 rollback resets knobs to defaults.
+        let mut a3 = Adapter::empty("knobs");
+        a3.top_k = 9;
+        commit_version(&root, &a3).unwrap();
+        assert_eq!(rollback(&root, "knobs").unwrap(), 0);
+        assert_eq!(load_adapter(&root, "knobs").top_k, 3);
+        // Never-apply skills are not exported as unconditional sections.
+        let mut b = Adapter::empty("neverexp");
+        b.skills = vec![Skill {
+            name: "secret".into(),
+            triggers: vec!["\u{1}never".into()],
+            body: "NEVER BODY".into(),
+        }];
+        let md = export_agents_md(&b);
+        assert!(!md.contains("NEVER BODY"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

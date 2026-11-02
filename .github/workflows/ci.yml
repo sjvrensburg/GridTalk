@@ -98,4 +98,4 @@ jobs:
           tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
           echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
           echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
-      - run: cargo check --locked -p gridtalk-graph -p gridtalk-index -p gridtalk-infer
+      - run: cargo check --locked -p gridtalk-graph -p gridtalk-index -p gridtalk-infer -p gridtalk-app -p gridtalk-ui

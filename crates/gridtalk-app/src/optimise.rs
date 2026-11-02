@@ -58,11 +58,13 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
             // Already learned: no duplicate candidate.
         } else {
             let mut a = current.clone();
-            if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+            if !current.rules.contains(FORMULA_RULE) {
+                if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+                    a.rules.push('\n');
+                }
+                a.rules.push_str(FORMULA_RULE);
                 a.rules.push('\n');
             }
-            a.rules.push_str(FORMULA_RULE);
-            a.rules.push('\n');
             a.ref_context = true;
             out.push(Candidate {
                 label: format!(
@@ -160,8 +162,16 @@ pub fn optimise_round(
      -> Result<(Option<f64>, Vec<TaskResult>), String> {
         let key = match adapter {
             Some(a) => format!(
-                "{}|{}|{}|{}|{}",
-                split, a.rules, a.top_k, a.max_steps, a.ref_context
+                "{}|{}|{}|{}|{}|{:?}",
+                split,
+                a.rules,
+                a.top_k,
+                a.max_steps,
+                a.ref_context,
+                a.skills
+                    .iter()
+                    .map(|sk| format!("{}:{:?}:{}", sk.name, sk.triggers, sk.body))
+                    .collect::<Vec<_>>()
             ),
             None => format!("{split}|none"),
         };
@@ -266,15 +276,21 @@ pub fn optimise_round(
         }
     }
     if accepted.is_none() {
-        card_best_effort(
-            root,
-            &current.name,
-            &format!(
-                "\n## Round {round}: no candidate improved train\n\n- train: {:.1}%\n- dev: {:.1}%\n",
-                baseline_train * 100.0,
-                baseline_dev * 100.0
-            ),
-        );
+        // Only claim "no candidate improved train" when that is what
+        // happened; candidates that improved train but failed the dev
+        // gate already got their own REJECTED entries above.
+        let any_train_improved = tried.iter().any(|(_, t, _, _)| *t > baseline_train);
+        if !any_train_improved {
+            card_best_effort(
+                root,
+                &current.name,
+                &format!(
+                    "\n## Round {round}: no candidate improved train\n\n- train: {:.1}%\n- dev: {:.1}%\n",
+                    baseline_train * 100.0,
+                    baseline_dev * 100.0
+                ),
+            );
+        }
     }
 
     Ok(RoundOutcome {

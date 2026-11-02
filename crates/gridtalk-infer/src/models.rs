@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub struct GgufInfo {
     pub version: u32,
     pub tensor_count: u64,
+    /// Offset where tensor payload begins (after infos, aligned).
+    pub data_start: u64,
     pub architecture: Option<String>,
     pub name: Option<String>,
     pub metadata: BTreeMap<String, String>,
@@ -167,9 +169,38 @@ pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
             metadata.insert(key, v);
         }
     }
+    // Tensor infos must actually be present: name, dims, type,
+    // offset for every declared tensor. A header claiming tensors
+    // with no infos is truncated, not a model.
+    for _ in 0..tensor_count {
+        let _name = r.string()?;
+        let n_dims = r.u32()?;
+        if n_dims > 8 {
+            return Err(ModelError::NotGguf(format!(
+                "tensor has {n_dims} dimensions"
+            )));
+        }
+        for _ in 0..n_dims {
+            r.u64()?;
+        }
+        r.u32()?; // tensor type
+        r.u64()?; // tensor offset
+    }
+    let alignment: u64 = metadata
+        .get("general.alignment")
+        .and_then(|v| v.parse().ok())
+        .filter(|a: &u64| *a > 0)
+        .unwrap_or(32);
+    let data_start = (r.pos as u64).div_ceil(alignment) * alignment;
+    if tensor_count > 0 && (bytes.len() as u64) <= data_start {
+        return Err(ModelError::Truncated(
+            "GGUF declares tensors but has no tensor payload".into(),
+        ));
+    }
     Ok(GgufInfo {
         version,
         tensor_count,
+        data_start,
         architecture: metadata.get("general.architecture").cloned(),
         name: metadata.get("general.name").cloned(),
         metadata,

@@ -116,9 +116,9 @@ tool policy. None of it needs model weights to improve. Define a
 ```
 
 Loading order at chat/investigate time: built-in prompt →
-global adapter → per-workbook sidecar (`<workbook>.gridtalk.md`,
-the AGENT.md-style file a user or a harness can edit next to the
-spreadsheet) → skills whose triggers match. This answers the
+adapter rules → skills whose triggers match → per-workbook
+sidecar (`<workbook>.gridtalk.md`, the AGENT.md-style file a
+user or a harness can edit next to the spreadsheet) last. This answers the
 assumption in the brief: yes, our harness can employ AGENT.md /
 SKILL.md-style files — we define their schema and honour them,
 and the optimiser writes them.

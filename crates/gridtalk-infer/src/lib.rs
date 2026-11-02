@@ -229,8 +229,8 @@ fn read_http_response(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
-    let mut stalls = 0usize;
     let mut last_progress = 0usize;
+    let mut last_progress_at = std::time::Instant::now();
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
     loop {
@@ -255,16 +255,17 @@ fn read_http_response(
                 if raw.len() > 16 * 1024 * 1024 {
                     return Err(InferError::Http("response exceeds 16 MiB cap".into()));
                 }
+                // Time-based stall: no >=4 KiB of progress for
+                // 10 s is a drip, however many reads it was spread
+                // across (read counts are meaningless under Nagle /
+                // buffering).
                 if raw.len() - last_progress >= 4096 {
                     last_progress = raw.len();
-                    stalls = 0;
-                } else {
-                    stalls += 1;
-                    if stalls > 60 {
-                        return Err(InferError::Http(
-                            "endpoint is slow-dripping the response".into(),
-                        ));
-                    }
+                    last_progress_at = std::time::Instant::now();
+                } else if last_progress_at.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err(InferError::Http(
+                        "endpoint is slow-dripping the response".into(),
+                    ));
                 }
                 // Complete as soon as Content-Length bytes of body
                 // have arrived; never wait for connection close.
@@ -287,6 +288,13 @@ fn read_http_response(
                         break;
                     }
                 }
+                // Chunked bodies: the terminal 0-chunk completes the
+                // response in-loop; do not wait for EOF/stall.
+                if let Some(he) = header_end {
+                    if content_length.is_none() && raw[he..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                        break;
+                    }
+                }
             }
             Err(e)
                 if matches!(
@@ -299,8 +307,7 @@ fn read_http_response(
                         return Err(InferError::Cancelled);
                     }
                 }
-                stalls += 1;
-                if stalls > 15 {
+                if last_progress_at.elapsed() > std::time::Duration::from_secs(30) {
                     return Err(InferError::Http(
                         "endpoint stalled for over 30 seconds".into(),
                     ));
@@ -511,6 +518,13 @@ pub mod config {
         /// never persisted.
         #[serde(default)]
         pub api_key_env: Option<String>,
+        /// Local-backend sampling/layer settings (llama.cpp only).
+        #[serde(default)]
+        pub temperature: Option<f32>,
+        #[serde(default)]
+        pub seed: Option<u32>,
+        #[serde(default)]
+        pub n_gpu_layers: Option<u32>,
     }
 
     fn default_backend() -> String {
@@ -529,6 +543,9 @@ pub mod config {
                 model_path: None,
                 base_url: None,
                 api_key_env: None,
+                temperature: None,
+                seed: None,
+                n_gpu_layers: None,
             }
         }
     }

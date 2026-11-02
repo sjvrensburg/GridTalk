@@ -22,6 +22,10 @@ use std::time::Instant;
 
 pub const MAX_CONTEXT: usize = 4096;
 
+// Note: each request builds a fresh llama.cpp context (no KV or
+// prefix reuse across requests), so prefill cost is paid per
+// request. Context reuse is future work.
+
 pub struct LlamaCppBackend {
     pub model_path: PathBuf,
     pub seed: u32,
@@ -55,15 +59,27 @@ struct CachedState {
 
 struct CachedModel {
     path: PathBuf,
-    stamp: Option<(std::time::SystemTime, u64)>,
+    stamp: Option<(std::time::SystemTime, u64, u64)>,
     n_gpu_layers: u32,
     model: LlamaModel,
 }
 
-fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    // A head-content hash catches same-mtime/same-length replacements
+    // that the (mtime, len) pair alone would alias.
+    use std::io::Read as _;
+    let mut head = vec![0u8; 65536];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in &head[..n] {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some((modified, meta.len(), hash))
 }
 
 fn cached_state() -> &'static std::sync::Mutex<Option<CachedState>> {
@@ -162,6 +178,12 @@ impl LlamaCppBackend {
         };
 
         let vocab = model.vocab();
+        // Context comes from the model's own training length, not a
+        // hard-coded window; fall back to MAX_CONTEXT when unknown.
+        let context_len = match model.n_ctx_train() {
+            0 => MAX_CONTEXT,
+            n => (n as usize).min(MAX_CONTEXT * 16),
+        };
         let prompt_tokens = vocab.tokenize(prompt.as_bytes(), true, true);
         if prompt_tokens.is_empty() {
             return Err(InferError::EngineUnavailable("empty prompt".into()));
@@ -169,17 +191,17 @@ impl LlamaCppBackend {
         if prompt_tokens
             .len()
             .checked_add(req.max_tokens)
-            .is_none_or(|total| total > MAX_CONTEXT)
+            .is_none_or(|total| total > context_len)
         {
             return Err(InferError::EngineUnavailable(format!(
-                "prompt ({} tokens) + max_tokens ({}) exceeds the {MAX_CONTEXT}-token context",
+                "prompt ({} tokens) + max_tokens ({}) exceeds the {context_len}-token context",
                 prompt_tokens.len(),
                 req.max_tokens
             )));
         }
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(MAX_CONTEXT as u32))
+            .with_n_ctx(NonZeroU32::new(context_len as u32))
             .with_n_batch(512);
         let mut ctx = model
             .new_context(backend, ctx_params)
@@ -253,7 +275,10 @@ impl LlamaCppBackend {
                 "<|end|>",
             ] {
                 if let Some(at) = cumulative.find(marker) {
-                    text_bytes.truncate(at);
+                    // `at` indexes the decoded string; truncate there
+                    // and re-encode (a lossy offset into raw bytes
+                    // could split a UTF-8 sequence).
+                    text_bytes = cumulative.as_bytes()[..at].to_vec();
                     if let Ok(text) = std::str::from_utf8(&text_bytes) {
                         if let Some(delta) = text.strip_prefix(emitted.as_str()) {
                             if !delta.is_empty() {
@@ -352,8 +377,18 @@ impl ChatBackend for LlamaCppBackend {
 /// compatibility but mapped onto llama.cpp with a stderr note.
 pub fn llama_backend_from_config(cfg: &crate::config::InferenceConfig) -> Option<LlamaCppBackend> {
     let model_path = cfg.model_path.as_ref().map(PathBuf::from)?;
-    Some(LlamaCppBackend {
+    let mut backend = LlamaCppBackend {
         model_path,
         ..LlamaCppBackend::default()
-    })
+    };
+    if let Some(t) = cfg.temperature {
+        backend.temperature = t;
+    }
+    if let Some(seed) = cfg.seed {
+        backend.seed = seed;
+    }
+    if let Some(layers) = cfg.n_gpu_layers {
+        backend.n_gpu_layers = layers;
+    }
+    Some(backend)
 }

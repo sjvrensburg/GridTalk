@@ -193,22 +193,30 @@ pub fn extract_numbers(text: &str) -> Vec<f64> {
             Some(stripped) => (stripped, true),
             None => (t, false),
         };
-        let normalized = if core.contains(',') {
+        let normalized = if core.contains(',') && core.contains('.') {
+            // Both separators: the last one is the decimal point
+            // (1.200,50 European or 1,200.50 Anglo).
+            if core.rfind(',') > core.rfind('.') {
+                core.replace('.', "").replace(',', ".")
+            } else {
+                core.replace(',', "")
+            }
+        } else if core.contains(',') {
             // Thousands groups: every group after the first is
-            // exactly 3 digits (the last may carry a ".dec" tail,
-            // e.g. 1,200.50). Otherwise the comma is decimal.
+            // exactly 3 digits, otherwise a single comma is decimal.
+            // Multiple non-thousands commas (1,200,50) are ambiguous
+            // and skipped, not mangled into 1.20050.
             let groups: Vec<&str> = core.split(',').collect();
             let thousands = groups.len() > 1
-                && groups[1..].iter().all(|g| {
-                    let int_part = g.split('.').next().unwrap_or("");
-                    int_part.len() == 3 && int_part.chars().all(|c| c.is_ascii_digit())
-                });
+                && groups[1..]
+                    .iter()
+                    .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()));
             if thousands {
                 core.replace(',', "")
-            } else if let Some((head, tail)) = core.split_once(',') {
-                format!("{head}.{}", tail.replace(',', ""))
+            } else if groups.len() == 2 {
+                format!("{}.{}", groups[0], groups[1])
             } else {
-                core.to_string()
+                continue;
             }
         } else {
             core.to_string()
@@ -254,8 +262,7 @@ pub struct TaskResult {
 fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // The cited range must also be *used* in the answer text —
     // retrieval alone does not count as citing.
-    let answer_cites =
-        citations.iter().any(|c| answer.contains(c.as_str())) || answer.contains(citation);
+    let answer_cites = citations.iter().any(|c| answer.contains(c.as_str()));
     if !answer_cites {
         return false;
     }
@@ -451,6 +458,20 @@ pub fn render_card_with_skipped(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bench_numbers_round5() {
+        assert_eq!(extract_numbers("total 1.200,50"), vec![1200.5]);
+        assert_eq!(extract_numbers("total 1,200.50"), vec![1200.5]);
+        assert!(extract_numbers("range 1,200,50 here").is_empty());
+        assert_eq!(extract_numbers("sci 1.2e3"), vec![1200.0]);
+        // A restated question ref is not a citation hit.
+        assert!(!citation_hit(
+            &["Sheet1!A1:B2".to_string()],
+            "Sheet1!D9",
+            "Sheet1!D9 is 5"
+        ));
+    }
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
     use gridtalk_index::HybridIndex;

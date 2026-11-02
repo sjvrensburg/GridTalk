@@ -1,7 +1,10 @@
 # Hermit run config for evolving a GridTalk adapter (Phase E).
 # See docs/hermit.md for the full picture and the validation status.
 #
-# Prepare data first:
+# Prepare data first (a tiny synthetic demo set is committed under
+# data/ so `hermit check` passes on a fresh checkout; regenerate it
+# from your own workbook to actually train). Bench rows carry no
+# workbook path, so export GRIDTALK_WORKBOOK when running hermit.
 #   gridtalk bench generate book.xlsx --out tasks-array.json
 #   .venv/bin/python -c "import sys; sys.path.insert(0, 'scripts/hermit'); \
 #       import gridtalk_task; gridtalk_task.prepare_data('tasks-array.json', 'scripts/hermit/data')"
