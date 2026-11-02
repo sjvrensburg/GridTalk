@@ -36,7 +36,8 @@ impl OpenWorkbook {
         std::fs::metadata(path).ok().and_then(|m| {
             // A change stamp catches same-mtime/same-length
             // replacements the pair would alias: ctime+nsec on
-            // Unix, the NTFS file index on Windows.
+            // Unix, the creation time on Windows (`file_index` is
+            // still unstable there).
             #[cfg(unix)]
             let ctime = {
                 use std::os::unix::fs::MetadataExt as _;
@@ -47,7 +48,7 @@ impl OpenWorkbook {
             #[cfg(windows)]
             let ctime = {
                 use std::os::windows::fs::MetadataExt as _;
-                m.file_index().map(|i| i as i64).unwrap_or(0)
+                m.creation_time() as i64
             };
             #[cfg(not(any(unix, windows)))]
             let ctime = 0i64;
