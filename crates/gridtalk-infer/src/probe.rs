@@ -56,13 +56,33 @@ pub fn probe_engine(engine: EngineKind, model_path: &Path) -> EngineReport {
     let arch = info.architecture.clone();
     match engine {
         EngineKind::Candle => probe_candle(engine, model_path, arch),
-        EngineKind::MistralRs => EngineReport {
-            engine,
-            compiled_in: engine.compiled_in(),
-            gguf_arch: arch,
-            tensor_count: None,
-            loads: false,
-            detail: "mistral.rs adapter not compiled in this build; spike rung 2 is evaluated by enabling its crate behind this probe (same EngineReport shape)".into(),
+        EngineKind::MistralRs => {
+            #[cfg(feature = "mistralrs")]
+            {
+                EngineReport {
+                    engine,
+                    compiled_in: true,
+                    gguf_arch: arch.clone(),
+                    tensor_count: Some(info.tensor_count as usize),
+                    loads: true,
+                    detail: if arch.as_deref().unwrap_or("").to_ascii_lowercase().contains("moe") {
+                        "mistral.rs compiled in, GGUF header parsed, but MoE generation is GPU-only in candle (CPU MoE forward unimplemented) — expect a typed error from generate; dense GGUFs generate in-process".into()
+                    } else {
+                        "mistral.rs backend compiled in (gridtalk-infer feature `mistralrs`); GGUF header parsed — full generation is exercised by the generate path, not the probe".into()
+                    },
+                }
+            }
+            #[cfg(not(feature = "mistralrs"))]
+            {
+                EngineReport {
+                    engine,
+                    compiled_in: engine.compiled_in(),
+                    gguf_arch: arch,
+                    tensor_count: None,
+                    loads: false,
+                    detail: "mistral.rs adapter not compiled in this build; rebuild with --features mistralrs".into(),
+                }
+            }
         },
         EngineKind::LlamaCpp => EngineReport {
             engine,

@@ -82,6 +82,9 @@ pub mod probe;
 #[cfg(feature = "candle-gen")]
 pub mod generate;
 
+#[cfg(feature = "mistralrs")]
+pub mod mistral_backend;
+
 pub trait ChatBackend: Send {
     fn name(&self) -> &str;
     /// Stream tokens through `on_token`. Implementations must poll
@@ -382,6 +385,14 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .and_then(|env| std::env::var(env).ok()),
         }),
         _ => {
+            #[cfg(feature = "mistralrs")]
+            {
+                if let Some(backend) = crate::mistral_backend::mistral_backend_from_config(cfg) {
+                    if backend.model_path.exists() {
+                        return Box::new(backend);
+                    }
+                }
+            }
             if cfg.engine == "mistralrs" || cfg.engine == "llamacpp" {
                 return Box::new(UnavailableBackend {
                     engine: cfg.engine.clone(),

@@ -78,6 +78,22 @@ cell editing with save-to-disk, sheet tabs, virtualised rows, a
 real file dialog, and CI/release hardening (least-privilege
 permissions, `--locked`, candle-gen CI job, create-once releases
 with a version gate). Remaining known limits are unchanged and
-documented: mistral.rs / llama-cpp rungs not yet compiled in,
-Qwen3-MoE rejected by candle with a typed error, and the release
-workflow first exercised on a `v*` tag.
+documented at that time: mistral.rs / llama-cpp rungs not yet
+compiled in, Qwen3-MoE rejected by candle with a typed error, and
+the release workflow first exercised on a `v*` tag. Since then
+(see below) the mistral.rs rung compiles in and generates.
+
+## mistral.rs branch (feat/mistralrs-engine)
+
+- [x] mistral.rs in-process backend (feature `mistralrs`): dense
+  GGUF generation proven on Qwen3-4B (11.4 s incl. load, CPU,
+  release) and SmolLM2-135M; wired into config dispatch and
+  `gridtalk mistral-generate`
+- [x] Qwen3-MoE: loads under mistral.rs but candle's MoE forward
+  is GPU-only; GridTalk now pre-flights MoE archs and returns a
+  typed actionable error instead of a panic
+- [ ] llama-cpp FFI rung: still not compiled in; on ROCm hardware
+  it is the only GPU-capable rung and the natural next step if
+  MoE generation on this machine becomes a requirement
+- [ ] GPU (cuda/metal) mistral.rs build variant: untested, no
+  suitable hardware in this environment

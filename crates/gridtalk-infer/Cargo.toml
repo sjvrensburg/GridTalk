@@ -12,6 +12,8 @@ toml = "0.9"
 candle-core = { version = "0.10", optional = true, default-features = false }
 candle-transformers = { version = "0.10", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar"] }
+mistralrs = { version = "0.8", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = []
@@ -20,5 +22,5 @@ default = []
 candle = ["dep:candle-core"]
 # Real GGUF generation (llama-family architectures) on candle.
 candle-gen = ["candle", "dep:candle-transformers", "dep:tokenizers"]
-mistralrs = []
+mistralrs = ["dep:mistralrs", "dep:tokio"]
 llamacpp = []

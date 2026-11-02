@@ -64,6 +64,7 @@ const COMMANDS: &[&str] = &[
     "view",
     "spike",
     "generate",
+    "mistral-generate",
     "models",
     "open-in-gridcraft",
     "help",
@@ -247,6 +248,48 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("failed to launch Gridcraft: {e}"))?;
             Ok(())
         }
+        "mistral-generate" => {
+            #[cfg(feature = "mistralrs")]
+            {
+                use gridtalk_infer::ChatBackend as _;
+                let model = args
+                    .get(2)
+                    .ok_or("usage: gridtalk mistral-generate <model.gguf> <prompt...>")?;
+                let prompt = args[3..].join(" ");
+                if prompt.trim().is_empty() {
+                    return Err(
+                        "usage: gridtalk mistral-generate <model.gguf> <prompt...> (prompt must not be empty)"
+                            .into(),
+                    );
+                }
+                let backend = gridtalk_infer::mistral_backend::MistralRsBackend {
+                    model_path: std::path::PathBuf::from(model),
+                    max_tokens: 128,
+                };
+                let req = ChatRequest {
+                    system: "You are a helpful spreadsheet assistant.".into(),
+                    user: prompt,
+                    max_tokens: 128,
+                };
+                let cancel = Arc::new(AtomicBool::new(false));
+                let started = std::time::Instant::now();
+                backend
+                    .stream(&req, &cancel, &mut |t| print!("{t}"))
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "\n\n[bench] mistral.rs total_ms={:.0}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                Ok(())
+            }
+            #[cfg(not(feature = "mistralrs"))]
+            {
+                Err(
+                    "mistral-generate requires a mistralrs build: cargo run -p gridtalk-app --features mistralrs -- mistral-generate ..."
+                        .into(),
+                )
+            }
+        }
         "generate" => {
             #[cfg(feature = "candle-gen")]
             {
@@ -352,7 +395,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (candle-gen builds)\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (candle-gen builds)\n  gridtalk mistral-generate <model.gguf> <prompt...> (mistralrs builds)\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

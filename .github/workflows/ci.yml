@@ -35,3 +35,5 @@ jobs:
         run: |
           cargo clippy --locked -p gridtalk-infer -p gridtalk-app --all-targets --features candle-gen -- -D warnings
           cargo test --locked -p gridtalk-infer -p gridtalk-app --features candle-gen
+      - name: Test mistralrs feature
+        run: cargo test --locked -p gridtalk-infer --features mistralrs

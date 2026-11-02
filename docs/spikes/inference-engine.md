@@ -58,3 +58,34 @@ get a typed error naming the architecture — evaluating mistral.rs
 remains the fallback of last resort. With no model configured,
 local chat uses the deterministic echo backend so the full
 pipeline stays demoable.
+
+## mistral.rs rung (branch feat/mistralrs-engine, 2026-11-02)
+
+User decisions: mistral.rs first, in-process library, engine-first
+across GGUFs (Qwen3-MoE = stretch, not the gate).
+
+Measured on this machine (Ryzen AI Max+ 395, CPU, release):
+
+| Model | Arch | Result |
+|---|---|---|
+| SmolLM2-135M-Instruct Q4_K_M | llama | Generates (debug build, 30 s incl. load) |
+| Qwen3-4B-Instruct-2507 Q4_K_M (2.4 GB, on disk) | qwen3 | **Generates: 11.4 s total incl. load** — an arch candle-gen rejects |
+| Qwen3-30B-A3B-Instruct-2507 Q4_K_M (18 GB, on disk) | qwen3moe | Loads, then candle panics `indexed_moe_forward is not implemented in this platform` — **MoE forward is GPU-only in candle** |
+
+Consequences, implemented in `gridtalk-infer` (feature `mistralrs`):
+
+- `MistralRsBackend` generates in-process for dense GGUFs of any
+  architecture mistral.rs supports; wired into
+  `backend_from_config` (engine = "mistralrs" + model_path).
+- MoE GGUFs are detected from the GGUF header before loading and
+  fail with a typed, actionable error (dense model / GPU build /
+  llama-cpp rung) instead of a channel-closed panic.
+- `gridtalk spike` reports this MoE caveat per model.
+
+llama-cpp FFI remains not compiled in. On this ROCm machine it is
+also the only rung that could use the GPU (llama.cpp + ROCm, per
+~/Projects/halo-prep benchmarks at ~50 tok/s for 35B-A3B), which
+makes it the natural next rung if MoE-on-this-hardware becomes a
+requirement. The existing loopback llama-server stack on the
+EVO-X3 (:8092/:8088) is already reachable today through the
+OpenAI-compatible backend with no new code.
