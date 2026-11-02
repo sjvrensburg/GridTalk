@@ -3,6 +3,7 @@
 //! the grid<->graph two-way sync state machine that the egui front
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
+mod bench;
 mod investigate;
 mod mcp;
 mod tools;
@@ -61,6 +62,7 @@ fn main() {
 
 const COMMANDS: &[&str] = &[
     "ask",
+    "bench",
     "investigate",
     "graph",
     "view",
@@ -199,6 +201,90 @@ fn run(args: &[String]) -> Result<(), String> {
                 state.highlighted_node
             );
             Ok(())
+        }
+        "bench" => {
+            // gridtalk bench generate <file> [--out tasks.json] [--max 100]
+            // gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]
+            let flag = |name: &str| -> Option<String> {
+                args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+            };
+            match args.get(2).map(|s| s.as_str()) {
+                Some("generate") => {
+                    let file = args.get(3).ok_or(
+                        "usage: gridtalk bench generate <file> [--out tasks.json] [--max 100]",
+                    )?;
+                    let max: usize = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(100);
+                    let wb = load_workbook(file)?;
+                    let (_, violations) = build_graph(&wb);
+                    if !violations.is_empty() {
+                        return Err(format!("graph invariants violated: {violations:?}"));
+                    }
+                    let tasks = bench::generate_tasks(&wb, max);
+                    let json = serde_json::to_string_pretty(&tasks).map_err(|e| e.to_string())?;
+                    match flag("--out") {
+                        Some(out) => {
+                            std::fs::write(&out, &json).map_err(|e| e.to_string())?;
+                            eprintln!(
+                                "wrote {} tasks ({} train / {} dev) to {out}",
+                                tasks.len(),
+                                tasks.iter().filter(|t| t.split == "train").count(),
+                                tasks.iter().filter(|t| t.split == "dev").count()
+                            );
+                        }
+                        None => println!("{json}"),
+                    }
+                    Ok(())
+                }
+                Some("run") => {
+                    let file = args
+                        .get(3)
+                        .ok_or("usage: gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]")?;
+                    let wb = load_workbook(file)?;
+                    let (graph, violations) = build_graph(&wb);
+                    if !violations.is_empty() {
+                        return Err(format!("graph invariants violated: {violations:?}"));
+                    }
+                    let hybrid = HybridIndex::build(&wb, &graph);
+                    let toolset = tools::Tools {
+                        wb: &wb,
+                        graph: &graph,
+                        hybrid: &hybrid,
+                    };
+                    let tasks: Vec<bench::BenchTask> = match flag("--tasks") {
+                        Some(path) => {
+                            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                            serde_json::from_str(&text)
+                                .map_err(|e| format!("invalid tasks file {path}: {e}"))?
+                        }
+                        None => bench::generate_tasks(&wb, 100),
+                    };
+                    let split = flag("--split").unwrap_or_else(|| "all".into());
+                    if !matches!(split.as_str(), "train" | "dev" | "all") {
+                        return Err(format!("unknown split {split}; expected train, dev or all"));
+                    }
+                    let cfg = config_from_env();
+                    let backend = backend_from_config(&cfg.inference);
+                    warn_if_external(&cfg);
+                    let report = bench::run_bench(&tasks, &toolset, backend.as_ref(), &split, 8)
+                        .map_err(|e| format!("bench run failed: {e}"))?;
+                    let card = bench::render_card(&report, tasks.len());
+                    match flag("--card") {
+                        Some(path) => {
+                            std::fs::write(&path, &card).map_err(|e| e.to_string())?;
+                            println!(
+                                "bench: {} tasks, accuracy {:.1}% -> {path}",
+                                report.results.len(),
+                                report.accuracy("all").unwrap_or(0.0) * 100.0
+                            );
+                        }
+                        None => println!("{card}"),
+                    }
+                    Ok(())
+                }
+                _ => {
+                    Err("usage: gridtalk bench generate <file> | gridtalk bench run <file>".into())
+                }
+            }
         }
         "investigate" => {
             let file = args
@@ -408,7 +494,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

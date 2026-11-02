@@ -201,10 +201,12 @@ session/cache layer, `.mcp.json` + Codex recipes, MCP contract
 tests, one real Claude Code and one Codex session driven
 end-to-end as acceptance.
 
-**Phase C (benchmark generator, ~1 wk):** `gridtalk bench
-generate|run`, deterministic judges, CARD.md writer. Acceptance:
-bench on the demo workbook produces scored results for the echo
-backend (floor) and a real local model.
+**Phase C (benchmark generator) — SHIPPED:** `gridtalk bench
+generate|run`, deterministic judges, CARD.md writer
+(`crates/gridtalk-app/src/bench.rs`, `docs/bench.md`). Acceptance
+met for the echo backend: demo workbook scores 50% accuracy /
+100% citation precision (the floor). A real-local-model run uses
+the same command with a model configured.
 
 **Phase D (adapter format + loop, ~2 wks):** adapter directories,
 loading into investigate/chat, `gridtalk optimise` (propose →
