@@ -207,7 +207,7 @@ fn write_wizard_config(
     };
     let mut text = String::from("[inference]\n");
     text.push_str(&format!("backend = \"{}\"\n", esc(backend)));
-    text.push_str("engine = \"candle\"\n");
+    text.push_str("engine = \"llamacpp\"\n");
     if !model_path.is_empty() {
         text.push_str(&format!("model_path = \"{}\"\n", esc(model_path)));
     }
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn wizard_config_round_trips_through_parser() {
-        let text = "[inference]\nbackend = \"local\"\nengine = \"candle\"\nmodel_path = \"/models/m.gguf\"\n";
+        let text = "[inference]\nbackend = \"local\"\nengine = \"llamacpp\"\nmodel_path = \"/models/m.gguf\"\n";
         let cfg = gridtalk_infer::config::Config::parse(text);
         assert_eq!(cfg.inference.backend, "local");
         assert_eq!(cfg.inference.model_path.as_deref(), Some("/models/m.gguf"));

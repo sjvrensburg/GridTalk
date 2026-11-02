@@ -9,37 +9,13 @@ use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EngineKind {
-    Candle,
-    MistralRs,
-    LlamaCpp,
-}
-
-impl EngineKind {
-    /// Ordered fallback ladder: pure-Rust first, FFI last.
-    pub fn ladder() -> [EngineKind; 3] {
-        [
-            EngineKind::Candle,
-            EngineKind::MistralRs,
-            EngineKind::LlamaCpp,
-        ]
-    }
-    pub fn feature_name(&self) -> &'static str {
-        match self {
-            EngineKind::Candle => "candle",
-            EngineKind::MistralRs => "mistralrs",
-            EngineKind::LlamaCpp => "llamacpp",
-        }
-    }
-    pub fn compiled_in(&self) -> bool {
-        match self {
-            EngineKind::Candle => cfg!(feature = "candle"),
-            EngineKind::MistralRs => cfg!(feature = "mistralrs"),
-            EngineKind::LlamaCpp => cfg!(feature = "llamacpp"),
-        }
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub first_token_ms: Option<f64>,
+    pub total_ms: f64,
+    pub tokens_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,8 +55,7 @@ pub type CancelToken = Arc<AtomicBool>;
 pub mod models;
 pub mod probe;
 
-#[cfg(feature = "candle-gen")]
-pub mod generate;
+pub mod llama_backend;
 
 pub trait ChatBackend: Send {
     fn name(&self) -> &str;
@@ -146,13 +121,6 @@ impl ChatBackend for UnavailableBackend {
             self.engine, self.reason
         )))
     }
-}
-
-/// Probe the local engine ladder and return the first compiled-in
-/// rung. The Phase 3 spike replaces `compiled_in` with a runtime
-/// load test per engine (see docs/spikes/inference-engine.md).
-pub fn select_local_engine() -> Option<EngineKind> {
-    EngineKind::ladder().into_iter().find(|e| e.compiled_in())
 }
 
 /// OpenAI-compatible chat-completions client (external backend and
@@ -382,21 +350,19 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .and_then(|env| std::env::var(env).ok()),
         }),
         _ => {
-            if cfg.engine == "mistralrs" || cfg.engine == "llamacpp" {
-                return Box::new(UnavailableBackend {
-                    engine: cfg.engine.clone(),
-                    reason: "that rung of the inference ladder is not compiled into this build (see docs/spikes/inference-engine.md)".into(),
-                });
+            if !matches!(
+                cfg.engine.as_str(),
+                "llamacpp" | "llama-cpp" | "llama.cpp" | ""
+            ) {
+                eprintln!(
+                    "gridtalk: note: engine = {:?} is ignored; the only local engine is llama.cpp (Vulkan)",
+                    cfg.engine
+                );
             }
-            #[cfg(feature = "candle-gen")]
-            {
-                if let Some(backend) = crate::generate::candle_backend_from_config(cfg) {
-                    if backend.model_path.exists() {
-                        return Box::new(backend);
-                    }
-                }
+            match crate::llama_backend::llama_backend_from_config(cfg) {
+                Some(backend) if backend.model_path.exists() => Box::new(backend),
+                _ => Box::new(EchoBackend),
             }
-            Box::new(EchoBackend)
         }
     }
 }
@@ -428,7 +394,7 @@ pub mod config {
         "local".into()
     }
     fn default_engine() -> String {
-        "candle".into()
+        "llamacpp".into()
     }
 
     impl Default for InferenceConfig {
@@ -483,12 +449,6 @@ pub mod config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ladder_is_pure_rust_first() {
-        assert_eq!(EngineKind::ladder()[0], EngineKind::Candle);
-        assert_eq!(EngineKind::ladder()[2], EngineKind::LlamaCpp);
-    }
 
     #[test]
     fn echo_streams_and_cancels() {

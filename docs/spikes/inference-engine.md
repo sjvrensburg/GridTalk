@@ -58,3 +58,13 @@ get a typed error naming the architecture — evaluating mistral.rs
 remains the fallback of last resort. With no model configured,
 local chat uses the deterministic echo backend so the full
 pipeline stays demoable.
+
+## Final decision (branch feat/llama-cpp-vulkan)
+
+The ladder is retired. llama.cpp over Vulkan is the only local
+engine (decision 0004): it generates dense *and* MoE GGUFs on
+this machine (Qwen3-30B-A3B ~9.7 tok/s, Qwen3-4B ~31.9 tok/s,
+end-to-end including load, CPU->Vulkan offload), candle and
+mistral.rs code paths are deleted, and macOS is dropped as a
+target platform. The sections above are the historical record
+that led here.
