@@ -37,7 +37,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] `ChatBackend` trait: streaming + cancellation
 - [x] OpenAI-compatible external backend (verbatim send, http; https = typed error until TLS lands)
 - [x] Deterministic echo backend for tests/demos
-- [x] Inference spike harness: `gridtalk spike` probes candle → mistral.rs → llama-cpp FFI (candle loads GGUF today; other rungs report why not — see `docs/spikes/inference-engine.md`)
+- [x] Inference: single llama.cpp-over-Vulkan engine (decision 0004); `gridtalk spike <model.gguf>` validates a GGUF header (header-only, not a load test)
 - [x] Local embeddings + hybrid fusion: offline n-gram `EmbeddingModel` (bge-small ONNX remains an adapter swap behind the same trait), cosine vector index, Reciprocal Rank Fusion of lexical+vector rankings (`HybridIndex`, used by chat + investigate)
 - [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|remove|list`, http download (https = typed error)
 - [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → cells → formulas → what_if tools with a recorded trail and citations; formula evaluator with what-if recomputation
@@ -50,9 +50,9 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Split / Graph-full / Grid-full modes persisted per workbook (`~/.config/gridtalk/ui-state.json`)
 - [x] Settings window (config path, verbatim-send notice)
 - [x] First-run wizard (privacy posture → backend/model → ready; writes `config.toml`, persisted `first_run_done`)
-- [x] Installers: tag-triggered release workflow (Linux/macOS/Windows archives attached to the GitHub Release) + `scripts/install.sh`; release workflow is exercised on the first `v*` tag
+- [x] Installers: tag-triggered release workflow (Linux/Windows archives attached to the GitHub Release; macOS is not a target, decision 0004) + `scripts/install.sh`; release workflow is exercised on the first `v*` tag
 
-- [x] Real-model generation: candle (`candle-gen`) generates from a real llama-family GGUF — SmolLM2-135M Q4_K_M at 31.9 tok/s, 541 ms first token (CPU, release). See `docs/spikes/inference-engine.md`
+- [x] Real-model generation: llama.cpp over Vulkan generates from real GGUFs incl. Qwen3-MoE (see Single-engine pivot below)
 - [x] Gridcraft ribbon reuse: companion-app composition (`gridtalk open-in-gridcraft`), decision 0003 — embedding rejected (forked egui + `SheetApp` ownership)
 
 ## Validation
@@ -77,10 +77,10 @@ flagging, async (worker-thread) chat in the UI, formula-preserving
 cell editing with save-to-disk, sheet tabs, virtualised rows, a
 real file dialog, and CI/release hardening (least-privilege
 permissions, `--locked`, candle-gen CI job, create-once releases
-with a version gate). Remaining known limits are unchanged and
-documented: mistral.rs / llama-cpp rungs not yet compiled in,
-Qwen3-MoE rejected by candle with a typed error, and the release
-workflow first exercised on a `v*` tag.
+with a version gate). Remaining known limits: the release
+workflow is first exercised on a `v*` tag, and Windows Vulkan
+runtime behaviour is verified only by inspection (no Windows test
+hardware).
 
 ## Single-engine pivot (feat/llama-cpp-vulkan, decision 0004)
 

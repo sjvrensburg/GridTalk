@@ -46,14 +46,27 @@ pub struct UiPrefs {
     pub config_path: String,
 }
 
+/// GridTalk's config directory: `$GRIDTALK_CONFIG_DIR` when set,
+/// otherwise the platform config dir (e.g. `%APPDATA%` on Windows,
+/// `~/.config` on Linux) with a `gridtalk` component.
+pub fn config_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("GRIDTALK_CONFIG_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Some(d) = dirs::config_dir() {
+        return d.join("gridtalk");
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => std::path::PathBuf::from(home).join(".config/gridtalk"),
+        _ => std::path::PathBuf::from(".config/gridtalk"),
+    }
+}
+
 impl UiPrefs {
     pub fn path() -> std::path::PathBuf {
-        let base =
-            std::env::var("GRIDTALK_CONFIG_DIR").unwrap_or_else(|_| match std::env::var("HOME") {
-                Ok(home) if !home.is_empty() => format!("{home}/.config/gridtalk"),
-                _ => ".config/gridtalk".to_string(),
-            });
-        std::path::PathBuf::from(base).join("ui-state.json")
+        config_dir().join("ui-state.json")
     }
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
@@ -140,11 +153,16 @@ pub struct GridTalkApp {
     current_path: Option<std::path::PathBuf>,
     saved_revision: u64,
     selected_sheet: usize,
-    edit_buffers: BTreeMap<(String, usize, usize), String>,
-    frame_snapshot: Option<gridtalk_graph::WorkbookSnapshot>,
+    edit_buffers: BTreeMap<(usize, usize, usize), String>,
+    frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
+    frame_sheet_idx: usize,
     frame_revision: u64,
+    chat_cancel: Option<Arc<AtomicBool>>,
+    chat_workbook: String,
+    pending_open: Option<std::path::PathBuf>,
+    close_armed: bool,
     graph_version: u64,
-    chat_rx: Option<std::sync::mpsc::Receiver<(String, String)>>,
+    chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
     chat_busy: bool,
 }
 
@@ -175,8 +193,13 @@ impl Default for GridTalkApp {
             saved_revision: 0,
             selected_sheet: 0,
             edit_buffers: BTreeMap::new(),
-            frame_snapshot: None,
+            frame_sheet: None,
+            frame_sheet_idx: usize::MAX,
             frame_revision: u64::MAX,
+            chat_cancel: None,
+            chat_workbook: String::new(),
+            pending_open: None,
+            close_armed: false,
             graph_version: 0,
             chat_rx: None,
             chat_busy: false,
@@ -205,21 +228,109 @@ fn write_wizard_config(
             .replace('"', "\\\"")
             .replace(['\r', '\n'], " ")
     };
-    let mut text = String::from("[inference]\n");
-    text.push_str(&format!("backend = \"{}\"\n", esc(backend)));
-    text.push_str("engine = \"llamacpp\"\n");
+    // Merge into any existing config instead of overwriting it:
+    // unrelated keys (model, api_key_env, comments) survive.
+    let mut updates: Vec<(String, String)> = vec![
+        ("backend".into(), esc(backend)),
+        ("engine".into(), "llamacpp".into()),
+    ];
     if !model_path.is_empty() {
-        text.push_str(&format!("model_path = \"{}\"\n", esc(model_path)));
+        updates.push(("model_path".into(), esc(model_path)));
     }
     if backend == "openai-compatible" {
-        text.push_str(&format!("base_url = \"{}\"\n", esc(base_url)));
+        updates.push(("base_url".into(), esc(base_url)));
     }
-    std::fs::write(&path, text)?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut in_inference = false;
+    let mut seen_section = false;
+    let mut applied: Vec<bool> = vec![false; updates.len()];
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_inference {
+                // Leaving [inference]: flush unapplied updates first.
+                for (i, (k, v)) in updates.iter().enumerate() {
+                    if !applied[i] {
+                        out.push(format!("{k} = \"{v}\""));
+                        applied[i] = true;
+                    }
+                }
+            }
+            in_inference = trimmed == "[inference]";
+            seen_section |= in_inference;
+        }
+        if in_inference {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if let Some(i) = updates.iter().position(|(k, _)| k == key) {
+                    out.push(format!("{key} = \"{}\"", updates[i].1));
+                    applied[i] = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if !seen_section {
+        out.push("[inference]".into());
+    }
+    for (i, (k, v)) in updates.iter().enumerate() {
+        if !applied[i] {
+            out.push(format!("{k} = \"{v}\""));
+        }
+    }
+    std::fs::write(&path, out.join("\n") + "\n")?;
     Ok(path)
 }
 
+/// Validate wizard inputs before Finish may persist anything.
+fn validate_wizard(backend: &str, model_path: &str, base_url: &str) -> Result<(), String> {
+    match backend {
+        "local" => {
+            if model_path.is_empty() {
+                return Err("choose a local .gguf model file first".into());
+            }
+            if !std::path::Path::new(model_path).exists() {
+                return Err(format!("model file does not exist: {model_path}"));
+            }
+            Ok(())
+        }
+        "openai-compatible" => {
+            if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+                return Err(format!(
+                    "base URL must start with http:// or https://: {base_url}"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown backend {other}")),
+    }
+}
+
 impl GridTalkApp {
+    fn push_chat(&mut self, role: &str, text: String) {
+        self.chat.push(ChatMsg {
+            role: role.into(),
+            text,
+        });
+        // Cap history so per-frame layout cost stays bounded.
+        const MAX_CHAT: usize = 200;
+        if self.chat.len() > MAX_CHAT {
+            let drop = self.chat.len() - MAX_CHAT;
+            self.chat.drain(..drop);
+        }
+    }
+
     fn open(&mut self, path: &std::path::Path) {
+        // Never silently discard unsaved edits: the first Open click
+        // arms the discard, the second (same path) confirms it.
+        if self.dirty() && self.pending_open.as_deref() != Some(path) {
+            self.pending_open = Some(path.to_path_buf());
+            self.status = "Unsaved edits would be discarded — click Open again to confirm.".into();
+            return;
+        }
+        self.pending_open = None;
         match load_path(path) {
             Ok(wb) => {
                 self.workbook_name = wb.name.clone();
@@ -237,6 +348,15 @@ impl GridTalkApp {
                 self.selected_sheet = 0;
                 self.edit_buffers.clear();
                 self.frame_revision = u64::MAX;
+                // Chat (and any in-flight answer) belongs to the old
+                // workbook; never land its reply in the new one.
+                if let Some(cancel) = &self.chat_cancel {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.chat_cancel = None;
+                self.chat.clear();
+                self.chat_rx = None;
+                self.chat_busy = false;
                 self.status = format!("Opened {}", path.display());
             }
             Err(e) => self.status = format!("Open failed: {e}"),
@@ -247,9 +367,20 @@ impl GridTalkApp {
         let (graph, violations) = build_graph(&snapshot);
         self.graph_version += 1;
         self.positions.clear();
+        if let Some(worker) = &self.layout_worker {
+            worker.cancel();
+        }
         self.layout_worker = None;
+        // Selection refers to the previous graph; drop it.
+        self.sync.selected_range = None;
+        self.sync.highlighted_node = None;
         if violations.is_empty() {
-            self.index = Some(Index::build(&snapshot, &graph));
+            // Refresh incrementally when possible (unchanged regions
+            // keep their embedding vectors).
+            match &mut self.index {
+                Some(index) => index.update(&snapshot, &graph),
+                None => self.index = Some(Index::build(&snapshot, &graph)),
+            }
         } else {
             // Never keep serving a stale index for a broken graph.
             self.index = None;
@@ -265,23 +396,17 @@ impl GridTalkApp {
             return;
         }
         self.chat_input.clear();
-        self.chat.push(ChatMsg {
-            role: "you".into(),
-            text: question.clone(),
-        });
+        self.push_chat("you", question.clone());
         let Some(index) = &self.index else {
-            self.chat.push(ChatMsg {
-                role: "gridtalk".into(),
-                text: "Open a workbook first.".into(),
-            });
+            self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
         let hits = index.search(&question, 3);
         if hits.is_empty() {
-            self.chat.push(ChatMsg {
-                role: "gridtalk".into(),
-                text: format!("No matching region found for \"{question}\"."),
-            });
+            self.push_chat(
+                "gridtalk",
+                format!("No matching region found for \"{question}\"."),
+            );
             return;
         }
         if let Some(first) = hits.first() {
@@ -299,6 +424,10 @@ impl GridTalkApp {
             .collect::<Vec<_>>()
             .join("\n---\n");
         let config_path = self.config_path.clone();
+        let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        self.chat_cancel = Some(cancel.clone());
+        self.chat_workbook = self.workbook_name.clone();
+        let workbook_tag = self.workbook_name.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_rx = Some(rx);
         self.chat_busy = true;
@@ -316,11 +445,10 @@ impl GridTalkApp {
                 user: format!("Question: {question}\n\nContext:\n{context}"),
                 max_tokens: 512,
             };
-            let cancel = Arc::new(AtomicBool::new(false));
             let mut out = String::new();
             let msg = match backend.stream(&req, &cancel, &mut |tok| out.push_str(tok)) {
-                Ok(()) => (backend.name().to_string(), out),
-                Err(e) => ("error".to_string(), e.to_string()),
+                Ok(()) => (workbook_tag.clone(), backend.name().to_string(), out),
+                Err(e) => (workbook_tag.clone(), "error".to_string(), e.to_string()),
             };
             let _ = tx.send(msg);
         });
@@ -328,11 +456,28 @@ impl GridTalkApp {
 
     fn save(&mut self) {
         let Some(path) = self.current_path.clone() else {
-            self.status = "Nothing to save: open a workbook first.".into();
+            self.status = "Nothing to save: open a workbook first, or use Save As.".into();
             return;
         };
-        let Some(inc) = &self.inc else { return };
+        self.save_to(&path, true);
+    }
+
+    fn save_as(&mut self, path: &std::path::Path) {
+        if self.save_to(path, false) {
+            self.current_path = Some(path.to_path_buf());
+        }
+    }
+
+    /// Flush pending debounced edits first, then write. Returns
+    /// true on success.
+    fn save_to(&mut self, path: &std::path::Path, _is_current: bool) -> bool {
+        // An edit typed <500ms ago must be in the saved file.
+        if let Some(inc) = &mut self.inc {
+            inc.flush();
+        }
+        let Some(inc) = &self.inc else { return false };
         let snapshot = inc.snapshot().clone();
+        let revision = inc.revision;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -341,21 +486,32 @@ impl GridTalkApp {
         let result: Result<(), String> = match ext.as_str() {
             "xlsx" => gridtalk_graph::to_xlsx_bytes(&snapshot)
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string())),
+                .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string())),
             "csv" | "tsv" => {
-                let delim = if ext == "tsv" { '\t' } else { ',' };
-                let text = snapshot_to_delimited(&snapshot, delim);
-                std::fs::write(&path, text).map_err(|e| e.to_string())
+                if snapshot.sheets.len() > 1 {
+                    Err(format!(
+                        "workbook has {} sheets but .{ext} holds one sheet; save as .xlsx to keep them all",
+                        snapshot.sheets.len()
+                    ))
+                } else {
+                    let delim = if ext == "tsv" { '\t' } else { ',' };
+                    let text = snapshot_to_delimited(&snapshot, delim);
+                    std::fs::write(path, text).map_err(|e| e.to_string())
+                }
             }
-            "ods" => Err("ODS is read-only in GridTalk; save as .xlsx or .csv".into()),
+            "ods" => Err("ODS is read-only in GridTalk; use Save As to write .xlsx or .csv".into()),
             _ => Err(format!("cannot save .{ext}; use .xlsx or .csv")),
         };
         match result {
             Ok(()) => {
-                self.saved_revision = inc.revision;
+                self.saved_revision = revision;
                 self.status = format!("Saved {}", path.display());
+                true
             }
-            Err(e) => self.status = format!("Save failed: {e}"),
+            Err(e) => {
+                self.status = format!("Save failed: {e}");
+                false
+            }
         }
     }
 
@@ -400,6 +556,12 @@ fn snapshot_to_delimited(snapshot: &gridtalk_graph::WorkbookSnapshot, delim: cha
 impl eframe::App for GridTalkApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
+        // Closing with unsaved edits needs a second, deliberate close.
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.close_armed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_armed = true;
+            self.status = "Unsaved edits — close again to exit without saving.".into();
+        }
         // Apply debounced cell edits; rebuild graph+index on revision change.
         if let Some(inc) = &mut self.inc {
             if inc.poll(std::time::Instant::now()) {
@@ -415,14 +577,25 @@ impl eframe::App for GridTalkApp {
         // Collect finished chat generations (worker thread).
         if let Some(rx) = &self.chat_rx {
             match rx.try_recv() {
-                Ok((role, text)) => {
-                    self.chat.push(ChatMsg { role, text });
+                Ok((wb_tag, role, text)) => {
+                    // Drop answers generated for a workbook that is
+                    // no longer open.
+                    if wb_tag == self.chat_workbook && wb_tag == self.workbook_name {
+                        self.push_chat(&role, text);
+                    }
                     self.chat_rx = None;
                     self.chat_busy = false;
+                    self.chat_cancel = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.push_chat(
+                        "error",
+                        "Generation stopped: the worker thread disconnected.".into(),
+                    );
+                    self.status = "Chat worker disconnected.".into();
                     self.chat_rx = None;
                     self.chat_busy = false;
+                    self.chat_cancel = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -433,22 +606,26 @@ impl eframe::App for GridTalkApp {
         if let Some(inc) = &self.inc {
             if inc.pending_edits() == 0 && !self.edit_buffers.is_empty() {
                 let snapshot = inc.snapshot();
-                self.edit_buffers.retain(|(sheet, r, c), buffer| {
+                self.edit_buffers.retain(|(sheet_idx, r, c), buffer| {
                     let current = snapshot
                         .sheets
-                        .iter()
-                        .find(|s| &s.name == sheet)
+                        .get(*sheet_idx)
                         .map(|s| cell_input_text(&s.get(*r, *c)))
                         .unwrap_or_default();
                     &current != buffer
                 });
             }
         }
-        // Cache the frame snapshot only when the revision changes,
-        // instead of cloning the workbook every frame.
+        // Cache only the displayed sheet, refreshed when the
+        // revision or selected sheet changes — never a whole-workbook
+        // clone per frame.
         if let Some(inc) = &self.inc {
-            if inc.revision != self.frame_revision || self.frame_snapshot.is_none() {
-                self.frame_snapshot = Some(inc.snapshot().clone());
+            if inc.revision != self.frame_revision
+                || self.selected_sheet != self.frame_sheet_idx
+                || self.frame_sheet.is_none()
+            {
+                self.frame_sheet = inc.snapshot().sheets.get(self.selected_sheet).cloned();
+                self.frame_sheet_idx = self.selected_sheet;
                 self.frame_revision = inc.revision;
             }
         }
@@ -485,6 +662,15 @@ impl eframe::App for GridTalkApp {
                 let save_label = if self.dirty() { "Save ●" } else { "Save" };
                 if ui.button(save_label).clicked() {
                     self.save();
+                }
+                if ui.button("Save As…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Excel workbook", &["xlsx"])
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                    {
+                        self.save_as(&path);
+                    }
                 }
                 if ui.button("Open in Gridcraft").clicked() {
                     match &self.current_path {
@@ -568,6 +754,15 @@ impl eframe::App for GridTalkApp {
                     }
                 });
             if finish {
+                if let Err(e) = validate_wizard(
+                    &self.wizard_backend,
+                    &self.wizard_model_path,
+                    &self.wizard_base_url,
+                ) {
+                    self.status = format!("Setup not saved: {e}");
+                    // Stay in the wizard (do not mark first run done).
+                    return;
+                }
                 match write_wizard_config(
                     &self.wizard_backend,
                     &self.wizard_model_path,
@@ -593,13 +788,18 @@ impl eframe::App for GridTalkApp {
         if self.show_settings {
             egui::Window::new("Settings").show(&ctx, |ui| {
                 ui.label("Config file (blank = local echo backend):");
-                if ui.text_edit_singleline(&mut self.config_path).changed() {
+                let resp = ui.text_edit_singleline(&mut self.config_path);
+                // Persist on Enter/focus loss, not on every keystroke,
+                // so a half-typed path is never saved mid-edit.
+                if resp.lost_focus() {
                     self.prefs.config_path = self.config_path.clone();
                     self.prefs.save();
                 }
                 ui.label("External endpoints receive cell values verbatim.");
                 ui.label("For sensitive workbooks, use a local model.");
                 if ui.button("Close").clicked() {
+                    self.prefs.config_path = self.config_path.clone();
+                    self.prefs.save();
                     self.show_settings = false;
                 }
             });
@@ -633,98 +833,117 @@ impl eframe::App for GridTalkApp {
 
 impl GridTalkApp {
     fn grid_and_chat(&mut self, ui: &mut egui::Ui) {
-        // Collect edits/clicks while rendering from the cached frame
-        // snapshot; apply them after the borrow ends.
+        // Collect edits/clicks while rendering; apply after.
         let mut pending_edit: Option<CellEdit> = None;
         let mut clicked_cell: Option<(String, usize, usize)> = None;
-        if let Some(snapshot) = self.frame_snapshot.clone() {
-            // Sheet tabs.
-            if snapshot.sheets.len() > 1 {
-                ui.horizontal(|ui| {
-                    for (i, sheet) in snapshot.sheets.iter().enumerate() {
-                        if ui
-                            .selectable_label(self.selected_sheet == i, &sheet.name)
-                            .clicked()
-                        {
-                            self.selected_sheet = i;
-                        }
+        // Sheet tabs need the sheet list; take names from the cached
+        // sheet plus the snapshot sheet count via inc (names only).
+        let sheet_names: Vec<String> = self
+            .inc
+            .as_ref()
+            .map(|inc| {
+                inc.snapshot()
+                    .sheets
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if sheet_names.len() > 1 {
+            ui.horizontal(|ui| {
+                for (i, name) in sheet_names.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.selected_sheet == i, name)
+                        .clicked()
+                        && self.selected_sheet != i
+                    {
+                        self.selected_sheet = i;
+                        // Selection belongs to the previous sheet.
+                        self.sync.selected_range = None;
+                        self.sync.highlighted_node = None;
                     }
-                });
-            }
-            let sheet_idx = self
-                .selected_sheet
-                .min(snapshot.sheets.len().saturating_sub(1));
-            if let Some(sheet) = snapshot.sheets.get(sheet_idx) {
-                ui.heading(&sheet.name);
-                let selected = self.sync.selected_range.clone();
-                let max_col = sheet.max_col();
-                // Header row.
-                ui.horizontal(|ui| {
-                    ui.add_space(38.0);
-                    for c in 0..max_col {
-                        ui.add_sized(
-                            [90.0, 18.0],
-                            egui::Label::new(
-                                egui::RichText::new(gridtalk_graph::col_name(c)).strong(),
-                            ),
-                        );
-                    }
-                });
-                // Virtualised rows: only the visible window is built.
-                let row_height = 22.0;
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_height, sheet.cells.len(), |ui, row_range| {
-                        for r in row_range {
-                            let row = &sheet.cells[r];
+                }
+            });
+        }
+        if let Some(sheet) = &self.frame_sheet {
+            let sheet_idx = self.frame_sheet_idx;
+            let sheet_name = sheet.name.clone();
+            ui.heading(&sheet_name);
+            let selected = self.sync.selected_range.clone();
+            let max_col = sheet.max_col();
+            let display_cols = max_col + 2;
+            // A few editable rows/columns beyond the data rectangle
+            // so users can append data instead of being fenced in.
+            let display_rows = sheet.cells.len() + 3;
+            let row_height = 22.0;
+            // Header + rows live inside the same horizontally
+            // scrolling area so column letters stay aligned.
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, display_rows + 1, |ui, row_range| {
+                    for r_plus in row_range {
+                        if r_plus == 0 {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [34.0, row_height],
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("{}", r + 1)).strong(),
-                                    ),
+                                    egui::Label::new(egui::RichText::new("").strong()),
                                 );
-                                for (c, cell) in row.iter().enumerate() {
-                                    let is_selected = selected
-                                        .as_ref()
-                                        .map(|s| s.sheet == sheet.name && s.contains(r, c))
-                                        .unwrap_or(false);
-                                    let key = (sheet.name.clone(), r, c);
-                                    // The editor shows formulas as
-                                    // formulas (=B2*C2), never the
-                                    // cached display value, and the
-                                    // buffer survives frames until
-                                    // the debounce flush lands.
-                                    let buffer = self
-                                        .edit_buffers
-                                        .entry(key)
-                                        .or_insert_with(|| cell_input_text(cell));
-                                    let resp = ui.add_sized(
+                                for c in 0..display_cols {
+                                    ui.add_sized(
                                         [90.0, row_height],
-                                        egui::TextEdit::singleline(buffer).text_color(
-                                            if is_selected {
-                                                egui::Color32::YELLOW
-                                            } else {
-                                                egui::Color32::LIGHT_GRAY
-                                            },
+                                        egui::Label::new(
+                                            egui::RichText::new(gridtalk_graph::col_name(c))
+                                                .strong(),
                                         ),
                                     );
-                                    if resp.clicked() {
-                                        clicked_cell = Some((sheet.name.clone(), r, c));
-                                    }
-                                    if resp.changed() {
-                                        pending_edit = Some(CellEdit {
-                                            sheet: sheet.name.clone(),
-                                            row: r,
-                                            col: c,
-                                            value: parse_cell_input(buffer),
-                                        });
-                                    }
                                 }
                             });
+                            continue;
                         }
-                    });
-            }
+                        let r = r_plus - 1;
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [34.0, row_height],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{}", r + 1)).strong(),
+                                ),
+                            );
+                            for c in 0..display_cols {
+                                let cell = sheet.get(r, c);
+                                let is_selected = selected
+                                    .as_ref()
+                                    .map(|s| s.sheet == sheet_name && s.contains(r, c))
+                                    .unwrap_or(false);
+                                // Index key: no sheet-name String
+                                // allocated per visible cell per frame.
+                                let key = (sheet_idx, r, c);
+                                let buffer = self
+                                    .edit_buffers
+                                    .entry(key)
+                                    .or_insert_with(|| cell_input_text(&cell));
+                                let resp = ui.add_sized(
+                                    [90.0, row_height],
+                                    egui::TextEdit::singleline(buffer).text_color(if is_selected {
+                                        egui::Color32::YELLOW
+                                    } else {
+                                        egui::Color32::LIGHT_GRAY
+                                    }),
+                                );
+                                if resp.clicked() {
+                                    clicked_cell = Some((sheet_name.clone(), r, c));
+                                }
+                                if resp.changed() {
+                                    pending_edit = Some(CellEdit {
+                                        sheet: sheet_name.clone(),
+                                        row: r,
+                                        col: c,
+                                        value: parse_cell_input(buffer),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                });
         }
         if let Some((sheet, r, c)) = clicked_cell {
             self.sync.select_cell(&self.graph, &sheet, r, c);
@@ -746,6 +965,12 @@ impl GridTalkApp {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Generating… (on a worker thread; the grid stays live)");
+                        if ui.button("Cancel").clicked() {
+                            if let Some(cancel) = &self.chat_cancel {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            self.status = "Cancelling generation…".into();
+                        }
                     });
                 }
             });
@@ -775,6 +1000,7 @@ impl GridTalkApp {
                 self.graph_version,
                 rect.width(),
                 rect.height(),
+                Some(ui.ctx().clone()),
             ));
         }
         let painter = ui.painter_at(rect);
@@ -790,8 +1016,32 @@ impl GridTalkApp {
                 );
             }
         }
+        // Nodes are real widgets: clickable, hoverable (tooltip with
+        // the range), and reachable by keyboard (Left/Right cycles
+        // nodes when the graph pane is hovered).
         let mut clicked_node: Option<usize> = None;
-        let mut clicked_dist = f32::MAX;
+        if response.hovered() {
+            let (next, prev) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                )
+            });
+            if (next || prev) && !self.graph.nodes.is_empty() {
+                let cur = self
+                    .sync
+                    .highlighted_node
+                    .and_then(|id| self.graph.nodes.iter().position(|n| n.id == id))
+                    .unwrap_or(0);
+                let len = self.graph.nodes.len();
+                let idx = if next {
+                    (cur + 1) % len
+                } else {
+                    (cur + len - 1) % len
+                };
+                clicked_node = Some(self.graph.nodes[idx].id);
+            }
+        }
         for n in &self.graph.nodes {
             if let Some(p) = self.positions.get(&n.id) {
                 let centre = egui::pos2(origin.x + p.x, origin.y + p.y);
@@ -803,21 +1053,38 @@ impl GridTalkApp {
                     NodeKind::Column => egui::Color32::GRAY,
                 };
                 painter.circle_filled(centre, if highlighted { 10.0 } else { 7.0 }, colour);
-                painter.text(
-                    centre + egui::vec2(10.0, -6.0),
-                    egui::Align2::LEFT_TOP,
-                    &n.label,
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::WHITE,
-                );
-                if response.clicked() {
-                    if let Some(click) = response.interact_pointer_pos() {
-                        let d = centre.distance(click);
-                        if d <= 12.0 && d < clicked_dist {
-                            clicked_dist = d;
-                            clicked_node = Some(n.id);
-                        }
-                    }
+                let node_rect = egui::Rect::from_center_size(centre, egui::vec2(120.0, 18.0));
+                let label = if n.label.len() > 16 {
+                    format!("{}…", &n.label[..16])
+                } else {
+                    n.label.clone()
+                };
+                let resp = ui
+                    .put(
+                        node_rect,
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .size(11.0)
+                                .color(egui::Color32::BLACK),
+                        )
+                        .fill(colour)
+                        .stroke(if highlighted {
+                            egui::Stroke::new(2.0, egui::Color32::YELLOW)
+                        } else {
+                            egui::Stroke::NONE
+                        }),
+                    )
+                    .on_hover_text(format!(
+                        "{:?}: {}{}",
+                        n.kind,
+                        n.label,
+                        n.range
+                            .as_ref()
+                            .map(|r| format!(" ({})", r.a1()))
+                            .unwrap_or_default()
+                    ));
+                if resp.clicked() {
+                    clicked_node = Some(n.id);
                 }
             }
         }
@@ -907,6 +1174,47 @@ mod tests {
             back.sheets[0].get(1, 1),
             gridtalk_graph::CellValue::Formula { .. }
         ));
+    }
+
+    #[test]
+    fn wizard_validation_and_save_flush() {
+        assert!(validate_wizard("local", "", "").is_err());
+        assert!(validate_wizard("local", "/definitely/missing.gguf", "").is_err());
+        assert!(validate_wizard("openai-compatible", "", "ftp://x").is_err());
+        assert!(validate_wizard("openai-compatible", "", "http://127.0.0.1:1/v1").is_ok());
+
+        // Save must flush a pending (not yet debounced) edit.
+        let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
+        let mut app = GridTalkApp::default();
+        let mut inc = IncrementalSnapshot::new(wb);
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 1,
+                col: 0,
+                value: CellValue::Number(99.0),
+            },
+            std::time::Instant::now(),
+        );
+        let dir = std::env::temp_dir().join(format!("gt-ui-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.csv");
+        app.inc = Some(inc);
+        app.current_path = Some(path.clone());
+        app.save();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("99"), "pending edit must be saved: {saved}");
+        // Multi-sheet CSV save is an explicit error, never silent loss.
+        let mut wb2 = parse_delimited("d", "Sheet1", "A\n1\n", ',');
+        wb2.sheets.push(gridtalk_graph::SheetSnapshot {
+            name: "Second".into(),
+            cells: vec![vec![CellValue::Number(7.0)]],
+        });
+        app.inc = Some(IncrementalSnapshot::new(wb2));
+        app.current_path = Some(path.clone());
+        app.save();
+        assert!(app.status.contains("sheets"), "status: {}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

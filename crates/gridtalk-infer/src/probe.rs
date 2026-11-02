@@ -3,7 +3,7 @@
 //! architecture/tensors; actual load + generation is exercised by
 //! `LlamaCppBackend` (and `gridtalk generate`).
 
-use crate::models::{parse_gguf, ModelError};
+use crate::models::{parse_gguf_file, ModelError};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -11,31 +11,21 @@ pub struct EngineReport {
     pub engine: &'static str,
     pub gguf_arch: Option<String>,
     pub tensor_count: Option<usize>,
-    pub loads: bool,
+    /// True when the GGUF *header* parses. This does not load
+    /// tensors or prove the engine can run the file.
+    pub header_ok: bool,
     pub detail: String,
 }
 
 pub fn probe_model(model_path: &Path) -> EngineReport {
-    let bytes = match std::fs::read(model_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return EngineReport {
-                engine: "llama-cpp-vulkan",
-                gguf_arch: None,
-                tensor_count: None,
-                loads: false,
-                detail: format!("cannot read model file: {e}"),
-            }
-        }
-    };
-    match parse_gguf(&bytes) {
+    match parse_gguf_file(model_path) {
         Ok(info) => EngineReport {
             engine: "llama-cpp-vulkan",
             gguf_arch: info.architecture.clone(),
             tensor_count: Some(info.tensor_count as usize),
-            loads: true,
+            header_ok: true,
             detail: format!(
-                "GGUF header OK (arch {:?}, {} tensors); llama.cpp loads every GGUF architecture, with all layers offloaded to Vulkan when a driver is present",
+                "GGUF header OK (arch {:?}, {} tensors; header only — not a load test); llama.cpp loads every GGUF architecture, with all layers offloaded to Vulkan when a driver is present",
                 info.architecture, info.tensor_count
             ),
         },
@@ -43,14 +33,14 @@ pub fn probe_model(model_path: &Path) -> EngineReport {
             engine: "llama-cpp-vulkan",
             gguf_arch: None,
             tensor_count: None,
-            loads: false,
+            header_ok: false,
             detail: format!("GGUF header rejected: {m}"),
         },
         Err(e) => EngineReport {
             engine: "llama-cpp-vulkan",
             gguf_arch: None,
             tensor_count: None,
-            loads: false,
+            header_ok: false,
             detail: e.to_string(),
         },
     }
@@ -68,11 +58,11 @@ mod tests {
         let good = dir.join("good.gguf");
         std::fs::write(&good, synthetic_gguf("qwen3moe")).unwrap();
         let report = probe_model(&good);
-        assert!(report.loads);
+        assert!(report.header_ok);
         assert_eq!(report.gguf_arch.as_deref(), Some("qwen3moe"));
         let bad = dir.join("bad.gguf");
         std::fs::write(&bad, b"not a model").unwrap();
-        assert!(!probe_model(&bad).loads);
+        assert!(!probe_model(&bad).header_ok);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

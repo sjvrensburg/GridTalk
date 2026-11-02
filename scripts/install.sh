@@ -1,9 +1,18 @@
 #!/bin/sh
-# GridTalk installer: builds from the checkout containing this
-# script and installs `gridtalk` and `gridtalk-ui` into
+# GridTalk installer (Linux): builds from the checkout containing
+# this script and installs `gridtalk` and `gridtalk-ui` into
 # ~/.local/bin (override with GRIDTALK_INSTALL_DIR). Nothing is
 # downloaded except crates.io dependencies during the build.
+# Windows users: use the release .zip instead (no install script).
+# Prerequisites: cargo, CMake, a C++ toolchain and glslc (Vulkan
+# SDK) — llama-cpp-sys-2 needs all of them to build.
 set -eu
+for tool in cargo cmake glslc; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "missing prerequisite: $tool (install Rust, CMake and the Vulkan SDK/glslc first)" >&2
+    exit 1
+  fi
+done
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(dirname -- "$SCRIPT_DIR")
 cd "$REPO_ROOT"
@@ -15,7 +24,7 @@ for bin in gridtalk gridtalk-ui; do
     exit 1
   fi
 done
-cargo build --release -p gridtalk-app -p gridtalk-ui
+cargo build --locked --release -p gridtalk-app -p gridtalk-ui
 cp target/release/gridtalk target/release/gridtalk-ui "$DIR/"
 echo "Installed gridtalk and gridtalk-ui into $DIR"
 echo "First run: gridtalk-ui  (a short setup wizard will appear)"

@@ -11,6 +11,38 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           submodules: true
+      - name: Cache Vulkan SDK (Linux)
+        uses: actions/cache@v4
+        with:
+          path: ~/vulkan-sdk
+          key: vulkan-sdk-1.4.341.0-linux-x86_64
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Full LunarG SDK: apt fragments miss SPIRV-Headers, which
+          # ggml-vulkan's shader generator requires. The tarball is
+          # verified against a pinned SHA-256 (and --fail stops an
+          # HTTP error page being saved as the tarball).
+          SDK_DIR="$HOME/vulkan-sdk/x86_64"
+          if [ ! -x "$SDK_DIR/bin/glslc" ]; then
+            curl -fL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
+            echo "ed66477d587a5587dc3601b1c2cdcc1fab5529c505f53a00171876cecd9b4fbe  /tmp/vulkan-sdk.tar.xz" | sha256sum -c -
+            mkdir -p "$HOME/vulkan-sdk"
+            tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          fi
+          # Tarball layout after --strip-components=1 is
+          # $HOME/vulkan-sdk/x86_64 (setup-env.sh in the SDK
+          # computes the same: <root>/$(uname -m)).
+          test -x "$SDK_DIR/bin/glslc"
+          test -f "$SDK_DIR/include/vulkan/vulkan.h"
+          test -f "$SDK_DIR/lib/libvulkan.so"
+          echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+          echo "CMAKE_PREFIX_PATH=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$SDK_DIR/lib" >> "$GITHUB_ENV"
+          echo "SDK installed at $SDK_DIR:"
+          ls "$SDK_DIR/bin/glslc" "$SDK_DIR/share/cmake/SPIRV-Headers"
       - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -42,19 +74,30 @@ jobs:
       - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Cache Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/vulkan-sdk
+          key: vulkan-sdk-1.4.341.0-linux-x86_64
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           # Full LunarG SDK: apt fragments miss SPIRV-Headers, which
-          # ggml-vulkan's shader generator requires.
-          curl -sL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
-          mkdir -p "$HOME/vulkan-sdk"
-          tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          # ggml-vulkan's shader generator requires. The tarball is
+          # verified against a pinned SHA-256 (and --fail stops an
+          # HTTP error page being saved as the tarball).
+          SDK_DIR="$HOME/vulkan-sdk/x86_64"
+          if [ ! -x "$SDK_DIR/bin/glslc" ]; then
+            curl -fL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
+            echo "ed66477d587a5587dc3601b1c2cdcc1fab5529c505f53a00171876cecd9b4fbe  /tmp/vulkan-sdk.tar.xz" | sha256sum -c -
+            mkdir -p "$HOME/vulkan-sdk"
+            tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          fi
           # Tarball layout after --strip-components=1 is
           # $HOME/vulkan-sdk/x86_64 (setup-env.sh in the SDK
           # computes the same: <root>/$(uname -m)).
-          SDK_DIR="$HOME/vulkan-sdk/x86_64"
           test -x "$SDK_DIR/bin/glslc"
           test -f "$SDK_DIR/include/vulkan/vulkan.h"
           test -f "$SDK_DIR/lib/libvulkan.so"
@@ -66,7 +109,7 @@ jobs:
           ls "$SDK_DIR/bin/glslc" "$SDK_DIR/share/cmake/SPIRV-Headers"
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
-        uses: jakoch/install-vulkan-sdk-action@v1
+        uses: jakoch/install-vulkan-sdk-action@d17de7e2f5e50efb5d2123efed18497d3c58c533 # v1
         with:
           vulkan_version: 1.4.341.0
           install_runtime: true
@@ -79,7 +122,7 @@ jobs:
           # MSBuild's vcvars batch breaks in the vulkan-shaders-gen
           # subproject on GitHub runners ("cannot find batch label
           # VCEnd"); Ninja avoids that path entirely.
-          choco install ninja -y
+          choco install ninja -y --version 1.12.1
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Get-ChildItem "$env:VULKAN_SDK" | Select-Object -First 5
@@ -92,9 +135,10 @@ jobs:
           mkdir -p dist
           cp target/release/gridtalk target/release/gridtalk-ui dist/
           cp README.md LICENSE-MIT config.example.toml dist/
-          cp vendor/gridcraft/LICENSE-MIT dist/GRIDRAFT-LICENSE-MIT
-          cp vendor/gridcraft/LICENSE-APACHE dist/GRIDRAFT-LICENSE-APACHE
-          cp vendor/gridcraft/NOTICE dist/GRIDRAFT-NOTICE || true
+          cp vendor/gridcraft/LICENSE-MIT dist/Gridcraft-LICENSE-MIT
+          cp vendor/gridcraft/LICENSE-APACHE dist/Gridcraft-LICENSE-APACHE
+          cp vendor/gridcraft/NOTICE dist/Gridcraft-NOTICE
+          cp licenses/llama.cpp-LICENSE.txt licenses/README.md dist/
           tar -czf "gridtalk-${{ github.ref_name }}-${{ runner.os }}.tar.gz" -C dist .
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -102,8 +146,15 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist
           Copy-Item target/release/gridtalk.exe, target/release/gridtalk-ui.exe, README.md, LICENSE-MIT, config.example.toml dist/
-          Copy-Item vendor/gridcraft/LICENSE-MIT dist/GRIDRAFT-LICENSE-MIT
-          Copy-Item vendor/gridcraft/LICENSE-APACHE dist/GRIDRAFT-LICENSE-APACHE
+          Copy-Item vendor/gridcraft/LICENSE-MIT dist/Gridcraft-LICENSE-MIT
+          Copy-Item vendor/gridcraft/LICENSE-APACHE dist/Gridcraft-LICENSE-APACHE
+          Copy-Item vendor/gridcraft/NOTICE dist/Gridcraft-NOTICE
+          Copy-Item licenses/llama.cpp-LICENSE.txt, licenses/README.md dist/
+          # The binary hard-links the Vulkan loader; bundle it so a
+          # driverless Windows machine starts (CPU fallback) instead
+          # of failing at loader time.
+          $loader = Join-Path $env:VULKAN_SDK "Bin/vulkan-1.dll"
+          if (Test-Path $loader) { Copy-Item $loader dist/ } else { throw "vulkan-1.dll not found under VULKAN_SDK ($env:VULKAN_SDK)" }
           Compress-Archive -Path dist/* -DestinationPath "gridtalk-${{ github.ref_name }}-Windows.zip"
       - name: Upload to GitHub Release
         shell: bash

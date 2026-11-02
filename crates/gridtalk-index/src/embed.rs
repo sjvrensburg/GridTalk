@@ -1,12 +1,10 @@
 //! Local embeddings and vector search.
 //!
-//! The production embedding model is `bge-small-en-v1.5` run locally
-//! (ExcelGRAG used fastembed/ONNX). That model is an *adapter*
-//! behind [`EmbeddingModel`]: this module ships a dependency-light,
-//! fully offline n-gram embedding that always works (including in
-//! tests and first run before any model download), plus cosine
-//! vector search over region passages. Swapping in the ONNX model
-//! changes only the `embed` implementation, not the hybrid index.
+//! This module ships a dependency-light, fully offline signed
+//! n-gram hashing embedding that always works (including in tests
+//! and first run). A `bge-small-en-v1.5` ONNX adapter behind
+//! [`EmbeddingModel`] is planned but not shipped: retrieval today is
+//! morphological (shared word/ngram features), not semantic.
 
 use std::collections::BTreeMap;
 
@@ -23,12 +21,12 @@ pub trait EmbeddingModel: Send + Sync {
 /// (e.g. "provision" / "provisions") with zero downloads and zero
 /// runtime dependencies — data never leaves the machine.
 pub struct NGramEmbedding {
-    pub dim: usize,
+    dim: usize,
 }
 
 impl Default for NGramEmbedding {
     fn default() -> Self {
-        NGramEmbedding { dim: 256 }
+        NGramEmbedding { dim: 1024 }
     }
 }
 
@@ -50,12 +48,64 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// keeps single characters and decimal numbers ("3.14" stays one
 /// token), splits on other punctuation.
 pub fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !(c.is_alphanumeric() || c == '.'))
-        .map(|s| s.trim_matches('.'))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    let chars: Vec<char> = text.to_lowercase().chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if cur.is_empty() {
+            return;
+        }
+        let mut t = std::mem::take(cur);
+        // Normalise numbers: "1,000" and "1000" are the same token,
+        // ".5" becomes "0.5".
+        if t.chars()
+            .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
+            && t.chars().any(|c| c.is_ascii_digit())
+        {
+            t = t.replace(',', "");
+            if let Some(rest) = t.strip_prefix('.') {
+                t = format!("0.{rest}");
+            }
+        }
+        let t = t.trim_matches('.').to_string();
+        let t = if let Some(rest) = t.strip_prefix('.') {
+            format!("0.{rest}")
+        } else {
+            t
+        };
+        if !t.is_empty() {
+            out.push(t);
+        }
+    };
+    for i in 0..chars.len() {
+        let c = chars[i];
+        let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+        let next_digit = chars.get(i + 1).is_some_and(|n| n.is_ascii_digit());
+        if c.is_alphanumeric()
+            || (c == '.' && (prev_digit || cur.is_empty()) && (next_digit || prev_digit))
+            || (c == ',' && prev_digit && next_digit)
+        {
+            cur.push(c);
+        } else if c == '%'
+            && !cur.is_empty()
+            && cur.chars().last().is_some_and(|l| l.is_ascii_digit())
+        {
+            cur.push(c);
+            flush(&mut cur, &mut out);
+        } else {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+fn add_feature(v: &mut [f32], h: u64, weight: f32) {
+    // Signed hashing: collisions can cancel instead of only adding,
+    // so unrelated texts stay near zero cosine.
+    let idx = (h % v.len() as u64) as usize;
+    let sign = if (h >> 63) == 0 { 1.0 } else { -1.0 };
+    v[idx] += sign * weight;
 }
 
 impl EmbeddingModel for NGramEmbedding {
@@ -72,18 +122,17 @@ impl EmbeddingModel for NGramEmbedding {
         let mut v = vec![0.0f32; self.dim];
         let words = tokenize(text);
         for w in &words {
-            let h = hash_token(w);
-            v[(h % self.dim as u64) as usize] += 1.0;
-            // Character trigrams over bytes (no per-trigram String).
-            let bytes = w.as_bytes();
-            if bytes.len() >= 3 {
-                for tri in bytes.windows(3) {
-                    let h = hash_bytes(tri);
-                    v[(h % self.dim as u64) as usize] += 0.5;
+            add_feature(&mut v, hash_token(w), 1.0);
+            // Character trigrams over chars, not UTF-8 bytes, so
+            // non-ASCII words hash their actual characters.
+            let chars: Vec<char> = w.chars().collect();
+            if chars.len() >= 3 {
+                for tri in chars.windows(3) {
+                    let tri_s: String = tri.iter().collect();
+                    add_feature(&mut v, hash_bytes(tri_s.as_bytes()), 0.5);
                 }
-            } else if !bytes.is_empty() {
-                let h = hash_bytes(bytes);
-                v[(h % self.dim as u64) as usize] += 0.5;
+            } else if !chars.is_empty() {
+                add_feature(&mut v, hash_bytes(w.as_bytes()), 0.5);
             }
         }
         for pair in words.windows(2) {
@@ -92,7 +141,7 @@ impl EmbeddingModel for NGramEmbedding {
             key.push(b' ');
             key.extend_from_slice(pair[1].as_bytes());
             let h = hash_bytes(&key);
-            v[(h % self.dim as u64) as usize] += 0.75;
+            add_feature(&mut v, h, 0.75);
         }
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
@@ -105,9 +154,9 @@ impl EmbeddingModel for NGramEmbedding {
 }
 
 impl NGramEmbedding {
-    /// Validating constructor: dim must be at least 8.
+    /// Validating constructor: dim must be in 8..=65536.
     pub fn new(dim: usize) -> Option<Self> {
-        if dim >= 8 {
+        if (8..=65_536).contains(&dim) {
             Some(NGramEmbedding { dim })
         } else {
             None
@@ -119,7 +168,14 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,16 +193,42 @@ pub struct VectorIndex {
     pub threshold: f32,
     pub dim: usize,
     vectors: Vec<Vec<f32>>,
+    texts: Vec<String>,
 }
 
 impl VectorIndex {
     pub fn build(texts: &[String], model: &dyn EmbeddingModel) -> Self {
         VectorIndex {
             model_name: model.name().to_string(),
-            threshold: 0.05,
+            threshold: 0.15,
             dim: model.dim(),
             vectors: texts.iter().map(|t| model.embed(t)).collect(),
+            texts: texts.to_vec(),
         }
+    }
+
+    /// Rebuild over `texts`, reusing the stored vector for any text
+    /// that is unchanged so a one-cell edit does not re-embed every
+    /// region.
+    pub fn rebuild(&mut self, texts: &[String], model: &dyn EmbeddingModel) {
+        if model.name() != self.model_name || model.dim() != self.dim {
+            *self = VectorIndex::build(texts, model);
+            return;
+        }
+        let cache: std::collections::HashMap<&str, &Vec<f32>> = self
+            .texts
+            .iter()
+            .map(|t| t.as_str())
+            .zip(self.vectors.iter())
+            .collect();
+        self.vectors = texts
+            .iter()
+            .map(|t| match cache.get(t.as_str()) {
+                Some(v) => (*v).clone(),
+                None => model.embed(t),
+            })
+            .collect();
+        self.texts = texts.to_vec();
     }
 
     pub fn search(&self, query: &str, model: &dyn EmbeddingModel, limit: usize) -> Vec<VectorHit> {
@@ -220,16 +302,34 @@ mod tests {
 
     #[test]
     fn regression_dim_zero_and_mismatched_models_never_panic() {
-        let zero = NGramEmbedding { dim: 0 };
-        assert!(zero.embed("anything").is_empty());
         assert!(NGramEmbedding::new(0).is_none());
+        assert!(NGramEmbedding::new(1).is_none());
+        assert!(NGramEmbedding::new(usize::MAX).is_none());
         let a = NGramEmbedding::default();
         let idx = VectorIndex::build(&["hello world".to_string()], &a);
         // Same name + dim is required; a 256-dim model against a
         // mismatched caller returns no hits instead of garbage.
-        let other = NGramEmbedding { dim: 64 };
+        let other = NGramEmbedding::new(64).unwrap();
         assert!(idx.search("hello", &other, 5).is_empty());
         assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn tokeniser_and_signed_hashing_regressions() {
+        assert_eq!(tokenize("1,000"), vec!["1000".to_string()]);
+        assert_eq!(tokenize("1000"), vec!["1000".to_string()]);
+        assert_eq!(tokenize(".5"), vec!["0.5".to_string()]);
+        assert_eq!(tokenize("50%"), vec!["50%".to_string()]);
+        let m = NGramEmbedding::default();
+        let unrelated = cosine(
+            &m.embed("apples quantity price"),
+            &m.embed("zebra xylophone quantum"),
+        );
+        assert!(unrelated.abs() < 0.15, "unrelated cosine {unrelated}");
+        // cosine() normalises unnormalised inputs.
+        assert!((cosine(&[2.0, 0.0], &[3.0, 0.0]) - 1.0).abs() < 1e-6);
+        // Char trigrams: accented words embed without byte artefacts.
+        assert_eq!(m.embed("café résumé"), m.embed("café résumé"));
     }
 
     #[test]

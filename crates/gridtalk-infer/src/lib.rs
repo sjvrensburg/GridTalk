@@ -15,6 +15,9 @@ pub struct GenerationStats {
     pub generated_tokens: usize,
     pub first_token_ms: Option<f64>,
     pub total_ms: f64,
+    /// Model load time, reported separately so generation timings
+    /// (first token, tokens/sec) are not conflated with it.
+    pub load_ms: f64,
     pub tokens_per_sec: f64,
 }
 
@@ -143,12 +146,21 @@ fn reject_crlf(field: &str, value: &str) -> Result<(), InferError> {
 }
 
 fn is_loopback_host(host_port: &str) -> bool {
-    let host = host_port
-        .trim_start_matches('[')
-        .split([':', ']'])
-        .next()
-        .unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
+    // Parse the host properly: a DNS name that merely starts with
+    // "127." (e.g. 127.attacker.example) is NOT loopback.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn connect_timeout(host_port: &str) -> Result<std::net::TcpStream, InferError> {
@@ -183,7 +195,7 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
         let size_str = String::from_utf8_lossy(&rest[..line_end])
             .trim()
             .to_string();
-        let size = usize::from_str_radix(&size_str, 16)
+        let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|_| InferError::Http(format!("bad chunk size {size_str:?}")))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
@@ -202,18 +214,48 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
 
 /// Read an HTTP/1.1 response (status checked, chunked decoded,
 /// 16 MiB cap) and return the body text.
-fn read_http_response(stream: &mut std::net::TcpStream) -> Result<String, InferError> {
+fn read_http_response(
+    stream: &mut std::net::TcpStream,
+    cancel: Option<&CancelToken>,
+) -> Result<String, InferError> {
     use std::io::Read as _;
+    // Short read timeout so cancellation is polled during the
+    // blocking exchange instead of only before/after it.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
+    let mut stalls = 0usize;
     loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&buf[..n]);
-        if raw.len() > 16 * 1024 * 1024 {
-            return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                stalls = 0;
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 16 * 1024 * 1024 {
+                    return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if let Some(c) = cancel {
+                    if c.load(Ordering::Relaxed) {
+                        return Err(InferError::Cancelled);
+                    }
+                }
+                stalls += 1;
+                if stalls > 15 {
+                    return Err(InferError::Http(
+                        "endpoint stalled for over 30 seconds".into(),
+                    ));
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
     let split = raw
@@ -293,7 +335,7 @@ impl ChatBackend for OpenAiCompatibleBackend {
                 "refusing to send an API key over cleartext http to non-loopback host {host_port}; use a loopback redacting proxy or a TLS endpoint"
             )));
         }
-        let path = format!("{path_prefix}/chat/completions");
+        let path = format!("{}/chat/completions", path_prefix.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
             "stream": false,
@@ -317,12 +359,24 @@ impl ChatBackend for OpenAiCompatibleBackend {
         req_text.push_str("\r\n");
         stream.write_all(req_text.as_bytes())?;
         stream.write_all(body.as_bytes())?;
-        let raw = read_http_response(&mut stream)?;
+        let raw = read_http_response(&mut stream, Some(cancel))?;
         let value: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| InferError::Http(format!("bad JSON response: {e}")))?;
-        let content = value["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| InferError::Http("response has no choices[0].message.content".into()))?;
+        let content_value = &value["choices"][0]["message"]["content"];
+        let content: String = if let Some(text) = content_value.as_str() {
+            text.to_string()
+        } else if let Some(parts) = content_value.as_array() {
+            // Array-of-parts content (some compatible servers).
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect()
+        } else {
+            return Err(InferError::Http(
+                "response has no choices[0].message.content".into(),
+            ));
+        };
+        let content = content.as_str();
         for word in content.split_inclusive(' ') {
             if cancel.load(Ordering::Relaxed) {
                 return Err(InferError::Cancelled);
@@ -337,6 +391,12 @@ impl ChatBackend for OpenAiCompatibleBackend {
 /// falls back to EchoBackend so the app always runs; the UI surfaces
 /// that no real model is loaded.
 pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn ChatBackend + Send> {
+    if !matches!(cfg.backend.as_str(), "local" | "openai-compatible" | "") {
+        eprintln!(
+            "gridtalk: warning: unknown backend {:?}; expected \"local\" or \"openai-compatible\" — falling back to local",
+            cfg.backend
+        );
+    }
     match cfg.backend.as_str() {
         "openai-compatible" => Box::new(OpenAiCompatibleBackend {
             base_url: cfg
@@ -361,6 +421,13 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
             }
             match crate::llama_backend::llama_backend_from_config(cfg) {
                 Some(backend) if backend.model_path.exists() => Box::new(backend),
+                Some(backend) => {
+                    eprintln!(
+                        "gridtalk: warning: configured model {} does not exist; using the echo backend until a real model is configured",
+                        backend.model_path.display()
+                    );
+                    Box::new(EchoBackend)
+                }
                 _ => Box::new(EchoBackend),
             }
         }
@@ -468,6 +535,20 @@ mod tests {
             EchoBackend.stream(&req, &cancel, &mut |_| {}),
             Err(InferError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn loopback_and_chunk_extensions() {
+        assert!(is_loopback_host("127.0.0.1:8080"));
+        assert!(is_loopback_host("127.5.6.7:8080"));
+        assert!(is_loopback_host("localhost:8080"));
+        assert!(is_loopback_host("[::1]:8080"));
+        assert!(!is_loopback_host("127.attacker.example:8080"));
+        assert!(!is_loopback_host("example.com:8080"));
+        assert_eq!(
+            decode_chunked(b"2; ext=val\r\nhi\r\n0\r\n\r\n").unwrap(),
+            b"hi".to_vec()
+        );
     }
 
     #[test]

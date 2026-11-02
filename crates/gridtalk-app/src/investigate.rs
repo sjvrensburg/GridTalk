@@ -46,6 +46,15 @@ pub fn investigate(
         result
     };
 
+    if max_steps == 0 {
+        // The step budget gates every tool call, including search.
+        return Ok(Investigation {
+            answer: String::new(),
+            trail: Vec::new(),
+            citations: Vec::new(),
+        });
+    }
+
     // Citations come from the structured hits, never scraped from
     // display text.
     let hits = tools.hybrid.search(question, 3);
@@ -142,11 +151,24 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
     let tokens: Vec<&str> = question.split_whitespace().collect();
     for (i, tok) in tokens.iter().enumerate() {
         let clean = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        // Byte index of the first non-letter, from char_indices —
+        // never slice by char count (multi-byte letters would panic).
+        let byte_at = |char_idx: usize| {
+            clean
+                .char_indices()
+                .nth(char_idx)
+                .map(|(b, _)| b)
+                .unwrap_or(clean.len())
+        };
         let letters = clean.chars().take_while(|c| c.is_alphabetic()).count();
         let is_ref = clean.len() >= 2
-            && letters >= 1
-            && letters < clean.len()
-            && clean[letters..].chars().all(|c| c.is_ascii_digit());
+            && clean.chars().take(letters).all(|c| c.is_ascii_alphabetic())
+            && (1..=3).contains(&letters)
+            && letters < clean.chars().count()
+            && clean[byte_at(letters)..]
+                .chars()
+                .all(|c| c.is_ascii_digit())
+            && !clean[byte_at(letters)..].is_empty();
         if is_ref {
             for next in tokens.iter().skip(i + 1).take(2) {
                 let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
@@ -218,6 +240,10 @@ mod tests {
         );
         assert_eq!(parse_cell_ref("Sheet1!$B$2"), Some(("Sheet1".into(), 1, 1)));
         assert_eq!(parse_what_if("what if version 2 is 10"), None);
+        // Multi-byte letters must not panic the byte slice, and a
+        // long letter prefix (COVID19) is not a cell reference.
+        assert_eq!(parse_what_if("what if \u{e9}2 is 10"), None);
+        assert_eq!(parse_what_if("what if COVID19 is 500"), None);
         // A failing backend must propagate, not fake an answer.
         struct FailBackend;
         impl ChatBackend for FailBackend {

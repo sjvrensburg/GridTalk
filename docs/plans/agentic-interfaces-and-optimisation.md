@@ -38,20 +38,24 @@ speak for tools. Build `gridtalk mcp` as an MCP server over stdio:
 | `get_cells` | `cells` tool | Typed values + formulas, not display strings |
 | `list_formulas` | `formulas` tool | Formula text + evaluated value |
 | `what_if` | `eval::what_if` | Read-only simulation; never writes the file |
-| `investigate` | `investigate()` | Full cited answer + trail |
 | `graph_overview` | graph nodes/edges | For harness-side reasoning |
 | `close_workbook` | — | Frees session state |
 
 **Design decisions:**
 
-1. **Crate:** use the Rust MCP SDK (`rmcp`) in a new
-   `gridtalk-mcp` binary target (or `gridtalk mcp` subcommand).
-   Tool arguments become serde structs — this forces the
-   stringly-typed `key=value` parsing in `Tools::execute` to be
-   replaced by typed calls, which the internal planner also uses.
-2. **Sessions:** the server holds open workbooks keyed by an id:
+1. **Crate (as shipped, superseding the original rmcp plan):**
+   hand-rolled JSON-RPC over stdio in the `gridtalk mcp`
+   subcommand (`crates/gridtalk-app/src/mcp.rs`); no `rmcp`
+   dependency and no separate `gridtalk-mcp` crate. Tool
+   arguments are validated typed values (`-32602` on missing or
+   mistyped arguments), and the internal planner uses the same
+   typed `ToolRequest` core. The MCP tool list is the eight tools
+   in the table above (no `investigate` tool; investigation is a
+   CLI/UI flow).
+2. **Sessions:** the server holds open workbooks keyed by an
+   unpredictable id (capped at 16 sessions, oldest evicted);
    snapshot + graph + index cached; invalidated when the file's
-   mtime changes (re-snapshot via the incremental path).
+   (mtime, length) stamp changes.
 3. **Safety/privacy defaults:** `open_workbook` only opens paths
    the calling harness supplies. `what_if` is simulation-only.
    Any future write tool (`set_cell`, `save`) is behind

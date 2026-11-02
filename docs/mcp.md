@@ -42,9 +42,22 @@ embedding, ranges with `vector_only` flags) · `expand` ·
 `get_cells` (typed values) · `list_formulas` (with evaluated
 values) · `what_if` · `graph_overview`.
 
-Sessions are invalidated when the file's mtime changes, so edits
-saved from the GridTalk UI or Gridcraft are picked up on the
-next call.
+Sessions are invalidated when the file's (mtime, length) stamp
+changes, so edits saved from the GridTalk UI or Gridcraft are
+picked up on the next call. Sessions are capped at 16 open
+workbooks (oldest evicted).
+
+## Troubleshooting
+
+- **`gridtalk` not found / MCP server fails to start:** the
+  shipped `.mcp.json` assumes a `gridtalk` binary on your `PATH`.
+  Install one first (`scripts/install.sh` from a checkout, or a
+  release archive), or point `command` at the binary's absolute
+  path, e.g. `/home/you/.local/bin/gridtalk`.
+- **Protocol errors:** the server requires `initialize` before
+  `tools/call`, negotiates `protocolVersion` down to a supported
+  version (2025-03-26 / 2024-11-05), and answers malformed frames
+  with JSON-RPC `-32600`/`-32602` rather than dropping them.
 
 ## Without MCP: JSON CLI
 

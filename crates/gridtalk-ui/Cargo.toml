@@ -15,6 +15,7 @@ gridtalk-index = { path = "../gridtalk-index" }
 gridtalk-infer = { path = "../gridtalk-infer" }
 serde.workspace = true
 serde_json.workspace = true
-eframe = "0.37"
-egui = "0.37"
+eframe = "=0.37.0"
+egui = "=0.37.0"
 rfd = "0.17"
+dirs = "6"

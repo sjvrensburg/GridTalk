@@ -185,15 +185,17 @@ pub fn specificity_index(g: &Graph) -> Vec<usize> {
         .filter(|n| matches!(n.kind, NodeKind::Region | NodeKind::Column) && n.range.is_some())
         .map(|n| n.id)
         .collect();
-    let area = |id: &usize| {
-        g.nodes
-            .iter()
-            .find(|n| n.id == *id)
-            .and_then(|n| n.range.as_ref())
-            .map(|r| (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1))
-            .unwrap_or(usize::MAX)
-    };
-    idx.sort_by_key(|id| area(id));
+    // Node ids are sequential, so areas can be precomputed once by id
+    // instead of rescanning `g.nodes` for every key comparison.
+    let mut areas = vec![usize::MAX; g.nodes.len()];
+    for n in &g.nodes {
+        if let Some(r) = &n.range {
+            if n.id < areas.len() {
+                areas[n.id] = (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1);
+            }
+        }
+    }
+    idx.sort_by_key(|id| areas.get(*id).copied().unwrap_or(usize::MAX));
     idx
 }
 
@@ -280,7 +282,7 @@ pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError
         "csv" | "tsv" => {
             let text = std::fs::read_to_string(path)?;
             let delim = if ext == "tsv" { '\t' } else { ',' };
-            Ok(parse_delimited(&name, "Sheet1", &text, delim))
+            parse_delimited_strict(&name, "Sheet1", &text, delim)
         }
         "xlsb" | "xls" | "xlsm" => Err(IngestError::UnsupportedFormat {
             ext,
@@ -330,17 +332,19 @@ pub fn load_gridcraft_bytes(
 /// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
 /// canonical text; the cached value (when Gridcraft has one) is kept
 /// alongside so passages can show both.
-#[cfg(feature = "gridcraft")]
-/// Cap on densified snapshot cells per sheet: a sparse XLSX with a
-/// single cell at XFD1048576 must not allocate a billion-cell grid.
+/// Cap on densified snapshot cells per sheet (and per workbook): a
+/// sparse XLSX with a single cell at XFD1048576 must not allocate a
+/// billion-cell grid.
 pub const MAX_SNAPSHOT_CELLS: usize = 4_000_000;
 
+#[cfg(feature = "gridcraft")]
 pub fn from_gridcraft_workbook(
     name: &str,
     wb: &gridcraft_model::Workbook,
 ) -> Result<WorkbookSnapshot, IngestError> {
     use gridcraft_core::Value;
     let mut sheets = Vec::new();
+    let mut total_cells: u64 = 0;
     for sheet in &wb.sheets {
         let (mut max_row, mut max_col) = (0usize, 0usize);
         for (addr, _) in sheet.cells.iter() {
@@ -348,6 +352,12 @@ pub fn from_gridcraft_workbook(
             max_col = max_col.max(addr.col as usize);
         }
         let area = (max_row as u64 + 1).saturating_mul(max_col as u64 + 1);
+        total_cells = total_cells.saturating_add(area);
+        if total_cells > MAX_SNAPSHOT_CELLS as u64 {
+            return Err(IngestError::Parse(format!(
+                "workbook is too sparse to snapshot ({total_cells} densified cells > {MAX_SNAPSHOT_CELLS} across all sheets)"
+            )));
+        }
         if area > MAX_SNAPSHOT_CELLS as u64 {
             return Err(IngestError::Parse(format!(
                 "sheet {} is too sparse to snapshot ({area} cells > {MAX_SNAPSHOT_CELLS}); trim empty rows/columns at the edges",
@@ -430,33 +440,46 @@ pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
 }
 
 pub fn parse_delimited(name: &str, sheet: &str, text: &str, delim: char) -> WorkbookSnapshot {
+    parse_delimited_strict(name, sheet, text, delim)
+        .expect("malformed delimited input; use parse_delimited_strict for a typed error")
+}
+
+/// Strict variant: malformed quoting (post-quote junk, unterminated
+/// quotes) is an error instead of being silently merged.
+pub fn parse_delimited_strict(
+    name: &str,
+    sheet: &str,
+    text: &str,
+    delim: char,
+) -> Result<WorkbookSnapshot, IngestError> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rows: Vec<Vec<CellValue>> = Vec::new();
-    for fields in split_delimited_stream(text, delim) {
+    for fields in split_delimited_stream(text, delim)? {
         if fields.len() == 1 && fields[0].is_empty() && rows.is_empty() {
             continue;
         }
         rows.push(fields.into_iter().map(|f| infer_value(&f)).collect());
     }
-    WorkbookSnapshot {
+    Ok(WorkbookSnapshot {
         name: name.into(),
         sheets: vec![SheetSnapshot {
             name: sheet.into(),
             cells: rows,
         }],
-    }
+    })
 }
 
 /// RFC4180-style stream splitter: quoted fields may contain the
 /// delimiter, newlines and leading/trailing spaces (preserved);
 /// unquoted fields are trimmed. `""` inside quotes is a quote.
-fn split_delimited_stream(text: &str, delim: char) -> Vec<Vec<String>> {
+fn split_delimited_stream(text: &str, delim: char) -> Result<Vec<Vec<String>>, IngestError> {
     let mut rows = Vec::new();
     let mut row: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
     let mut in_q = false;
     let mut field_quoted = false;
+    let mut just_closed = false;
     let mut chars = text.chars().peekable();
     let push_field = |row: &mut Vec<String>, cur: &mut String, field_quoted: bool| {
         let v = std::mem::take(cur);
@@ -474,18 +497,25 @@ fn split_delimited_stream(text: &str, delim: char) -> Vec<Vec<String>> {
                     cur.push('"');
                 } else {
                     in_q = false;
+                    just_closed = true;
                 }
             } else {
                 cur.push(ch);
             }
+        } else if just_closed && ch != delim && ch != '\n' && ch != '\r' {
+            return Err(IngestError::Parse(format!(
+                "unexpected character {ch:?} after closing quote"
+            )));
         } else if ch == '"' && cur.is_empty() && !quoted {
             in_q = true;
             quoted = true;
             field_quoted = true;
+            just_closed = false;
         } else if ch == delim {
             push_field(&mut row, &mut cur, field_quoted);
             quoted = false;
             field_quoted = false;
+            just_closed = false;
         } else if ch == '\n' || ch == '\r' {
             if ch == '\r' && chars.peek() == Some(&'\n') {
                 chars.next();
@@ -493,16 +523,20 @@ fn split_delimited_stream(text: &str, delim: char) -> Vec<Vec<String>> {
             push_field(&mut row, &mut cur, field_quoted);
             quoted = false;
             field_quoted = false;
+            just_closed = false;
             rows.push(std::mem::take(&mut row));
         } else {
             cur.push(ch);
         }
     }
+    if in_q {
+        return Err(IngestError::Parse("unterminated quoted field".into()));
+    }
     if !cur.is_empty() || !row.is_empty() || field_quoted {
         push_field(&mut row, &mut cur, field_quoted);
         rows.push(row);
     }
-    rows
+    Ok(rows)
 }
 
 fn infer_value(f: &str) -> CellValue {
@@ -616,7 +650,16 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
         if c == '\'' {
             let mut j = i + 1;
             let mut name = String::new();
-            while j < chars.len() && chars[j] != '\'' {
+            while j < chars.len() {
+                if chars[j] == '\'' {
+                    // Doubled '' is an escaped apostrophe inside the name.
+                    if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                        name.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
                 name.push(chars[j]);
                 j += 1;
             }
@@ -638,6 +681,12 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
         }
         let at = if sheet.is_some() { start } else { i };
         if let Some((r0, c0, next)) = parse_a1_at(&chars, at) {
+            // A ref-shaped token immediately followed by '(' is a
+            // function name (LOG10(...)), not a cell reference.
+            if sheet.is_none() && next < chars.len() && chars[next] == '(' {
+                i = next;
+                continue;
+            }
             // Range?
             if next < chars.len() && chars[next] == ':' {
                 if let Some((r1, c1, end)) = parse_a1_at(&chars, next + 1) {
@@ -728,12 +777,8 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
                     }
                 }
             }
-            // Mark the whole bounding box so interior blanks do not reseed.
-            for row in visited.iter_mut().take(r1 + 1).skip(r0) {
-                for cell in row.iter_mut().take(c1 + 1).skip(c0) {
-                    *cell = true;
-                }
-            }
+            // Only component cells stay visited: a disconnected cell
+            // inside this bounding box must seed its own region.
             let first_all_text =
                 (c0..=c1).all(|cc| matches!(sheet.get(r0, cc), CellValue::Text(_)));
             let below_has_typed = r1 > r0
@@ -876,12 +921,15 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             match wb.sheets.iter().find(|s| s.name == r.sheet) {
                 None => problems.push(format!("node {} range on unknown sheet {}", n.id, r.sheet)),
                 Some(s) => {
-                    if r.r1 >= s.cells.len().max(1) && !s.cells.is_empty() && r.r1 >= s.cells.len()
-                    {
-                        // Regions are built from the sheet, so this flags hand-made graphs.
-                        if r.r0 > r.r1 || r.c0 > r.c1 {
-                            problems.push(format!("node {} has inverted range", n.id));
-                        }
+                    if r.r0 > r.r1 || r.c0 > r.c1 {
+                        problems.push(format!("node {} has inverted range", n.id));
+                    }
+                    if !s.cells.is_empty() && r.r1 >= s.cells.len() {
+                        problems.push(format!("node {} range rows out of bounds", n.id));
+                    }
+                    let width = s.max_col();
+                    if width > 0 && r.c1 >= width {
+                        problems.push(format!("node {} range columns out of bounds", n.id));
                     }
                 }
             }
@@ -1034,6 +1082,10 @@ impl IncrementalSnapshot {
         let edits = std::mem::take(&mut self.pending);
         let mut applied = 0usize;
         for edit in edits {
+            if edit.row > 10_000 || edit.col > 1_000 {
+                self.dropped += 1;
+                continue;
+            }
             let known = self.snapshot.sheets.iter().any(|s| s.name == edit.sheet);
             if !known {
                 self.dropped += 1;
@@ -1216,6 +1268,47 @@ mod tests {
         // NaN / inf stay text, never numbers.
         let wb2 = parse_delimited("d", "S", "A\nNaN\n", ',');
         assert_eq!(wb2.sheets[0].get(1, 0), CellValue::Text("NaN".into()));
+    }
+
+    #[test]
+    fn graph_regressions_round2() {
+        // Escaped apostrophe in a quoted sheet name.
+        let q = formula_refs_qualified("'O''Brien'!A1");
+        assert_eq!(q[0].sheet.as_deref(), Some("O'Brien"));
+        // Strict CSV rejects post-quote junk and unterminated quotes.
+        assert!(parse_delimited_strict("d", "S", "A\n\"x\"junk\n", ',').is_err());
+        assert!(parse_delimited_strict("d", "S", "A\n\"x\n", ',').is_err());
+        // Invariants flag inverted / column-overflowing hand-built ranges.
+        let wb = sample();
+        let mut g = Graph::default();
+        g.nodes.push(Node {
+            id: 0,
+            kind: NodeKind::Region,
+            label: "bad".into(),
+            range: Some(RangeRef {
+                sheet: "Sheet1".into(),
+                r0: 0,
+                c0: 0,
+                r1: 0,
+                c1: 99,
+            }),
+        });
+        assert!(check_invariants(&wb, &g)
+            .iter()
+            .any(|v| v.contains("columns out of bounds")));
+        // Workbook densification cap applies across sheets.
+        let mut inc = IncrementalSnapshot::new(sample());
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: usize::MAX,
+                col: 0,
+                value: CellValue::Number(1.0),
+            },
+            std::time::Instant::now(),
+        );
+        assert_eq!(inc.flush(), 0);
+        assert_eq!(inc.dropped_edits(), 1);
     }
 
     #[test]

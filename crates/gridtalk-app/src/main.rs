@@ -290,6 +290,14 @@ fn run(args: &[String]) -> Result<(), String> {
             // --allow-write is accepted for forward compatibility;
             // there are no write tools yet either way (what_if is
             // simulation-only), so it currently changes nothing.
+            // Anything else is a typo and must not be silently ignored.
+            for extra in &args[2..] {
+                if extra != "--allow-write" {
+                    return Err(format!(
+                        "unknown argument {extra} for `gridtalk mcp` (only --allow-write is recognised)"
+                    ));
+                }
+            }
             mcp::serve_stdio()
         }
         "tools" => {
@@ -311,7 +319,10 @@ fn run(args: &[String]) -> Result<(), String> {
                         .get(4)
                         .ok_or("usage: gridtalk tools call <file> '<json>'")?;
                     let wb = load_workbook(file)?;
-                    let (graph, _) = build_graph(&wb);
+                    let (graph, violations) = build_graph(&wb);
+                    if !violations.is_empty() {
+                        return Err(format!("graph invariants violated: {violations:?}"));
+                    }
                     let hybrid = HybridIndex::build(&wb, &graph);
                     let toolset = tools::Tools {
                         wb: &wb,
@@ -338,10 +349,18 @@ fn run(args: &[String]) -> Result<(), String> {
             let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
             let report = gridtalk_infer::probe::probe_model(std::path::Path::new(file));
             println!(
-                "{}: loads={} arch={:?} tensors={:?} — {}",
-                report.engine, report.loads, report.gguf_arch, report.tensor_count, report.detail
+                "{}: header_ok={} arch={:?} tensors={:?} — {}",
+                report.engine,
+                report.header_ok,
+                report.gguf_arch,
+                report.tensor_count,
+                report.detail
             );
-            Ok(())
+            if report.header_ok {
+                Ok(())
+            } else {
+                Err("model header did not validate".into())
+            }
         }
         "models" => {
             let mgr = gridtalk_infer::models::ModelManager::default_cache();

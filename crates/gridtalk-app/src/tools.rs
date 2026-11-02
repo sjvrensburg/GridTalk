@@ -3,13 +3,13 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_cell, what_if};
+use gridtalk_graph::eval::{eval_cell, what_if_in_workbook};
 use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "tool", rename_all = "snake_case")]
+#[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolRequest {
     Search {
         query: String,
@@ -51,15 +51,21 @@ impl ToolRequest {
     }
 
     /// JSON Schemas for every tool, for MCP/tool-list consumers.
+    /// Each entry carries a real JSON Schema (`inputSchema`) plus the
+    /// `tool` discriminator value a `ToolRequest` JSON must use.
     pub fn schemas() -> serde_json::Value {
-        serde_json::json!([
-            {"name": "search", "description": "Hybrid lexical+embedding search over workbook regions", "input": {"query": "string", "limit": "usize (default 3)"}},
-            {"name": "expand", "description": "Graph neighbours of the region containing a range", "input": {"range": "Sheet1!A1:D4"}},
-            {"name": "cells", "description": "Typed cell values and formulas in a range", "input": {"range": "Sheet1!A1:D4"}},
-            {"name": "formulas", "description": "Formulas in a range with evaluated values", "input": {"range": "Sheet1!A1:D4"}},
-            {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only)", "input": {"cell": "B2 or Sheet1!B2", "value": 10.0, "target": "Sheet1!D4"}},
-            {"name": "graph_overview", "description": "All graph nodes and edges", "input": {}}
-        ])
+        let schema = |props: serde_json::Value, required: &[&str]| serde_json::json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
+        serde_json::json!({
+            "request_format": "A ToolRequest is a JSON object with a \"tool\" discriminator, e.g. {\"tool\": \"search\", \"query\": \"...\", \"limit\": 3}. Unknown fields are rejected.",
+            "tools": [
+                {"name": "search", "tool": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "default": 3}}), &["query"])},
+                {"name": "expand", "tool": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
+                {"name": "cells", "tool": "cells", "description": "Typed cell values and formulas in a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
+                {"name": "formulas", "tool": "formulas", "description": "Formulas in a range with evaluated values", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
+                {"name": "what_if", "tool": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only)", "inputSchema": schema(serde_json::json!({"cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}), &["cell", "value", "target"])},
+                {"name": "graph_overview", "tool": "graph_overview", "description": "All graph nodes and edges", "inputSchema": schema(serde_json::json!({}), &[])}
+            ]
+        })
     }
 }
 
@@ -270,27 +276,40 @@ impl<'a> Tools<'a> {
                 if !value.is_finite() {
                     return ToolResult::err("what_if", "what-if value must be finite".into());
                 }
-                let Some((sheet_name, tr, tc)) = parse_cell_ref(target) else {
+                let Some((target_sheet, tr, tc)) = parse_cell_ref(target) else {
                     return ToolResult::err("what_if", format!("cannot parse target {target}"));
                 };
+                // The override may name its own sheet (Other!B2);
+                // it must never silently land on the target sheet.
                 let qualified = if cell.contains('!') {
                     cell.clone()
                 } else {
-                    format!("{sheet_name}!{cell}")
+                    format!("{target_sheet}!{cell}")
                 };
-                let Some((_, orow, ocol)) = parse_cell_ref(&qualified) else {
+                let Some((override_sheet, orow, ocol)) = parse_cell_ref(&qualified) else {
                     return ToolResult::err("what_if", format!("cannot parse cell {cell}"));
                 };
-                match self.sheet(&sheet_name) {
-                    Some(sheet) => match what_if(sheet, (orow, ocol), *value, (tr, tc)) {
-                        Ok((before, after)) => ToolResult::ok(
-                            "what_if",
-                            serde_json::json!({"cell": cell, "value": value, "target": target, "before": before, "after": after}),
-                            format!("what-if {cell}={value}: {target} changes {before} -> {after}"),
-                        ),
-                        Err(e) => ToolResult::err("what_if", format!("what-if failed: {e}")),
-                    },
-                    None => ToolResult::err("what_if", format!("no sheet named {sheet_name}")),
+                if self.sheet(&override_sheet).is_none() {
+                    return ToolResult::err(
+                        "what_if",
+                        format!("no sheet named {override_sheet} for override cell {cell}"),
+                    );
+                }
+                if self.sheet(&target_sheet).is_none() {
+                    return ToolResult::err("what_if", format!("no sheet named {target_sheet}"));
+                }
+                match what_if_in_workbook(
+                    self.wb,
+                    (&override_sheet, orow, ocol),
+                    *value,
+                    (&target_sheet, tr, tc),
+                ) {
+                    Ok((before, after)) => ToolResult::ok(
+                        "what_if",
+                        serde_json::json!({"cell": cell, "value": value, "target": target, "before": before, "after": after}),
+                        format!("what-if {cell}={value}: {target} changes {before} -> {after}"),
+                    ),
+                    Err(e) => ToolResult::err("what_if", format!("what-if failed: {e}")),
                 }
             }
             ToolRequest::GraphOverview => {
@@ -392,14 +411,21 @@ fn cell_json(cell: &CellValue) -> serde_json::Value {
     }
 }
 
+/// Largest range a Cells/Formulas call may materialise.
+pub const MAX_RANGE_CELLS: usize = 10_000;
+
 /// `Sheet1!A1:D4` -> (sheet, r0, c0, r1, c1), 0-based inclusive.
-/// A single cell is a 1x1 range; reversed ranges are rejected.
+/// A single cell is a 1x1 range; reversed ranges and ranges over
+/// MAX_RANGE_CELLS are rejected.
 pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
     let (sheet, rest) = a1.split_once('!')?;
     if let Some((a, b)) = rest.split_once(':') {
         let (_, r0, c0) = parse_cell_ref(&format!("{sheet}!{a}"))?;
         let (_, r1, c1) = parse_cell_ref(&format!("{sheet}!{b}"))?;
         if r1 < r0 || c1 < c0 {
+            return None;
+        }
+        if (r1 - r0 + 1).saturating_mul(c1 - c0 + 1) > MAX_RANGE_CELLS {
             return None;
         }
         Some((sheet.to_string(), r0, c0, r1, c1))
@@ -477,6 +503,27 @@ mod tests {
         assert_eq!(whatif.data["after"], 30.0);
         // Legacy wrapper agrees with the typed path.
         assert!(tools.execute("search", "q=provision").contains("Sheet1!"));
+        // An override naming another sheet is honoured (and a
+        // nonexistent override sheet is an error, not a silent
+        // landing on the target sheet).
+        let bad = tools.call(&ToolRequest::WhatIf {
+            cell: "Nope!B2".into(),
+            value: 1.0,
+            target: "Sheet1!D2".into(),
+        });
+        assert!(!bad.ok);
+        assert!(bad.text.contains("Nope"), "got: {}", bad.text);
+        assert!(
+            parse_range("Sheet1!A1:ZZ100000").is_none(),
+            "huge ranges are capped"
+        );
+        let schemas = ToolRequest::schemas();
+        assert_eq!(schemas["tools"][0]["inputSchema"]["type"], "object");
+        assert!(schemas["request_format"]
+            .as_str()
+            .unwrap()
+            .contains("\"tool\""));
+
         // Bad input is an ok:false result, never a panic.
         assert!(
             !tools

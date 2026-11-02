@@ -22,24 +22,32 @@ use std::time::SystemTime;
 
 struct OpenWorkbook {
     path: PathBuf,
-    mtime: Option<SystemTime>,
+    /// (mtime, len) captured *before* reading, so a write during the
+    /// load cannot stamp new metadata onto old content.
+    stamp: Option<(SystemTime, u64)>,
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
 }
 
 impl OpenWorkbook {
+    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64)> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+    }
+
     fn load(path: &PathBuf) -> Result<Self, String> {
+        let stamp = Self::stamp_of(path);
         let wb = load_path(path).map_err(|e| e.to_string())?;
         let (graph, violations) = build_graph(&wb);
         if !violations.is_empty() {
             return Err(format!("graph invariants violated: {violations:?}"));
         }
         let hybrid = HybridIndex::build(&wb, &graph);
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         Ok(OpenWorkbook {
             path: path.clone(),
-            mtime,
+            stamp,
             wb,
             graph,
             hybrid,
@@ -47,10 +55,9 @@ impl OpenWorkbook {
     }
 
     fn fresh(&mut self) -> Result<(), String> {
-        let mtime = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .ok();
-        if mtime != self.mtime {
+        // mtime + length: a same-mtime replacement with a different
+        // size is still picked up.
+        if Self::stamp_of(&self.path) != self.stamp {
             *self = OpenWorkbook::load(&self.path.clone())?;
         }
         Ok(())
@@ -65,18 +72,32 @@ impl OpenWorkbook {
     }
 }
 
+pub const MAX_WORKBOOKS: usize = 16;
+const SUPPORTED_PROTOCOLS: [&str; 2] = ["2025-03-26", "2024-11-05"];
+
 pub struct McpServer {
     workbooks: HashMap<String, OpenWorkbook>,
+    order: std::collections::VecDeque<String>,
     next_id: u64,
+    initialized: bool,
 }
 
 impl Default for McpServer {
     fn default() -> Self {
         McpServer {
             workbooks: HashMap::new(),
+            order: std::collections::VecDeque::new(),
             next_id: 1,
+            initialized: false,
         }
     }
+}
+
+fn req_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i64, String)> {
+    args.get(field)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .ok_or((-32602, format!("missing or non-string argument: {field}")))
 }
 
 fn tool_definitions() -> Value {
@@ -96,18 +117,51 @@ impl McpServer {
     /// Handle one JSON-RPC request object; returns the response
     /// object, or None for notifications.
     pub fn handle(&mut self, request: &Value) -> Option<Value> {
+        // Non-object frames (batches, scalars) are Invalid Request,
+        // never silently dropped.
+        if !request.is_object() {
+            return Some(
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "invalid request: expected a JSON-RPC object"}}),
+            );
+        }
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
         // Notifications get no response per JSON-RPC.
         request.get("id")?;
+        if let Some(v) = request.get("jsonrpc") {
+            if v.as_str() != Some("2.0") {
+                return Some(
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request: jsonrpc must be \"2.0\""}}),
+                );
+            }
+        }
+        let method = match request.get("method").and_then(|m| m.as_str()) {
+            Some(m) if !m.is_empty() => m,
+            _ => {
+                return Some(
+                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request: missing method"}}),
+                );
+            }
+        };
+        if method == "notifications/initialized" {
+            self.initialized = true;
+            return None;
+        }
         let result = match method {
             "initialize" => {
+                self.initialized = true;
                 let client_version = request
                     .pointer("/params/protocolVersion")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("2024-11-05");
+                    .unwrap_or("");
+                // Negotiate: echo the client's version only when we
+                // support it, otherwise offer our newest supported.
+                let negotiated = if SUPPORTED_PROTOCOLS.contains(&client_version) {
+                    client_version
+                } else {
+                    SUPPORTED_PROTOCOLS[0]
+                };
                 Ok(json!({
-                    "protocolVersion": client_version,
+                    "protocolVersion": negotiated,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "gridtalk", "version": env!("CARGO_PKG_VERSION")}
                 }))
@@ -115,7 +169,14 @@ impl McpServer {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tool_definitions()})),
             "tools/call" => {
-                self.call_tool(request.pointer("/params").cloned().unwrap_or(json!({})))
+                if !self.initialized {
+                    Err((
+                        -32002,
+                        "server not initialized: send initialize first".to_string(),
+                    ))
+                } else {
+                    self.call_tool(request.pointer("/params").cloned().unwrap_or(json!({})))
+                }
             }
             other => Err((-32601, format!("method not found: {other}"))),
         };
@@ -144,8 +205,27 @@ impl McpServer {
                     .ok_or((-32602, "missing string argument: path".to_string()))?;
                 match OpenWorkbook::load(&PathBuf::from(path)) {
                     Ok(open) => {
-                        let id = format!("wb-{}", self.next_id);
+                        // Unpredictable session ids + a hard cap with
+                        // oldest-first eviction.
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let id = format!(
+                            "wb-{:x}-{}",
+                            nanos ^ (std::process::id() as u128) << 32,
+                            self.next_id
+                        );
                         self.next_id += 1;
+                        while self.workbooks.len() >= MAX_WORKBOOKS {
+                            match self.order.pop_front() {
+                                Some(old) => {
+                                    self.workbooks.remove(&old);
+                                }
+                                None => break,
+                            }
+                        }
+                        self.order.push_back(id.clone());
                         let sheets: Vec<Value> = open
                             .wb
                             .sheets
@@ -169,14 +249,12 @@ impl McpServer {
                 }
             }
             "close_workbook" => {
-                let id = args
-                    .get("workbook_id")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
+                let id = req_str(&args, "workbook_id")?;
                 if self.workbooks.remove(id).is_some() {
+                    self.order.retain(|x| x != id);
                     text_result(format!("closed {id}"), false)
                 } else {
-                    text_result(format!("unknown workbook_id {id}"), true)
+                    Err((-32602, format!("unknown workbook_id {id}")))
                 }
             }
             _ => {
@@ -192,49 +270,31 @@ impl McpServer {
                 let tools = open.tools();
                 let req = match name {
                     "search" => ToolRequest::Search {
-                        query: args
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
-                        limit: args.get("limit").and_then(|l| l.as_u64()).unwrap_or(3) as usize,
+                        query: req_str(&args, "query")?.into(),
+                        limit: match args.get("limit") {
+                            None => 3,
+                            Some(v) => v
+                                .as_u64()
+                                .ok_or((-32602, "limit must be a positive integer".to_string()))?
+                                as usize,
+                        },
                     },
                     "expand" => ToolRequest::Expand {
-                        range: args
-                            .get("range")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
+                        range: req_str(&args, "range")?.into(),
                     },
                     "get_cells" => ToolRequest::Cells {
-                        range: args
-                            .get("range")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
+                        range: req_str(&args, "range")?.into(),
                     },
                     "list_formulas" => ToolRequest::Formulas {
-                        range: args
-                            .get("range")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
+                        range: req_str(&args, "range")?.into(),
                     },
                     "what_if" => ToolRequest::WhatIf {
-                        cell: args
-                            .get("cell")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
-                        value: args
-                            .get("value")
-                            .and_then(|q| q.as_f64())
-                            .unwrap_or(f64::NAN),
-                        target: args
-                            .get("target")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .into(),
+                        cell: req_str(&args, "cell")?.into(),
+                        value: args.get("value").and_then(|q| q.as_f64()).ok_or((
+                            -32602,
+                            "missing or non-numeric argument: value".to_string(),
+                        ))?,
+                        target: req_str(&args, "target")?.into(),
                     },
                     "graph_overview" => ToolRequest::GraphOverview,
                     other => {
@@ -259,8 +319,41 @@ pub fn serve_stdio() -> Result<(), String> {
         "gridtalk mcp: serving on stdio ({} tools)",
         tool_definitions().as_array().map(|a| a.len()).unwrap_or(0)
     );
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|e| e.to_string())?;
+    // Cap each frame at 1 MiB: an unbounded line would grow memory
+    // until OOM before any parse error could be reported.
+    const MAX_LINE: usize = 1024 * 1024;
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    loop {
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            let mut chunk = Vec::new();
+            let n = reader
+                .read_until(b'\n', &mut chunk)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            let done = chunk.ends_with(b"\n");
+            raw.extend_from_slice(&chunk);
+            if raw.len() > MAX_LINE {
+                let resp = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "request line exceeds the 1 MiB cap"}});
+                writeln!(stdout, "{resp}").map_err(|e| e.to_string())?;
+                stdout.flush().map_err(|e| e.to_string())?;
+                raw.clear();
+                if done {
+                    break;
+                }
+                // Keep discarding until the newline.
+                continue;
+            }
+            if done {
+                break;
+            }
+        }
+        if raw.is_empty() {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
         if line.trim().is_empty() {
             continue;
         }
@@ -339,11 +432,29 @@ mod tests {
         let text = whatif["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"after\":30.0"), "what-if payload: {text}");
 
-        // Unknown workbook is a tool error, not a protocol crash.
+        // Unknown workbook is a protocol-level invalid-params error.
         let bad = rpc(
             &mut server,
             json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "search", "arguments": {"workbook_id": "wb-999", "query": "x"}}}),
         );
-        assert!(bad.get("error").is_some() || bad["result"]["isError"] == json!(true));
+        assert_eq!(bad["error"]["code"], -32602);
+        // Missing required args are -32602, never silent defaults.
+        let missing = rpc(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "search", "arguments": {"workbook_id": wb_id}}}),
+        );
+        assert_eq!(missing["error"]["code"], -32602);
+        // Non-object frames get -32600, not silence.
+        let batch = server
+            .handle(&json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]))
+            .unwrap();
+        assert_eq!(batch["error"]["code"], -32600);
+        // Unsupported protocol versions are negotiated down.
+        let mut fresh = McpServer::default();
+        let init = rpc(
+            &mut fresh,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}}),
+        );
+        assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
     }
 }
