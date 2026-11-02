@@ -421,6 +421,42 @@ pub fn append_card(root: &Path, name: &str, markdown: &str) -> Result<(), String
         .map_err(|e| e.to_string())
 }
 
+/// Render an adapter as an AGENTS.md document, so external
+/// harnesses (Codex and friends) pick up the same learned rules
+/// when working in a directory with the workbook.
+pub fn export_agents_md(adapter: &Adapter) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# AGENTS.md — GridTalk adapter `{}` (v{})\n\n",
+        adapter.name, adapter.version
+    ));
+    out.push_str("These rules were learned by `gridtalk optimise` against\n");
+    out.push_str("deterministic spreadsheet ground truth. Apply them when\n");
+    out.push_str("answering questions about this workbook with GridTalk's\n");
+    out.push_str("tools (`gridtalk tools`, MCP, or the desktop UI).\n\n");
+    out.push_str(&format!(
+        "Harness knobs: top_k={}, max_steps={}, ref_context={}.\n",
+        adapter.top_k, adapter.max_steps, adapter.ref_context
+    ));
+    if !adapter.rules.trim().is_empty() {
+        out.push_str("\n## Rules\n\n");
+        out.push_str(adapter.rules.trim());
+        out.push('\n');
+    }
+    for skill in &adapter.skills {
+        out.push_str(&format!("\n## Skill: {}\n\n", skill.name));
+        if !skill.triggers.is_empty() {
+            out.push_str(&format!(
+                "Applies when the question mentions: {}.\n\n",
+                skill.triggers.join(", ")
+            ));
+        }
+        out.push_str(skill.body.trim());
+        out.push('\n');
+    }
+    out
+}
+
 /// Per-workbook sidecar rules (`<workbook>.gridtalk.md`), the
 /// AGENT.md-style file a user edits next to the spreadsheet.
 pub fn sidecar_rules(workbook_path: &Path) -> Option<String> {
@@ -465,6 +501,26 @@ mod tests {
         // Rolling back to v0 clears the rules entirely.
         assert_eq!(rollback(&root, "demo").unwrap(), 0);
         assert!(load_adapter(&root, "demo").rules.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agents_md_export_carries_rules_and_skills() {
+        let root = temp_root("export");
+        let mut a = Adapter::empty("demo");
+        a.rules = "- Answer with just the final number.\n".into();
+        a.skills = vec![Skill {
+            name: "provisions".into(),
+            triggers: vec!["provision".into()],
+            body: "Check the Provision row.".into(),
+        }];
+        commit_version(&root, &a).unwrap();
+        let loaded = load_adapter(&root, "demo");
+        let md = export_agents_md(&loaded);
+        assert!(md.contains("AGENTS.md"));
+        assert!(md.contains("just the final number"));
+        assert!(md.contains("Skill: provisions"));
+        assert!(md.contains("provision"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

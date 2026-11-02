@@ -248,6 +248,22 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     Ok(())
                 }
+                Some("export") => {
+                    // gridtalk adapter export <name> [--out AGENTS.md]
+                    let name = args
+                        .get(3)
+                        .ok_or("usage: gridtalk adapter export <name> [--out AGENTS.md]")?;
+                    let loaded = load_named_adapter(name);
+                    let md = adapter::export_agents_md(&loaded);
+                    match args.windows(2).find(|w| w[0] == "--out") {
+                        Some(w) => {
+                            std::fs::write(&w[1], &md).map_err(|e| e.to_string())?;
+                            println!("wrote {} (adapter {name} v{})", w[1], loaded.version);
+                        }
+                        None => print!("{md}"),
+                    }
+                    Ok(())
+                }
                 Some("rollback") => {
                     let name = args
                         .get(3)
@@ -256,7 +272,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     println!("adapter {name} rolled back to v{v}");
                     Ok(())
                 }
-                _ => Err("usage: gridtalk adapter list|show <name>|rollback <name>".into()),
+                _ => Err(
+                    "usage: gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]"
+                        .into(),
+                ),
             }
         }
         "optimise" => {

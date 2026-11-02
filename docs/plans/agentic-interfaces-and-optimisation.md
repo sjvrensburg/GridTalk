@@ -1,6 +1,6 @@
 # Future development: agentic interfaces + self-optimisation
 
-Status: Phases A-C merged; Phase D implemented on `feat/adapter-optimise`. Phase E remains future work. Companion to `docs/plan.md`.
+Status: Phases A-D merged; Phase E implemented on `feat/hermit-interop`. All planned phases are now shipped. Companion to `docs/plan.md`.
 Main CI at time of writing: run 41423800953 (post-merge) — check
 `gh run list --branch main` for the terminal result.
 
