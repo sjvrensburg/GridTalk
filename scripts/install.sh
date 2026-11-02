@@ -13,7 +13,10 @@ for tool in cargo cmake glslc cc c++; do
     exit 1
   fi
 done
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve symlinks so invoking through a linked script still
+# builds the real checkout.
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 REPO_ROOT=$(dirname -- "$SCRIPT_DIR")
 cd "$REPO_ROOT"
 DIR="${GRIDTALK_INSTALL_DIR:-$HOME/.local/bin}"

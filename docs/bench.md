@@ -36,6 +36,9 @@ configured — that score is the floor a real model must beat).
 Scoring is a number check against ground truth plus citation
 precision (did the answer cite the expected range?).
 
+Bench runs execute sequentially: task order, trails and CARD
+rows are deterministic, and there is no parallelism to tune.
+
 Scoring is strict: the **final** number in the answer must match
 ground truth (0.1% relative tolerance, 0.005 absolute floor), and
 citation precision counts only structured citations whose range

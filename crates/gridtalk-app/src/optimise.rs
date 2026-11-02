@@ -53,18 +53,24 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
         // retrieval entirely, so the planner must include the
         // named cell directly for the rule to have anything to
         // answer from.
-        let mut a = current.clone();
-        if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+        const FORMULA_RULE: &str = "- When asked what a formula cell calculates to, read the formula's computed value from the tool results and answer with just the final number.";
+        if current.rules.contains(FORMULA_RULE) && current.ref_context {
+            // Already learned: no duplicate candidate.
+        } else {
+            let mut a = current.clone();
+            if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+                a.rules.push('\n');
+            }
+            a.rules.push_str(FORMULA_RULE);
             a.rules.push('\n');
+            a.ref_context = true;
+            out.push(Candidate {
+                label: format!(
+                    "rule:formula-number+ref_context ({formula_fail} formula_result failures)"
+                ),
+                adapter: a,
+            });
         }
-        a.rules.push_str("- When asked what a formula cell calculates to, read the formula's computed value from the tool results and answer with just the final number.\n");
-        a.ref_context = true;
-        out.push(Candidate {
-            label: format!(
-                "rule:formula-number+ref_context ({formula_fail} formula_result failures)"
-            ),
-            adapter: a,
-        });
     }
     let whatif_fail = failing(results, "what_if");
     if whatif_fail > 0 {
@@ -86,7 +92,10 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
             &format!("{value_fail} cell_value failures"),
         );
     }
-    let citation_misses = results.iter().filter(|r| !r.citation_hit).count();
+    let citation_misses = results
+        .iter()
+        .filter(|r| !r.passed && r.error.is_none() && !r.citation_hit)
+        .count();
     if citation_misses > 0 && current.top_k < 8 {
         let mut a = current.clone();
         a.top_k = (a.top_k + 2).min(8);
@@ -95,7 +104,10 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
             adapter: a,
         });
     }
-    let no_trail = results.iter().filter(|r| r.trail_steps <= 1).count();
+    let no_trail = results
+        .iter()
+        .filter(|r| !r.passed && r.error.is_none() && r.trail_steps <= 1)
+        .count();
     if no_trail > 0 && current.max_steps < 16 {
         let mut a = current.clone();
         a.max_steps = 16;
@@ -107,18 +119,28 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
     out
 }
 
-#[allow(dead_code)] // `round`/`tried` are read by tests and CARD writers
+#[allow(dead_code)] // round/tried are consumed by tests and future CARD writers
 pub struct RoundOutcome {
     pub round: usize,
     pub baseline_train: f64,
     pub baseline_dev: f64,
     pub accepted: Option<(String, f64, f64)>, // label, train, dev
     pub tried: Vec<(String, f64, f64, bool)>, // label, train, dev, accepted
+    /// Set when the round could not run (e.g. an empty split).
+    pub note: Option<String>,
+}
+
+fn card_best_effort(root: &std::path::Path, name: &str, entry: &str) {
+    // CARD is the record, not the transaction: a failed append
+    // warns but never misreports a committed version as failed.
+    if let Err(e) = append_card(root, name, entry) {
+        eprintln!("gridtalk: warning: could not append CARD.md for {name}: {e}");
+    }
 }
 
 /// One optimise round: score the current adapter (train+dev),
-/// try each candidate on train, gate the best on dev, and commit
-/// or record rejection in CARD.md.
+/// try candidates on train best-first, gate each on dev until one
+/// passes, and commit or record rejection in CARD.md.
 pub fn optimise_round(
     root: &std::path::Path,
     workbook_tasks: &[BenchTask],
@@ -127,40 +149,88 @@ pub fn optimise_round(
     current: &Adapter,
     round: usize,
 ) -> Result<RoundOutcome, String> {
-    let score =
-        |adapter: Option<&Adapter>, split: &str| -> Result<(f64, Vec<TaskResult>), String> {
-            let report = run_bench_with(
-                workbook_tasks,
-                tools,
-                backend,
-                split,
-                adapter.map(|a| a.max_steps).unwrap_or(8),
-                adapter,
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((report.accuracy(split).unwrap_or(0.0), report.results))
+    let train_n = workbook_tasks.iter().filter(|t| t.split == "train").count();
+    let dev_n = workbook_tasks.iter().filter(|t| t.split == "dev").count();
+    // Memoise identical adapter evaluations within the round.
+    let mut cache: std::collections::HashMap<String, (Option<f64>, Vec<TaskResult>)> =
+        std::collections::HashMap::new();
+    let score = |adapter: Option<&Adapter>,
+                 split: &str,
+                 cache: &mut std::collections::HashMap<String, (Option<f64>, Vec<TaskResult>)>|
+     -> Result<(Option<f64>, Vec<TaskResult>), String> {
+        let key = match adapter {
+            Some(a) => format!(
+                "{}|{}|{}|{}|{}",
+                split, a.rules, a.top_k, a.max_steps, a.ref_context
+            ),
+            None => format!("{split}|none"),
         };
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit.clone());
+        }
+        let report = run_bench_with(
+            workbook_tasks,
+            tools,
+            backend,
+            split,
+            adapter.map(|a| a.max_steps).unwrap_or(8),
+            adapter,
+        )
+        .map_err(|e| e.to_string())?;
+        let acc = report.accuracy(split);
+        cache.insert(key, (acc, report.results.clone()));
+        Ok((acc, report.results))
+    };
 
-    let (baseline_train, baseline_results) = score(Some(current), "train")?;
-    let (baseline_dev, _) = score(Some(current), "dev")?;
+    let (baseline_train_opt, baseline_results) = score(Some(current), "train", &mut cache)?;
+    let (baseline_dev_opt, _) = score(Some(current), "dev", &mut cache)?;
+    // An empty split is no evidence: the dev gate would be
+    // vacuous. Skip the round and say so in the CARD.
+    if baseline_train_opt.is_none() || baseline_dev_opt.is_none() {
+        let note = format!(
+            "skipped: empty split (train {train_n} tasks, dev {dev_n} tasks); both splits need tasks before the gate means anything"
+        );
+        card_best_effort(
+            root,
+            &current.name,
+            &format!("\n## Round {round}: SKIPPED\n\n- {note}\n"),
+        );
+        return Ok(RoundOutcome {
+            round,
+            baseline_train: baseline_train_opt.unwrap_or(0.0),
+            baseline_dev: baseline_dev_opt.unwrap_or(0.0),
+            accepted: None,
+            tried: Vec::new(),
+            note: Some(note),
+        });
+    }
+    let baseline_train = baseline_train_opt.unwrap();
+    let baseline_dev = baseline_dev_opt.unwrap();
     let candidates = propose(current, &baseline_results);
 
-    let mut tried = Vec::new();
-    let mut best: Option<(Candidate, f64)> = None;
+    // Score candidates on train, best first.
+    let mut scored: Vec<(Candidate, f64)> = Vec::new();
     for cand in candidates {
-        let (train_acc, _) = score(Some(&cand.adapter), "train")?;
-        let better = train_acc > baseline_train + 1e-9;
-        if better && best.as_ref().is_none_or(|(_, acc)| train_acc > *acc) {
-            best = Some((cand.clone(), train_acc));
-        }
-        tried.push((cand.label, train_acc, f64::NAN, false));
+        let (train_acc, _) = score(Some(&cand.adapter), "train", &mut cache)?;
+        scored.push((cand, train_acc.unwrap_or(0.0)));
     }
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut tried: Vec<(String, f64, f64, bool)> = scored
+        .iter()
+        .map(|(c, t)| (c.label.clone(), *t, f64::NAN, false))
+        .collect();
 
+    // Gate candidates in train order until one passes dev.
     let mut accepted = None;
-    if let Some((cand, train_acc)) = best {
-        let (dev_acc, _) = score(Some(&cand.adapter), "dev")?;
-        // Gate: dev must not regress. Dev is a gate, never a
-        // proposer input.
+    for (cand, train_acc) in &scored {
+        if *train_acc <= baseline_train + 1e-9 {
+            break;
+        }
+        let (dev_acc, _) = score(Some(&cand.adapter), "dev", &mut cache)?;
+        let dev_acc = dev_acc.unwrap_or(0.0);
+        if let Some(row) = tried.iter_mut().find(|(l, _, _, _)| *l == cand.label) {
+            row.2 = dev_acc;
+        }
         if dev_acc >= baseline_dev - 1e-9 {
             let version = commit_version(root, &cand.adapter)?;
             let mut entry = format!(
@@ -174,14 +244,14 @@ pub fn optimise_round(
             for (label, t, _, _) in &tried {
                 entry.push_str(&format!("- tried {label}: train {:.1}%\n", t * 100.0));
             }
-            append_card(root, &current.name, &entry)?;
+            card_best_effort(root, &current.name, &entry);
             if let Some(row) = tried.iter_mut().find(|(l, _, _, _)| *l == cand.label) {
-                row.2 = dev_acc;
                 row.3 = true;
             }
-            accepted = Some((cand.label.clone(), train_acc, dev_acc));
+            accepted = Some((cand.label.clone(), *train_acc, dev_acc));
+            break;
         } else {
-            append_card(
+            card_best_effort(
                 root,
                 &current.name,
                 &format!(
@@ -192,13 +262,11 @@ pub fn optimise_round(
                     baseline_dev * 100.0,
                     dev_acc * 100.0
                 ),
-            )?;
-            if let Some(row) = tried.iter_mut().find(|(l, _, _, _)| *l == cand.label) {
-                row.2 = dev_acc;
-            }
+            );
         }
-    } else {
-        append_card(
+    }
+    if accepted.is_none() {
+        card_best_effort(
             root,
             &current.name,
             &format!(
@@ -206,7 +274,7 @@ pub fn optimise_round(
                 baseline_train * 100.0,
                 baseline_dev * 100.0
             ),
-        )?;
+        );
     }
 
     Ok(RoundOutcome {
@@ -215,6 +283,7 @@ pub fn optimise_round(
         baseline_dev,
         accepted,
         tried,
+        note: None,
     })
 }
 

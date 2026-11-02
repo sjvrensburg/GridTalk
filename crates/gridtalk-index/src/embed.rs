@@ -79,6 +79,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
                     .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
             {
                 body.replace(',', "")
+            } else if body.contains('.') {
+                // Already has a decimal point: grouping commas are
+                // separators, never a second point.
+                body.replace(',', "")
             } else {
                 body.replace(',', ".")
             };
@@ -216,17 +220,39 @@ pub struct VectorHit {
 
 /// Brute-force cosine index (region counts are small by design —
 /// the graph is lifted, so documents are regions, not cells).
-fn embed_chunks(text: &str, model: &dyn EmbeddingModel) -> Vec<std::sync::Arc<Vec<f32>>> {
+/// Max chunks scored per region (bounds memory and query cost).
+const MAX_CHUNKS: usize = 64;
+
+pub type ChunkSet = (Vec<std::sync::Arc<Vec<f32>>>, Vec<String>);
+
+fn embed_chunks(
+    text: &str,
+    model: &dyn EmbeddingModel,
+) -> (Vec<std::sync::Arc<Vec<f32>>>, Vec<String>) {
     // Score against the best-matching line/chunk of a region, not
-    // only the whole diluted region vector.
+    // only the whole diluted region vector. In multi-line docs,
+    // trivially short lines (<3 tokens) are skipped so a stray
+    // "9" line cannot win by being short.
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() <= 1 {
-        return vec![std::sync::Arc::new(model.embed(text))];
+        return (
+            vec![std::sync::Arc::new(model.embed(text))],
+            vec![text.to_string()],
+        );
     }
-    lines
+    let kept: Vec<&str> = lines
         .iter()
-        .map(|l| std::sync::Arc::new(model.embed(l)))
-        .collect()
+        .copied()
+        .filter(|l| tokenize(l).len() >= 2)
+        .take(MAX_CHUNKS)
+        .collect();
+    let kept = if kept.is_empty() { &lines[..1] } else { &kept };
+    (
+        kept.iter()
+            .map(|l| std::sync::Arc::new(model.embed(l)))
+            .collect(),
+        kept.iter().map(|l| l.to_string()).collect(),
+    )
 }
 
 pub struct VectorIndex {
@@ -239,16 +265,20 @@ pub struct VectorIndex {
     /// Per-doc chunk vectors (usually one per passage line).
     vectors: Vec<Vec<std::sync::Arc<Vec<f32>>>>,
     texts: Vec<String>,
+    /// The chunk texts behind `vectors`, for per-chunk caching.
+    chunk_texts: Vec<Vec<String>>,
 }
 
 impl VectorIndex {
     pub fn build(texts: &[String], model: &dyn EmbeddingModel) -> Self {
+        let chunks: Vec<ChunkSet> = texts.iter().map(|t| embed_chunks(t, model)).collect();
         VectorIndex {
             model_name: model.name().to_string(),
             threshold: 0.15,
             dim: model.dim(),
-            vectors: texts.iter().map(|t| embed_chunks(t, model)).collect(),
+            vectors: chunks.iter().map(|(v, _)| v.clone()).collect(),
             texts: texts.to_vec(),
+            chunk_texts: chunks.into_iter().map(|(_, t)| t).collect(),
         }
     }
 
@@ -257,24 +287,38 @@ impl VectorIndex {
     /// region.
     pub fn rebuild(&mut self, texts: &[String], model: &dyn EmbeddingModel) {
         if model.name() != self.model_name || model.dim() != self.dim {
+            // Preserve a customised threshold across a model swap.
+            let threshold = self.threshold;
             *self = VectorIndex::build(texts, model);
+            self.threshold = threshold;
             return;
         }
-        // Arc clones: reusing an unchanged doc's vectors is O(1)
-        // per chunk, not a 4 KiB copy.
-        let cache: std::collections::HashMap<&str, &Vec<std::sync::Arc<Vec<f32>>>> = self
-            .texts
+        // Per-chunk cache: unchanged *lines* keep their vectors
+        // even when their region changed around them.
+        let cache: std::collections::HashMap<&str, &std::sync::Arc<Vec<f32>>> = self
+            .chunk_texts
             .iter()
+            .flatten()
             .map(|t| t.as_str())
-            .zip(self.vectors.iter())
+            .zip(self.vectors.iter().flatten())
             .collect();
-        self.vectors = texts
-            .iter()
-            .map(|t| match cache.get(t.as_str()) {
-                Some(v) => (*v).clone(),
-                None => embed_chunks(t, model),
-            })
-            .collect();
+        let mut all_vectors = Vec::new();
+        let mut all_texts = Vec::new();
+        for t in texts {
+            let (vecs, lines) = embed_chunks(t, model);
+            let vecs: Vec<std::sync::Arc<Vec<f32>>> = lines
+                .iter()
+                .zip(vecs.iter())
+                .map(|(line, fresh)| match cache.get(line.as_str()) {
+                    Some(cached) => (*cached).clone(),
+                    None => fresh.clone(),
+                })
+                .collect();
+            all_vectors.push(vecs);
+            all_texts.push(lines);
+        }
+        self.vectors = all_vectors;
+        self.chunk_texts = all_texts;
         self.texts = texts.to_vec();
     }
 

@@ -177,4 +177,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+        run: |
+          # Verify both OS assets exist before going public.
+          ASSETS=$(gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" --json assets --jq '[.assets[].name] | join(" ")')
+          echo "assets: $ASSETS"
+          case "$ASSETS" in *".tar.gz"*) ;; *) echo "missing Linux .tar.gz asset"; exit 1;; esac
+          case "$ASSETS" in *".zip"*) ;; *) echo "missing Windows .zip asset"; exit 1;; esac
+          gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"

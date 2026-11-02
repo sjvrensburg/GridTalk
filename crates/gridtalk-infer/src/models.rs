@@ -492,6 +492,9 @@ impl ModelManager {
                 }
                 out.write_all(&buf[..n])?;
                 total += n as u64;
+                if total % (256 * 1024 * 1024) < n as u64 {
+                    eprintln!("gridtalk: downloaded {total} bytes…");
+                }
                 if total > MAX_DOWNLOAD_BYTES {
                     return Err(ModelError::Http("download exceeds the 64 GiB cap".into()));
                 }

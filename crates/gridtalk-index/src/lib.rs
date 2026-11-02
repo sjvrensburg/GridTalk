@@ -26,9 +26,11 @@ pub struct Hit {
     pub vector_only: bool,
 }
 
+pub type DocEntry = (RangeRef, String, BTreeMap<String, usize>, String, usize);
+
 #[derive(Debug, Default)]
 pub struct Index {
-    docs: Vec<(RangeRef, String, BTreeMap<String, usize>, String)>,
+    docs: Vec<DocEntry>,
     df: BTreeMap<String, usize>,
     /// Regions skipped because their sheet was absent (diagnostic).
     pub dropped_regions: usize,
@@ -64,7 +66,9 @@ impl Index {
                 for t in tf.keys() {
                     *idx.df.entry(t.clone()).or_default() += 1;
                 }
-                idx.docs.push((region.range.clone(), passage, tf, body));
+                let doc_len: usize = tf.values().sum();
+                idx.docs
+                    .push((region.range.clone(), passage, tf, body, doc_len));
             } else {
                 idx.dropped_regions += 1;
             }
@@ -80,8 +84,8 @@ impl Index {
         let mut hits: Vec<Hit> = self
             .docs
             .iter()
-            .filter_map(|(range, passage, tf, _)| {
-                let score = self.score_doc(tf, &terms, n);
+            .filter_map(|(range, passage, tf, _, doc_len)| {
+                let score = self.score_doc(tf, *doc_len, &terms, n);
                 let matched: Vec<String> = terms
                     .iter()
                     .filter(|t| tf.contains_key(*t))
@@ -117,8 +121,8 @@ impl Index {
             .docs
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, _, tf, _))| {
-                let score = self.score_doc(tf, &terms, n);
+            .filter_map(|(i, (_, _, tf, _, doc_len))| {
+                let score = self.score_doc(tf, *doc_len, &terms, n);
                 if score > 0.0 {
                     Some((i, score))
                 } else {
@@ -136,7 +140,13 @@ impl Index {
 
     /// Shared TF-IDF scoring (with length normalisation) used by
     /// both `search` and `ranking` so they cannot drift apart.
-    fn score_doc(&self, tf: &BTreeMap<String, usize>, terms: &[String], n: f64) -> f64 {
+    fn score_doc(
+        &self,
+        tf: &BTreeMap<String, usize>,
+        doc_len: usize,
+        terms: &[String],
+        n: f64,
+    ) -> f64 {
         let mut score = 0.0;
         for t in terms {
             if let Some(&count) = tf.get(t) {
@@ -144,7 +154,6 @@ impl Index {
                 score += (1.0 + (count as f64).ln()) * (1.0 + (n / (1.0 + df)).ln());
             }
         }
-        let doc_len: usize = tf.values().sum();
         if doc_len > 0 {
             // Stronger than the old 0.1 factor: long regions must
             // not win purely by accumulating more matched terms.
@@ -154,18 +163,18 @@ impl Index {
     }
 
     pub fn doc(&self, i: usize) -> Option<(&RangeRef, &str)> {
-        self.docs.get(i).map(|(r, p, _, _)| (r, p.as_str()))
+        self.docs.get(i).map(|(r, p, _, _, _)| (r, p.as_str()))
     }
 
     /// The indexed body text (passage without the Range header).
     pub fn doc_body(&self, i: usize) -> Option<&str> {
-        self.docs.get(i).map(|(_, _, _, b)| b.as_str())
+        self.docs.get(i).map(|(_, _, _, b, _)| b.as_str())
     }
 
     /// Query terms present in doc `i`, from the stored tf map.
     pub fn matched_terms(&self, i: usize, terms: &[String]) -> Vec<String> {
         match self.docs.get(i) {
-            Some((_, _, tf, _)) => terms
+            Some((_, _, tf, _, _)) => terms
                 .iter()
                 .filter(|t| tf.contains_key(*t))
                 .cloned()

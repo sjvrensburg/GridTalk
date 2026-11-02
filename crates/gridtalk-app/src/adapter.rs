@@ -113,8 +113,35 @@ fn dirs_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/gridtalk/adapters"))
 }
 
+/// Adapter names are a single path component. Anything else
+/// (separators, `..`, empty) is rejected so a name from the CLI,
+/// prefs or a tasks file can never escape the adapters root.
+pub fn valid_adapter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 pub fn adapter_dir(root: &Path, name: &str) -> PathBuf {
-    root.join(name)
+    if valid_adapter_name(name) {
+        root.join(name)
+    } else {
+        // Never escape the root; callers that care validate first.
+        root.join("__invalid__")
+    }
+}
+
+fn clean_value(raw: &str) -> String {
+    let v = raw.trim();
+    if let Some(stripped) = v.strip_prefix('"') {
+        // Quoted: take up to the closing quote.
+        return stripped.split('"').next().unwrap_or("").to_string();
+    }
+    // Unquoted: strip a trailing comment.
+    v.split(" #").next().unwrap_or(v).trim().to_string()
 }
 
 fn parse_knobs(text: &str) -> (u32, usize, usize, bool) {
@@ -125,12 +152,24 @@ fn parse_knobs(text: &str) -> (u32, usize, usize, bool) {
         if line.starts_with('#') || line.starts_with('[') {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let value = value.trim().trim_matches('"');
+        if let Some((key, raw)) = line.split_once('=') {
+            let value = clean_value(raw);
+            let warn = |key: &str| {
+                eprintln!("gridtalk: warning: malformed adapter knob {key}={raw:?}; using default");
+            };
             match key.trim() {
-                "version" => version = value.parse().unwrap_or(0),
-                "top_k" => top_k = value.parse().unwrap_or(3).clamp(1, 25),
-                "max_steps" => max_steps = value.parse().unwrap_or(8).clamp(1, 64),
+                "version" => match value.parse() {
+                    Ok(v) => version = v,
+                    Err(_) => warn("version"),
+                },
+                "top_k" => match value.parse::<usize>() {
+                    Ok(v) => top_k = v.clamp(1, 25),
+                    Err(_) => warn("top_k"),
+                },
+                "max_steps" => match value.parse::<usize>() {
+                    Ok(v) => max_steps = v.clamp(1, 64),
+                    Err(_) => warn("max_steps"),
+                },
                 "ref_context" => ref_context = value == "true",
                 _ => {}
             }
@@ -166,17 +205,30 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                 .to_string();
             let mut triggers = Vec::new();
             let mut body_lines = Vec::new();
-            for line in text.lines() {
-                if let Some(rest) = line
-                    .trim()
-                    .strip_prefix("Triggers:")
-                    .or_else(|| line.trim().strip_prefix("triggers:"))
-                {
-                    triggers = rest
+            // Only a Triggers line in the first three lines is
+            // metadata; later ones are body, verbatim.
+            for (idx, line) in text.lines().enumerate() {
+                let header = idx < 3;
+                let parsed = if header {
+                    line.trim()
+                        .strip_prefix("Triggers:")
+                        .or_else(|| line.trim().strip_prefix("triggers:"))
+                } else {
+                    None
+                };
+                if let Some(rest) = parsed {
+                    let parsed: Vec<String> = rest
                         .split(',')
                         .map(|t| t.trim().to_lowercase())
                         .filter(|t| !t.is_empty())
                         .collect();
+                    // An explicit empty Triggers line means
+                    // "never auto-apply", not "always".
+                    triggers = if parsed.is_empty() {
+                        vec!["\u{1}never".to_string()]
+                    } else {
+                        parsed
+                    };
                 } else {
                     body_lines.push(line);
                 }
@@ -199,6 +251,15 @@ fn load_from_dir(
     max_steps: usize,
     ref_context: bool,
 ) -> Adapter {
+    // Per-version knobs win over the root pointer file (the root
+    // file holds only the version pointer plus a convenience copy).
+    let (top_k, max_steps, ref_context) = match std::fs::read_to_string(dir.join("adapter.toml")) {
+        Ok(text) if !text.is_empty() => {
+            let (_, tk, ms, rc) = parse_knobs(&text);
+            (tk, ms, rc)
+        }
+        _ => (top_k, max_steps, ref_context),
+    };
     let rules = std::fs::read_to_string(dir.join("ADAPTER.md")).unwrap_or_default();
     Adapter {
         name: name.into(),
@@ -222,6 +283,12 @@ pub fn load_adapter(root: &Path, name: &str) -> Adapter {
         if vdir.is_dir() {
             return load_from_dir(&vdir, name, version, top_k, max_steps, ref_context);
         }
+        // Pointer names a version that is not on disk: report v0
+        // rather than claiming a version we did not load.
+        eprintln!(
+            "gridtalk: warning: adapter {name} points at missing v{version}; loading root copies as v0"
+        );
+        return load_from_dir(&dir, name, 0, top_k, max_steps, ref_context);
     }
     load_from_dir(&dir, name, version, top_k, max_steps, ref_context)
 }
@@ -240,25 +307,70 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
     names
 }
 
+fn scopeguard_remove(path: &Path) -> impl FnOnce() {
+    let owned = path.to_path_buf();
+    move || {
+        let _ = owned;
+    }
+}
+
 /// Commit `adapter` as the next version: writes `vN/` and moves
 /// the root pointer. Returns the committed version.
 pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
+    if !valid_adapter_name(&adapter.name) {
+        return Err(format!("invalid adapter name {:?}", adapter.name));
+    }
     let dir = adapter_dir(root, &adapter.name);
-    let next = adapter.version + 1;
+    // Next version is the max on disk too — a stale in-memory
+    // adapter can never rewrite an existing version.
+    let on_disk_max = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_prefix('v'))
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let next = adapter.version.max(on_disk_max) + 1;
     let vdir = dir.join(format!("v{next}"));
-    std::fs::create_dir_all(vdir.join("skills")).map_err(|e| e.to_string())?;
+    if vdir.exists() {
+        return Err(format!("adapter version v{next} already exists"));
+    }
+    // Write into a temp dir and rename into place: no partial vN.
+    let tmp = dir.join(format!(".v{next}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("skills")).map_err(|e| e.to_string())?;
+    let vdir_tmp = tmp.clone();
+    let _guard = scopeguard_remove(&tmp);
     let mut committed = adapter.clone();
     committed.version = next;
-    std::fs::write(vdir.join("ADAPTER.md"), &committed.rules).map_err(|e| e.to_string())?;
-    std::fs::write(vdir.join("adapter.toml"), knob_text(&committed)).map_err(|e| e.to_string())?;
-    for skill in &committed.skills {
-        let mut text = String::new();
-        if !skill.triggers.is_empty() {
-            text.push_str(&format!("Triggers: {}\n", skill.triggers.join(", ")));
-        }
-        text.push_str(&skill.body);
-        std::fs::write(vdir.join("skills").join(format!("{}.md", skill.name)), text)
+    let write_result = (|| -> Result<(), String> {
+        std::fs::write(vdir_tmp.join("ADAPTER.md"), &committed.rules).map_err(|e| e.to_string())?;
+        std::fs::write(vdir_tmp.join("adapter.toml"), knob_text(&committed))
             .map_err(|e| e.to_string())?;
+        for skill in &committed.skills {
+            let mut text = String::new();
+            if !skill.triggers.is_empty() {
+                text.push_str(&format!("Triggers: {}\n", skill.triggers.join(", ")));
+            }
+            text.push_str(&skill.body);
+            std::fs::write(
+                vdir_tmp.join("skills").join(format!("{}.md", skill.name)),
+                text,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&vdir_tmp, &vdir).map_err(|e| e.to_string())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
     }
     // Root pointer + a copy of the active files for easy reading.
     std::fs::write(dir.join("adapter.toml"), knob_text(&committed)).map_err(|e| e.to_string())?;
@@ -277,6 +389,10 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     let mut pointer = current.clone();
     pointer.version = target;
     std::fs::write(dir.join("adapter.toml"), knob_text(&pointer)).map_err(|e| e.to_string())?;
+    // Refresh the root convenience copy from the rolled-back
+    // version (v0 clears it — no resurrected rules).
+    let rolled = load_adapter(root, name);
+    std::fs::write(dir.join("ADAPTER.md"), &rolled.rules).map_err(|e| e.to_string())?;
     Ok(target)
 }
 
@@ -284,10 +400,20 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
 pub fn append_card(root: &Path, name: &str, markdown: &str) -> Result<(), String> {
     let dir = adapter_dir(root, name);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    use std::io::Write as _;
     let path = dir.join("CARD.md");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| "# Adapter CARD\n".into());
-    text.push_str(markdown);
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    let exists = path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        file.write_all(b"# Adapter CARD\n")
+            .map_err(|e| e.to_string())?;
+    }
+    file.write_all(markdown.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 /// Per-workbook sidecar rules (`<workbook>.gridtalk.md`), the

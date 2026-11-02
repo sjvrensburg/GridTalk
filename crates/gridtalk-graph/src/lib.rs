@@ -1070,7 +1070,21 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
                     if let Some(src) = node_for_cell_in(g, &specificity, &sheet.name, r, c) {
-                        for tok in expr.split(|ch: char| {
+                        // Blank out string literals ("B2" is text,
+                        // not a reference) before tokenising.
+                        let mut scrubbed = String::with_capacity(expr.len());
+                        let mut in_str = false;
+                        for ch in expr.chars() {
+                            if ch == '"' {
+                                in_str = !in_str;
+                                scrubbed.push(' ');
+                            } else if in_str {
+                                scrubbed.push(' ');
+                            } else {
+                                scrubbed.push(ch);
+                            }
+                        }
+                        for tok in scrubbed.split(|ch: char| {
                             !(ch.is_alphanumeric() || matches!(ch, '$' | '!' | '\'' | ':' | '.'))
                         }) {
                             let tok = tok.trim_matches('\'');
@@ -1083,6 +1097,48 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                 continue;
                             }
                             let cellpart = tok.rsplit('!').next().unwrap_or(tok);
+                            // For ranges, also sample interior
+                            // cells so the cross-check sees beyond
+                            // the corners the primary extractor
+                            // caps at for huge ranges.
+                            if let Some((a, b)) = cellpart.split_once(':') {
+                                let parse_end = |t: &str| -> Option<(usize, usize)> {
+                                    let t = t.replace('$', "");
+                                    let sp = t.find(|ch: char| ch.is_ascii_digit())?;
+                                    let (letters, digits) = t.split_at(sp);
+                                    Some((
+                                        digits.parse::<usize>().ok()?.checked_sub(1)?,
+                                        col_from_letters(letters)?,
+                                    ))
+                                };
+                                if let (Some((r0, c0)), Some((r1, c1))) =
+                                    (parse_end(a), parse_end(b))
+                                {
+                                    let rows = r1.saturating_sub(r0) + 1;
+                                    let cols = c1.saturating_sub(c0) + 1;
+                                    let rstep = (rows / 8).max(1);
+                                    let cstep = (cols / 8).max(1);
+                                    let mut rr = r0;
+                                    while rr <= r1 {
+                                        let mut cc = c0;
+                                        while cc <= c1 {
+                                            if let Some(t) = node_for_cell_in(
+                                                g,
+                                                &specificity,
+                                                &sheet.name,
+                                                rr,
+                                                cc,
+                                            ) {
+                                                if src != t {
+                                                    independent.insert((src, t));
+                                                }
+                                            }
+                                            cc += cstep;
+                                        }
+                                        rr += rstep;
+                                    }
+                                }
+                            }
                             for part in cellpart.split(':') {
                                 let part = part.replace('$', "");
                                 let split = part.find(|ch: char| ch.is_ascii_digit());
@@ -1493,6 +1549,15 @@ mod tests {
         );
         assert_eq!(inc.flush(), 0);
         assert!(inc.take_dirty_ranges().is_empty());
+    }
+
+    #[test]
+    fn graph_regressions_round4() {
+        // A string literal in a formula is not a reference.
+        let wb = parse_delimited("d", "Sheet1", "A,B\n1,=\"B2\"\n", ',');
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let _ = g;
     }
 
     #[test]

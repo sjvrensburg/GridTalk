@@ -224,10 +224,21 @@ fn read_http_response(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .ok();
+    // Total deadline, and a stall budget that resets only on
+    // >=4 KiB of new progress (a slow drip defeats neither).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     let mut stalls = 0usize;
+    let mut last_progress = 0usize;
+    let mut content_length: Option<usize> = None;
+    let mut header_end: Option<usize> = None;
     loop {
+        if std::time::Instant::now() > deadline {
+            return Err(InferError::Http(
+                "endpoint did not complete the response within 300 seconds".into(),
+            ));
+        }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -240,19 +251,41 @@ fn read_http_response(
                         return Err(InferError::Cancelled);
                     }
                 }
-                if raw.is_empty() && n < 1024 {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 16 * 1024 * 1024 {
+                    return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+                }
+                if raw.len() - last_progress >= 4096 {
+                    last_progress = raw.len();
+                    stalls = 0;
+                } else {
                     stalls += 1;
-                    if stalls > 30 {
+                    if stalls > 60 {
                         return Err(InferError::Http(
                             "endpoint is slow-dripping the response".into(),
                         ));
                     }
-                } else {
-                    stalls = 0;
                 }
-                raw.extend_from_slice(&buf[..n]);
-                if raw.len() > 16 * 1024 * 1024 {
-                    return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+                // Complete as soon as Content-Length bytes of body
+                // have arrived; never wait for connection close.
+                if header_end.is_none() {
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let head = String::from_utf8_lossy(&raw[..pos]);
+                        content_length = head.lines().find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        });
+                    }
+                }
+                if let (Some(he), Some(cl)) = (header_end, content_length) {
+                    if raw.len() - he >= cl {
+                        break;
+                    }
                 }
             }
             Err(e)

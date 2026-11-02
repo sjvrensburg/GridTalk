@@ -194,15 +194,21 @@ pub fn extract_numbers(text: &str) -> Vec<f64> {
             None => (t, false),
         };
         let normalized = if core.contains(',') {
+            // Thousands groups: every group after the first is
+            // exactly 3 digits (the last may carry a ".dec" tail,
+            // e.g. 1,200.50). Otherwise the comma is decimal.
             let groups: Vec<&str> = core.split(',').collect();
-            if groups.len() > 1
-                && groups[1..]
-                    .iter()
-                    .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
-            {
+            let thousands = groups.len() > 1
+                && groups[1..].iter().all(|g| {
+                    let int_part = g.split('.').next().unwrap_or("");
+                    int_part.len() == 3 && int_part.chars().all(|c| c.is_ascii_digit())
+                });
+            if thousands {
                 core.replace(',', "")
+            } else if let Some((head, tail)) = core.split_once(',') {
+                format!("{head}.{}", tail.replace(',', ""))
             } else {
-                core.replace(',', ".")
+                core.to_string()
             }
         } else {
             core.to_string()
@@ -245,7 +251,14 @@ pub struct TaskResult {
 /// Citation precision is scored on structured citations only: a
 /// cited *range* counts when it contains the expected cell. An
 /// answer merely restating the question's citation does not.
-fn citation_hit(citations: &[String], citation: &str) -> bool {
+fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
+    // The cited range must also be *used* in the answer text —
+    // retrieval alone does not count as citing.
+    let answer_cites =
+        citations.iter().any(|c| answer.contains(c.as_str())) || answer.contains(citation);
+    if !answer_cites {
+        return false;
+    }
     let Some((_, er, ec)) = crate::tools::parse_cell_ref(citation) else {
         return false;
     };
@@ -335,7 +348,7 @@ pub fn run_bench_with(
             match investigate_with(&task.question, tools, backend, max_steps, adapter, None) {
                 Ok(inv) => (
                     judge_number(&inv.answer, task.expected),
-                    citation_hit(&inv.citations, &task.citation),
+                    citation_hit(&inv.citations, &task.citation, &inv.answer),
                     inv.trail.len(),
                     None,
                 ),
@@ -393,7 +406,9 @@ pub fn render_card_with_skipped(
     ));
     out.push_str("Ground truth is deterministic (cell values / evaluator\n");
     out.push_str("results); no LLM judges any task.\n\n");
-    out.push_str("| Split | Tasks | Accuracy | Citation precision | Mean latency (ms) |\n");
+    out.push_str(
+        "| Split | Tasks | Accuracy | Citation precision (answer-cited) | Mean latency (ms) |\n",
+    );
     out.push_str("|---|---:|---:|---:|---:|\n");
     for split in ["train", "dev", "all"] {
         let n = report
@@ -486,6 +501,7 @@ mod tests {
     fn judge_extracts_numbers_without_llm() {
         assert!(judge_number("The answer is 6.", 6.0));
         assert!(judge_number("Total: 1,200 units", 1200.0));
+        assert!(judge_number("Total: 1,200.50", 1200.5));
         assert!(!judge_number("The answer is 7.", 6.0));
         assert!(!judge_number("no numbers here", 6.0));
         assert!(judge_number("changes 6 -> 36", 36.0));
@@ -493,6 +509,20 @@ mod tests {
         // number must NOT pass.
         assert!(!judge_number("It was 6 earlier; the answer is 7", 6.0));
         assert!(judge_number("It was 6 earlier; the answer is 7", 7.0));
+    }
+
+    #[test]
+    fn citation_hit_requires_answer_citation() {
+        let citations = vec!["Sheet1!A1:D4".to_string()];
+        assert!(citation_hit(
+            &citations,
+            "Sheet1!D2",
+            "The total is 6 [Sheet1!A1:D4]"
+        ));
+        // Retrieval hit without an answer citation does not count.
+        assert!(!citation_hit(&citations, "Sheet1!D2", "The total is 6"));
+        // Out-of-range citations do not count either.
+        assert!(!citation_hit(&citations, "Sheet1!Z9", "see Sheet1!A1:D4"));
     }
 
     #[test]

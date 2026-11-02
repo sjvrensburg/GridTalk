@@ -148,7 +148,7 @@ impl<'a> Tools<'a> {
             ToolRequest::Expand { range } => {
                 // Accept caller spellings (sheet1!a1:b2, $A$1) by
                 // canonicalising through the range parser first.
-                let canonical = parse_range(range).map(|(sheet, r0, c0, r1, c1)| {
+                let canonical = parse_range_uncapped(range).map(|(sheet, r0, c0, r1, c1)| {
                     gridtalk_graph::RangeRef {
                         sheet,
                         r0,
@@ -236,7 +236,7 @@ impl<'a> Tools<'a> {
                     }
                     None => ToolResult::err("cells", format!("no sheet named {sheet_name}")),
                 },
-                None => ToolResult::err("cells", format!("cannot parse range {range}")),
+                None => ToolResult::err("cells", range_error(range)),
             },
             ToolRequest::Formulas { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
@@ -289,7 +289,7 @@ impl<'a> Tools<'a> {
                     }
                     None => ToolResult::err("formulas", format!("no sheet named {sheet_name}")),
                 },
-                None => ToolResult::err("formulas", format!("cannot parse range {range}")),
+                None => ToolResult::err("formulas", range_error(range)),
             },
             ToolRequest::WhatIf {
                 cell,
@@ -307,7 +307,7 @@ impl<'a> Tools<'a> {
                 let qualified = if cell.contains('!') {
                     cell.clone()
                 } else {
-                    format!("{target_sheet}!{cell}")
+                    format!("{}!{cell}", gridtalk_graph::quote_sheet(&target_sheet))
                 };
                 let Some((override_sheet, orow, ocol)) = parse_cell_ref(&qualified) else {
                     return ToolResult::err("what_if", format!("cannot parse cell {cell}"));
@@ -439,6 +439,15 @@ pub const MAX_RANGE_CELLS: usize = 10_000;
 
 /// Split `Sheet!rest` or `'My Sheet'!rest` into (sheet, rest),
 /// honouring the doubled-quote escape inside quoted names.
+/// Distinguish "too large" from "unparseable" for range errors.
+fn range_error(range: &str) -> String {
+    if parse_range_uncapped(range).is_some() {
+        format!("range {range} exceeds the {MAX_RANGE_CELLS}-cell limit; narrow the range")
+    } else {
+        format!("cannot parse range {range}")
+    }
+}
+
 fn split_sheet_prefix(a1: &str) -> Option<(String, &str)> {
     if let Some(rest) = a1.strip_prefix('\'') {
         let mut name = String::new();
@@ -495,6 +504,16 @@ fn parse_cell_on_sheet(sheet: &str, cell: &str) -> Option<(usize, usize)> {
 /// MAX_RANGE_CELLS are rejected. Quoted sheet names and a
 /// qualified range end (`Sheet1!A1:Sheet1!B2`) are accepted.
 pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
+    parse_range_inner(a1, true)
+}
+
+/// Range parsing without the materialisation cap (for Expand,
+/// which never materialises cells).
+pub fn parse_range_uncapped(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
+    parse_range_inner(a1, false)
+}
+
+fn parse_range_inner(a1: &str, capped: bool) -> Option<(String, usize, usize, usize, usize)> {
     let (sheet, rest) = split_sheet_prefix(a1)?;
     if let Some((a, b)) = rest.split_once(':') {
         let (r0, c0) = parse_cell_on_sheet(&sheet, a)?;
@@ -512,7 +531,7 @@ pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
         if r1 < r0 || c1 < c0 {
             return None;
         }
-        if (r1 - r0 + 1).saturating_mul(c1 - c0 + 1) > MAX_RANGE_CELLS {
+        if capped && (r1 - r0 + 1).saturating_mul(c1 - c0 + 1) > MAX_RANGE_CELLS {
             return None;
         }
         Some((sheet, r0, c0, r1, c1))

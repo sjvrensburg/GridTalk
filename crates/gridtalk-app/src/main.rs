@@ -267,23 +267,32 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut name = "default".to_string();
             let mut rounds = 3usize;
             {
+                // Strict like bench: no duplicates, no unknowns,
+                // no flag-shaped values, rounds capped at 10.
+                let mut seen: Vec<&str> = Vec::new();
                 let mut i = 3;
                 while i < args.len() {
-                    match args[i].as_str() {
-                        "--adapter" => {
-                            name = args.get(i + 1).ok_or("--adapter needs a value")?.clone();
-                            i += 2;
-                        }
+                    let flag_name = args[i].as_str();
+                    if seen.contains(&flag_name) {
+                        return Err(format!("duplicate optimise flag {flag_name}"));
+                    }
+                    seen.push(flag_name);
+                    let value = args
+                        .get(i + 1)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| format!("optimise flag {flag_name} needs a value"))?;
+                    match flag_name {
+                        "--adapter" => name = value.clone(),
                         "--rounds" => {
-                            rounds = args
-                                .get(i + 1)
-                                .and_then(|v| v.parse().ok())
-                                .filter(|n| *n >= 1)
-                                .ok_or("--rounds must be a positive integer")?;
-                            i += 2;
+                            rounds = value
+                                .parse::<usize>()
+                                .ok()
+                                .filter(|n| (1..=10).contains(n))
+                                .ok_or("--rounds must be an integer in 1..=10")?
                         }
                         other => return Err(format!("unknown optimise flag {other}")),
                     }
+                    i += 2;
                 }
             }
             let wb = load_workbook(file)?;
@@ -302,7 +311,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
             let root = adapter::adapters_root();
-            let mut current = adapter::load_adapter(&root, &name);
+            let mut current = load_named_adapter(&name);
             println!(
                 "optimise adapter {name} (v{}) on {} tasks with backend {}",
                 current.version,
@@ -318,6 +327,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     &current,
                     round,
                 )?;
+                if let Some(note) = &outcome.note {
+                    println!("round {round}: {note}; stopping");
+                    break;
+                }
                 match &outcome.accepted {
                     Some((label, train, dev)) => {
                         println!(
@@ -480,8 +493,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     let cfg = config_from_env();
                     let backend = backend_from_config(&cfg.inference);
                     warn_if_external(&cfg);
-                    let bench_adapter = flag("--adapter")
-                        .map(|name| adapter::load_adapter(&adapter::adapters_root(), &name));
+                    let bench_adapter = flag("--adapter").map(|name| load_named_adapter(&name));
                     let report = bench::run_bench_with(
                         &tasks,
                         &toolset,
@@ -523,13 +535,21 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut adapter_name: Option<String> = None;
             let mut question_words: Vec<String> = Vec::new();
             {
+                // --adapter is only a flag before the question
+                // starts (or after a `--` separator handling);
+                // inside the question it is literal text.
                 let mut i = 3;
+                let mut in_flags = true;
                 while i < args.len() {
-                    if args[i] == "--adapter" {
+                    if in_flags && args[i] == "--adapter" {
+                        if adapter_name.is_some() {
+                            return Err("duplicate --adapter flag".into());
+                        }
                         adapter_name =
                             Some(args.get(i + 1).ok_or("--adapter needs a value")?.clone());
                         i += 2;
                     } else {
+                        in_flags = false;
                         question_words.push(args[i].clone());
                         i += 1;
                     }
@@ -555,9 +575,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
-            let cli_adapter = adapter_name
-                .as_ref()
-                .map(|n| adapter::load_adapter(&adapter::adapters_root(), n));
+            let cli_adapter = adapter_name.as_ref().map(|n| load_named_adapter(n));
             let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
             let inv = investigate::investigate_with(
                 &question,
@@ -822,6 +840,23 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         format!("{}…", s.chars().take(n - 1).collect::<String>())
     }
+}
+
+/// Load an explicitly named adapter, warning when it does not
+/// exist (a typo must not silently run unadapted).
+fn load_named_adapter(name: &str) -> adapter::Adapter {
+    let root = adapter::adapters_root();
+    if !adapter::valid_adapter_name(name) {
+        eprintln!("gridtalk: warning: invalid adapter name {name:?}; running unadapted");
+        return adapter::Adapter::empty(name);
+    }
+    if !root.join(name).is_dir() {
+        eprintln!(
+            "gridtalk: warning: adapter {name:?} not found in {}; running unadapted",
+            root.display()
+        );
+    }
+    adapter::load_adapter(&root, name)
 }
 
 fn load_workbook(file: &str) -> Result<WorkbookSnapshot, String> {
