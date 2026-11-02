@@ -32,13 +32,12 @@ jobs:
           echo "CMAKE_PREFIX_PATH=$SDK_DIR" >> "$GITHUB_ENV"
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install vulkan-sdk -y
-          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
-          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CMAKE_PREFIX_PATH=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.341.0
+          install_runtime: true
+          cache: true
+          stripdown: true
       - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --component rustfmt,clippy --profile minimal && rustup default stable
