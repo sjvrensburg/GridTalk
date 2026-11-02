@@ -1,0 +1,17 @@
+[package]
+name = "gridtalk-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gridtalk"
+path = "src/main.rs"
+
+[dependencies]
+gridtalk-graph = { path = "../gridtalk-graph" }
+gridtalk-index = { path = "../gridtalk-index" }
+gridtalk-infer = { path = "../gridtalk-infer" }
+serde.workspace = true
+serde_json.workspace = true

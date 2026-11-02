@@ -1,0 +1,13 @@
+# GridTalk settings. Copy to ~/.config/gridtalk/config.toml
+# The API key itself is never stored here — only the NAME of the
+# environment variable that holds it.
+
+[inference]
+# "local" (default, nothing leaves your PC) or "openai-compatible"
+backend = "local"
+# Local engine ladder: "candle" | "mistralrs" | "llamacpp"
+engine = "candle"
+# model = "Qwen3-30B-A3B-Q4_K_M"
+# model_path = "/home/you/.cache/gridtalk/models/model.gguf"
+# base_url = "http://127.0.0.1:11434/v1"   # external backend / redacting proxy
+# api_key_env = "GRIDTALK_API_KEY"

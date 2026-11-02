@@ -1,0 +1,4 @@
+Item,Qty,Price,Total
+Apples,2,3,=B2*C2
+Pears,4,5,=B3*C3
+Provision,1,1200,=B4*C4

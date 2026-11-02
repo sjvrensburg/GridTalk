@@ -17,4 +17,4 @@ Phase 1 scaffolding. See `docs/plan.md` for the phased implementation plan and `
 
 ## Licence
 
-MIT OR Apache-2.0.
+MIT.
