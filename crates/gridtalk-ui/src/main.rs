@@ -67,14 +67,33 @@ pub fn config_dir() -> std::path::PathBuf {
     }
 }
 
-/// Adapters root, mirroring gridtalk-app's resolution:
-/// GRIDTALK_CONFIG's parent first, else the platform config dir.
+/// Adapters root, mirroring gridtalk-app's `adapters_root`
+/// exactly (same precedence and platform bases, so UI chat and
+/// the CLI see the same adapters):
+/// GRIDTALK_CONFIG_DIR, then GRIDTALK_CONFIG's parent, then the
+/// platform config dir (LOCALAPPDATA on Windows, XDG_CONFIG_HOME
+/// or ~/.config on Linux).
 pub fn adapters_root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("GRIDTALK_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("adapters");
+        }
+    }
     if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
         if let Some(parent) = std::path::PathBuf::from(&cfg).parent() {
             if !parent.as_os_str().is_empty() {
                 return parent.join("adapters");
             }
+        }
+    }
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        if !appdata.is_empty() {
+            return std::path::PathBuf::from(appdata).join("gridtalk/adapters");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("gridtalk/adapters");
         }
     }
     config_dir().join("adapters")
@@ -91,11 +110,64 @@ fn valid_adapter_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// Mirror of gridtalk-app's `gridcraft_binary` resolution.
+fn gridcraft_binary_ui() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("GRIDTALK_GRIDCRAFT_BIN") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let exe_name = if cfg!(windows) {
+        "gridcraft.exe"
+    } else {
+        "gridcraft"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for profile in ["release", "debug"] {
+        let candidate = root.join(format!("vendor/gridcraft/target/{profile}/{exe_name}"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Write bytes atomically (unique temp + rename), like prefs save.
 fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-    match std::fs::rename(&tmp, path) {
+    let write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    match write {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -273,7 +345,7 @@ pub struct GridTalkApp {
 
 impl Default for GridTalkApp {
     fn default() -> Self {
-        let prefs = UiPrefs::load();
+        let mut prefs = UiPrefs::load();
         let config_path = if !prefs.config_path.is_empty() {
             prefs.config_path.clone()
         } else {
@@ -294,6 +366,12 @@ impl Default for GridTalkApp {
         } else {
             saved_adapter
         };
+        // Persist the sanitised value so a later prefs.save() cannot
+        // resurrect the cleared (deleted/traversal) name.
+        if prefs.active_adapter != saved_adapter {
+            prefs.active_adapter = saved_adapter.clone();
+            prefs.save();
+        }
         GridTalkApp {
             inc: None,
             graph: Graph::default(),
@@ -553,7 +631,28 @@ impl GridTalkApp {
             })
         };
         let version: u32 = get("version").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let top_k: usize = get("top_k").and_then(|v| v.parse().ok()).unwrap_or(3);
+        // Per-version knobs win over the root copy (matching
+        // gridtalk-app's load_from_dir); root values seed.
+        let vknobs = if version > 0 {
+            std::fs::read_to_string(dir.join(format!("v{version}/adapter.toml")))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let get_v = |key: &str| -> Option<String> {
+            vknobs.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == key {
+                    Some(v.trim().trim_matches('"').to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let top_k: usize = get_v("top_k")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| get("top_k").and_then(|v| v.parse().ok()))
+            .unwrap_or(3);
         let rules_dir = if version > 0 && dir.join(format!("v{version}")).is_dir() {
             dir.join(format!("v{version}"))
         } else {
@@ -1021,19 +1120,32 @@ impl eframe::App for GridTalkApp {
                 }
                 if ui.button("Open in Gridcraft").clicked() {
                     match &self.current_path {
+                        Some(path) if self.dirty() => {
+                            self.status =
+                                "Save first: Gridcraft would open the stale on-disk file, not your unsaved edits.".into();
+                        }
                         Some(path) => {
-                            let bin = std::env::var("GRIDTALK_GRIDCRAFT_BIN")
-                                .ok()
-                                .filter(|b| !b.is_empty())
-                                .unwrap_or_else(|| "gridcraft".into());
-                            match std::process::Command::new(&bin).arg(path).spawn() {
-                                Ok(_) => {
-                                    self.status = format!("Launched Gridcraft on {}", path.display())
+                            // Mirror the CLI's gridcraft_binary
+                            // resolution: checked env var, beside the
+                            // exe, PATH, vendor build tree.
+                            let bin = gridcraft_binary_ui();
+                            match bin {
+                                Some(bin) => {
+                                    match std::process::Command::new(&bin).arg(path).spawn() {
+                                        Ok(_) => {
+                                            self.status =
+                                                format!("Launched Gridcraft on {}", path.display())
+                                        }
+                                        Err(e) => {
+                                            self.status = format!(
+                                                "Could not launch Gridcraft ({}): {e}",
+                                                bin.display()
+                                            )
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    self.status = format!(
-                                        "Could not launch Gridcraft ({bin}): {e}. Build it once with: cargo build --manifest-path vendor/gridcraft/Cargo.toml -p gridcraft (or set GRIDTALK_GRIDCRAFT_BIN)"
-                                    )
+                                None => {
+                                    self.status = "Gridcraft binary not found. Build it once with: cargo build --manifest-path vendor/gridcraft/Cargo.toml -p gridcraft (or set GRIDTALK_GRIDCRAFT_BIN)".into()
                                 }
                             }
                         }
@@ -1127,9 +1239,14 @@ impl eframe::App for GridTalkApp {
                             ui.heading("Ready");
                             ui.label("Open a workbook from the top-left, then ask a question in the chat pane.");
                             ui.label("Tip: click a graph node to jump to its cells; click a cell to find its graph node.");
-                            if ui.button("Finish").clicked() {
-                                finish = true;
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Back").clicked() {
+                                    self.wizard_step = 1;
+                                }
+                                if ui.button("Finish").clicked() {
+                                    finish = true;
+                                }
+                            });
                         }
                     }
                 });

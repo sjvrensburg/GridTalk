@@ -262,21 +262,17 @@ pub struct TaskResult {
 fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // The cited range must also be *used* in the answer text —
     // retrieval alone does not count as citing.
-    let answer_cites = citations.iter().any(|c| answer.contains(c.as_str()));
-    if !answer_cites {
-        return false;
-    }
-    let Some((_, er, ec)) = crate::tools::parse_cell_ref(citation) else {
+    let Some((esheet, er, ec)) = crate::tools::parse_cell_ref(citation) else {
         return false;
     };
+    // The SAME cited range must both appear in the answer and
+    // contain the expected cell (combining two different ranges
+    // was a false positive).
     citations.iter().any(|cited| {
-        crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
-            crate::tools::parse_cell_ref(citation).is_some_and(|(esheet, _, _)| sheet == esheet)
-                && er >= r0
-                && er <= r1
-                && ec >= c0
-                && ec <= c1
-        })
+        answer.contains(cited.as_str())
+            && crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
+                sheet == esheet && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
+            })
     })
 }
 

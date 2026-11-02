@@ -774,16 +774,28 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                             }
                         }
                     } else {
-                        refs.push(QualifiedRef {
-                            sheet: sheet.clone(),
-                            row: r0,
-                            col: c0,
-                        });
-                        refs.push(QualifiedRef {
-                            sheet: sheet.clone(),
-                            row: r1,
-                            col: c1,
-                        });
+                        // Over the cap: emit the same interior
+                        // sample grid check_invariants uses
+                        // (rows/8 x cols/8 from the low corner), so
+                        // lifted edges reach interior columns and
+                        // regions instead of only the corners.
+                        let rows = hi_r - lo_r + 1;
+                        let cols = hi_c - lo_c + 1;
+                        let rstep = (rows / 8).max(1);
+                        let cstep = (cols / 8).max(1);
+                        let mut rr = lo_r;
+                        while rr <= hi_r {
+                            let mut cc = lo_c;
+                            while cc <= hi_c {
+                                refs.push(QualifiedRef {
+                                    sheet: sheet.clone(),
+                                    row: rr,
+                                    col: cc,
+                                });
+                                cc += cstep;
+                            }
+                            rr += rstep;
+                        }
                     }
                     i = end;
                     continue;

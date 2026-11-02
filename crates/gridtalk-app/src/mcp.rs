@@ -146,7 +146,7 @@ fn tool_definitions() -> Value {
         {"name": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
         {"name": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
         {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only, never writes)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}, "required": ["workbook_id", "cell", "value", "target"]}},
-        {"name": "graph_overview", "description": "All graph nodes and edges for an open workbook", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
+        {"name": "graph_overview", "description": "Graph nodes and edges for an open workbook (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
     ])
 }
 

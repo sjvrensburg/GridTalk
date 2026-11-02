@@ -67,17 +67,28 @@ struct CachedModel {
 fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
-    // A head-content hash catches same-mtime/same-length replacements
-    // that the (mtime, len) pair alone would alias.
-    use std::io::Read as _;
-    let mut head = vec![0u8; 65536];
-    let n = std::fs::File::open(path)
-        .and_then(|mut f| f.read(&mut head))
-        .unwrap_or(0);
+    // A head+tail content hash catches same-mtime/same-length
+    // replacements that the (mtime, len) pair alone would alias
+    // (weights live after the header, so head-only was not enough).
+    use std::io::{Read as _, Seek as _, SeekFrom};
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in &head[..n] {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let mut head = vec![0u8; 65536];
+        if let Ok(n) = f.read(&mut head) {
+            mix(&head[..n]);
+        }
+        if meta.len() > 65536 && f.seek(SeekFrom::End(-65536)).is_ok() {
+            let mut tail = vec![0u8; 65536];
+            if let Ok(n) = f.read(&mut tail) {
+                mix(&tail[..n]);
+            }
+        }
     }
     Some((modified, meta.len(), hash))
 }
@@ -200,8 +211,14 @@ impl LlamaCppBackend {
             )));
         }
 
+        // Allocate only the context this request needs (prompt +
+        // generation), floored at MAX_CONTEXT and capped at the
+        // model's training length — a 64K KV cache for a 1K request
+        // wastes gigabytes.
+        let n_ctx =
+            (prompt_tokens.len() + req.max_tokens).clamp(MAX_CONTEXT.min(context_len), context_len);
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(context_len as u32))
+            .with_n_ctx(NonZeroU32::new(n_ctx as u32))
             .with_n_batch(512);
         let mut ctx = model
             .new_context(backend, ctx_params)

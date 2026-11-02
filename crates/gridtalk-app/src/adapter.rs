@@ -231,10 +231,11 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                 .to_string();
             let mut triggers = Vec::new();
             let mut body_lines = Vec::new();
-            // Only a Triggers line in the first three lines is
-            // metadata; later ones are body, verbatim.
+            // Only a Triggers line on line 0 is metadata; every
+            // later line is body, verbatim (commit_version writes
+            // the metadata line first, so bodies round-trip).
             for (idx, line) in text.lines().enumerate() {
-                let header = idx < 3;
+                let header = idx == 0;
                 let parsed = if header {
                     line.trim()
                         .strip_prefix("Triggers:")
@@ -394,7 +395,10 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         std::fs::write(vdir_tmp.join("adapter.toml"), knob_text(&committed))
             .map_err(|e| e.to_string())?;
         for skill in &committed.skills {
-            if !valid_adapter_name(&skill.name) || skill.name.contains('.') {
+            // Interior dots are fine (`my.skill` -> my.skill.md,
+            // which load_skills reads back verbatim); separators,
+            // leading dots and traversal are not.
+            if !valid_adapter_name(&skill.name) || skill.name.starts_with('.') {
                 return Err(format!("invalid skill name {:?}", skill.name));
             }
             let mut text = String::new();
@@ -416,8 +420,14 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
     }
     // Root pointer + a copy of the active files for easy reading,
     // each swapped in atomically so a crash cannot truncate them.
-    write_atomic(&dir.join("adapter.toml"), &knob_text(&committed))?;
-    write_atomic(&dir.join("ADAPTER.md"), &committed.rules)?;
+    // The version is already committed (vN renamed in), so a failed
+    // convenience copy must warn, not report the commit as failed.
+    if let Err(e) = write_atomic(&dir.join("adapter.toml"), &knob_text(&committed)) {
+        eprintln!("gridtalk: warning: committed v{next} but root adapter.toml update failed: {e}");
+    }
+    if let Err(e) = write_atomic(&dir.join("ADAPTER.md"), &committed.rules) {
+        eprintln!("gridtalk: warning: committed v{next} but root ADAPTER.md update failed: {e}");
+    }
     Ok(next)
 }
 
@@ -429,10 +439,16 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     }
     let dir = adapter_dir(root, name);
     let target = current.version - 1;
-    if target > 0 && !dir.join(format!("v{target}")).is_dir() {
-        return Err(format!(
-            "adapter {name} cannot roll back: v{target} is missing on disk"
-        ));
+    if target > 0 {
+        let vdir = dir.join(format!("v{target}"));
+        if !vdir.is_dir()
+            || !vdir.join("adapter.toml").is_file()
+            || !vdir.join("ADAPTER.md").is_file()
+        {
+            return Err(format!(
+                "adapter {name} cannot roll back: v{target} is missing or incomplete on disk"
+            ));
+        }
     }
     let mut pointer = if target == 0 {
         Adapter::empty(name)

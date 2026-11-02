@@ -51,8 +51,13 @@ fn dedup_terms(terms: Vec<String>) -> Vec<String> {
 impl Index {
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let mut idx = Index::default();
-        let sheets: BTreeMap<&str, &gridtalk_graph::SheetSnapshot> =
-            wb.sheets.iter().map(|s| (s.name.as_str(), s)).collect();
+        // Duplicate sheet names must not collapse: the first sheet
+        // of a name wins (later duplicates keep their own regions
+        // out rather than rendering another sheet's cells).
+        let mut sheets: BTreeMap<&str, &gridtalk_graph::SheetSnapshot> = BTreeMap::new();
+        for sh in &wb.sheets {
+            sheets.entry(sh.name.as_str()).or_insert(sh);
+        }
         for region in &graph.regions {
             if let Some(sheet) = sheets.get(region.range.sheet.as_str()) {
                 let passage = render_passage(sheet, region);

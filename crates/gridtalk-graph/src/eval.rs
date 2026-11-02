@@ -335,11 +335,25 @@ impl<'a> Parser<'a> {
                 }
                 let name: String = self.chars[start..self.pos].iter().collect();
                 self.skip_ws();
-                if self.peek() != Some('(') && name.eq_ignore_ascii_case("TRUE") {
-                    return Ok(1.0);
-                }
-                if self.peek() != Some('(') && name.eq_ignore_ascii_case("FALSE") {
-                    return Ok(0.0);
+                if name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE") {
+                    let v = if name.eq_ignore_ascii_case("TRUE") {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if self.peek() == Some('(') {
+                        // TRUE() / FALSE() literal form.
+                        let save = self.pos;
+                        self.bump();
+                        self.skip_ws();
+                        if self.peek() == Some(')') {
+                            self.bump();
+                            return Ok(v);
+                        }
+                        self.pos = save; // not the literal form; fall through
+                    } else {
+                        return Ok(v);
+                    }
                 }
                 if self.peek() == Some('(') {
                     if target_sheet != self.sheet_idx {
@@ -521,6 +535,12 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function(&mut self, name: &str) -> Result<f64, EvalError> {
+        // Unsupported names fail BEFORE any argument is evaluated,
+        // so an argument error cannot mask the cached-value
+        // fallback for formulas we cannot evaluate at all.
+        if !matches!(name, "SUM" | "AVERAGE" | "AVG" | "MIN" | "MAX" | "COUNT") {
+            return Err(EvalError::Parse(format!("unsupported function {name}")));
+        }
         // One range or a comma list of expressions.
         let mut values: Vec<f64> = Vec::new();
         loop {
@@ -558,7 +578,10 @@ impl<'a> Parser<'a> {
                                     continue;
                                 }
                             }
-                            let cell = self.sheets[range_sheet].get(r, c);
+                            // Borrowed access: cloning every
+                            // cell (incl. long Text) just to
+                            // discard most of them is wasteful.
+                            let cell = self.sheets[range_sheet].get_ref(r, c);
                             if matches!(
                                 cell,
                                 CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
@@ -841,6 +864,15 @@ mod tests {
             cached: Some(Box::new(CellValue::Number(999.0))),
         };
         assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 999.0);
+        // Unsupported function whose ARGUMENTS would error still
+        // falls back to the cached value.
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "MEDIAN(1/0)".into(),
+            cached: Some(Box::new(CellValue::Number(42.0))),
+        };
+        assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 42.0);
+        let wb = parse_delimited("d", "S", "A\n=TRUE()+FALSE()\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 1.0);
         // Long dependency chains: 120 cells deep, no depth error.
         let mut csv = String::from("A\n1\n");
         for i in 3..=121 {

@@ -102,8 +102,12 @@ pub fn investigate_with(
                 let cells = run("cells", &format!("range={clean}"), &mut trail);
                 context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
             }
-            // Directly-read ref_context cells are citations too.
-            if !citations.contains(&clean) {
+            // Directly-read ref_context cells are citations too —
+            // but only when the named sheet actually exists (the
+            // tool calls above return error text for a bad sheet).
+            let sheet_ok = parse_cell_ref(&clean)
+                .is_some_and(|(sheet_name, _, _)| tools.sheet_for(&sheet_name).is_some());
+            if sheet_ok && !citations.contains(&clean) {
                 citations.push(clean.clone());
             }
         }
@@ -150,18 +154,19 @@ pub fn investigate_with(
                         parse_cell_ref(&format!("{sheet}!{cell}"))
                     };
                     let dependent_target = || -> Option<String> {
-                        let (_, orow, ocol) = override_coord.clone()?;
+                        let (osheet, orow, ocol) = override_coord.clone()?;
                         let (_, r0, c0, r1, c1) = parse_range(range)?;
                         let sheet_obj = tools.sheet_for(&sheet)?;
                         for r in r0..=r1 {
                             for c in c0..=c1 {
                                 if let CellValue::Formula { expr, .. } = sheet_obj.get(r, c) {
                                     let refs = gridtalk_graph::formula_refs_qualified(&expr);
+                                    // A qualified ref names the
+                                    // OVERRIDE's sheet; an unqualified
+                                    // one means the formula's own sheet.
                                     let depends = refs.iter().any(|q| {
-                                        (q.sheet.is_none()
-                                            || q.sheet
-                                                .as_deref()
-                                                .is_some_and(|qs| qs.eq_ignore_ascii_case(&sheet)))
+                                        let ref_sheet = q.sheet.as_deref().unwrap_or(&sheet);
+                                        ref_sheet.eq_ignore_ascii_case(&osheet)
                                             && q.row == orow
                                             && q.col == ocol
                                     });
@@ -314,7 +319,7 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
     for qref in qualified_refs(question) {
         if parse_cell_ref(&qref).is_some() {
             if let Some(pos) = question.find(&qref) {
-                for next in question[pos + qref.len()..].split_whitespace().take(4) {
+                for next in question[pos + qref.len()..].split_whitespace().take(12) {
                     let n =
                         next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
                     if let Ok(v) = n.parse::<f64>() {

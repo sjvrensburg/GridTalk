@@ -52,7 +52,14 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
         cmd += ["--adapter", str(task["gridtalk_adapter"])]
     cmd.append(str(task["question"]))
     started = time.time()
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return RunOutput(
+            output="",
+            wall_s=time.time() - started,
+            extra={"error": f"could not run gridtalk CLI: {exc}"},
+        )
     wall = time.time() - started
     if proc.returncode != 0:
         return RunOutput(
@@ -70,44 +77,51 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
 
 
 def _extract_numbers(text: str) -> list[float]:
-    """Mirror bench.rs `extract_numbers` (shared with the Rust fix):
-    whitespace/|;: tokenised, edge-trimmed, letter-leading tokens
-    (citations, words, ranges) skipped, leading-dot and scientific
-    notation accepted, thousands vs decimal separators disambiguated,
-    ranges and malformed groupings skipped."""
+    """Exact mirror of bench.rs `extract_numbers`: whitespace/|;:
+    tokenised, edges trimmed to alphanumeric/./-/,% characters,
+    first char digit/./-, last-separator-is-decimal for mixed
+    formats, thousands iff every trailing group is 3 digits, a
+    single comma is decimal, other multi-comma forms skipped, and
+    only finite Rust-parseable floats count."""
+    import math
+
     nums: list[float] = []
     for raw in re.split(r"[\s|;:]+", text or ""):
-        token = raw.strip("()[]{}\"'")
-        if not token:
-            continue
-        body = token[1:] if token[0] in "+-" else token
-        if not body or not (body[0].isdigit() or body[0] == "."):
-            continue  # citations like Sheet1!A1 / A1, words, markers
-        if "-" in body:
-            continue  # range like 10-20 is ambiguous
+        token = raw
+        while token and not (token[0].isalnum() or token[0] in ".-,%"):
+            token = token[1:]
+        while token and not (token[-1].isalnum() or token[-1] in ".-,%"):
+            token = token[:-1]
+        if not token or not (token[0].isdigit() or token[0] in ".-"):
+            continue  # citations, words, markers
         percent = token.endswith("%")
-        core = body.rstrip("%")
+        core = token[:-1] if percent else token
+        if "," in core and "." in core:
+            if core.rfind(",") > core.rfind("."):  # 1.200,50 European
+                core = core.replace(".", "").replace(",", ".")
+            else:  # 1,200.50
+                core = core.replace(",", "")
+        elif "," in core:
+            groups = core.split(",")
+            if len(groups) > 1 and all(
+                len(g) == 3 and g.isdigit() for g in groups[1:]
+            ):
+                core = core.replace(",", "")  # thousands, any first-group length
+            elif len(groups) == 2:
+                core = groups[0] + "." + groups[1]  # decimal comma
+            else:
+                continue  # 1,200,50 etc: ambiguous
+        if "_" in core:
+            continue  # Rust f64 parse rejects underscores; float() does not
         try:
-            if "." in core and "," in core:
-                if core.rfind(",") > core.rfind("."):  # 1.200,50 European
-                    core = core.replace(".", "").replace(",", ".")
-                else:  # 1,200.50
-                    core = core.replace(",", "")
-            elif "," in core:
-                groups = core.split(",")
-                if len(groups) == 2 and groups[0] and groups[1]:
-                    if len(groups[1]) == 3 and groups[1].isdigit() and len(groups[0]) <= 3:
-                        core = groups[0] + groups[1]  # thousands
-                    else:
-                        core = groups[0] + "." + groups[1]  # decimal comma
-                else:
-                    continue  # 1,200,50 etc: ambiguous
-            value = float(core)  # handles .5 and 1e5 / 1.2E-3
+            value = float(core)  # .5, 1e5, 1.2e-3, -1.2e-3; ranges fail here
         except ValueError:
+            continue
+        if not math.isfinite(value):
             continue
         if percent:
             value /= 100.0
-        nums.append(-value if token.startswith("-") else value)
+        nums.append(value)
     return nums
 
 
@@ -205,6 +219,17 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
     for row in rows:
         if not isinstance(row, dict) or not row.get("id") or "question" not in row or "expected" not in row:
             raise ValueError("each bench row needs id/question/expected")
+        if not isinstance(row["id"], str) or not row["id"]:
+            raise ValueError("bench task id must be a non-empty string")
+        if not isinstance(row["question"], str) or not row["question"].strip():
+            raise ValueError(f"task {row['id']}: question must be a non-empty string")
+        exp = row["expected"]
+        if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
+            raise ValueError(f"task {row['id']}: expected must be a number or numeric string")
+        if isinstance(exp, str) and _final_number(exp) is None:
+            raise ValueError(f"task {row['id']}: expected {exp!r} is not numeric")
+        if isinstance(exp, (int, float)) and exp != exp:
+            raise ValueError(f"task {row['id']}: expected must be finite")
         if row["id"] in seen:
             raise ValueError(f"duplicate bench task id: {row['id']}")
         seen.add(row["id"])

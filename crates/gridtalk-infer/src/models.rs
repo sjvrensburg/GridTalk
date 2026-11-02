@@ -147,8 +147,38 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// (block elements, bytes per block) for known GGML tensor types.
+fn ggml_type_layout(ty: u32) -> Option<(u64, u64)> {
+    Some(match ty {
+        0 => (1, 4),      // F32
+        1 => (1, 2),      // F16
+        2 => (32, 18),    // Q4_0
+        3 => (32, 20),    // Q4_1
+        6 => (32, 22),    // Q5_0
+        7 => (32, 24),    // Q5_1
+        8 => (32, 34),    // Q8_0
+        9 => (32, 36),    // Q8_1
+        10 => (256, 84),  // Q2_K
+        11 => (256, 110), // Q3_K
+        12 => (256, 144), // Q4_K
+        13 => (256, 176), // Q5_K
+        14 => (256, 210), // Q6_K
+        15 => (256, 292), // Q8_K
+        16 => (1, 1),     // I8
+        17 => (1, 2),     // I16
+        18 => (1, 4),     // I32
+        19 => (1, 8),     // I64
+        20 => (1, 8),     // F64
+        _ => return None,
+    })
+}
+
 /// Parse a GGUF header (v2/v3 layout) without loading tensors.
 pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
+    parse_gguf_with_len(bytes, bytes.len() as u64)
+}
+
+fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelError> {
     let mut r = Reader { b: bytes, pos: 0 };
     if r.take(4)? != b"GGUF" {
         return Err(ModelError::NotGguf("bad magic".into()));
@@ -172,19 +202,29 @@ pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
     // Tensor infos must actually be present: name, dims, type,
     // offset for every declared tensor. A header claiming tensors
     // with no infos is truncated, not a model.
+    let mut tensor_extents: Vec<(String, u64, u64)> = Vec::new(); // (name, offset, bytes)
     for _ in 0..tensor_count {
-        let _name = r.string()?;
+        let name = r.string()?;
         let n_dims = r.u32()?;
         if n_dims > 8 {
             return Err(ModelError::NotGguf(format!(
                 "tensor has {n_dims} dimensions"
             )));
         }
+        let mut elements: u64 = 1;
         for _ in 0..n_dims {
-            r.u64()?;
+            let d = r.u64()?;
+            elements = elements
+                .checked_mul(d)
+                .ok_or_else(|| ModelError::NotGguf("tensor dimension overflow".into()))?;
         }
-        r.u32()?; // tensor type
-        r.u64()?; // tensor offset
+        let ty = r.u32()?;
+        let offset = r.u64()?;
+        // Unknown (newer) GGML types: extent cannot be verified
+        // here; llama.cpp remains the authority for those.
+        let size =
+            ggml_type_layout(ty).map(|(block, per_block)| elements.div_ceil(block) * per_block);
+        tensor_extents.push((name, offset, size.unwrap_or(0)));
     }
     let alignment: u64 = metadata
         .get("general.alignment")
@@ -192,10 +232,22 @@ pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
         .filter(|a: &u64| *a > 0)
         .unwrap_or(32);
     let data_start = (r.pos as u64).div_ceil(alignment) * alignment;
-    if tensor_count > 0 && (bytes.len() as u64) <= data_start {
+    if tensor_count > 0 && file_len <= data_start {
         return Err(ModelError::Truncated(
             "GGUF declares tensors but has no tensor payload".into(),
         ));
+    }
+    // Every verifiable tensor must lie inside the actual file.
+    for (name, offset, size) in &tensor_extents {
+        let end = data_start
+            .checked_add(*offset)
+            .and_then(|v| v.checked_add(*size))
+            .ok_or_else(|| ModelError::NotGguf(format!("tensor {name} extent overflow")))?;
+        if end > file_len {
+            return Err(ModelError::Truncated(format!(
+                "tensor {name} extends to {end}, beyond the {file_len}-byte file"
+            )));
+        }
     }
     Ok(GgufInfo {
         version,
@@ -217,13 +269,14 @@ pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
     // multi-GB tensor payload into RAM.
     const HEADER_CAP: u64 = 64 * 1024 * 1024;
     let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut buf = Vec::new();
     let mut window: u64 = 1024 * 1024;
     loop {
         buf.clear();
         file.seek(std::io::SeekFrom::Start(0))?;
         (&mut file).take(window).read_to_end(&mut buf)?;
-        match parse_gguf(&buf) {
+        match parse_gguf_with_len(&buf, file_len) {
             Err(ModelError::Truncated(_))
                 if (buf.len() as u64) >= window && window < HEADER_CAP =>
             {
@@ -596,6 +649,31 @@ mod tests {
         assert_eq!(info.architecture.as_deref(), Some("qwen3moe"));
         assert_eq!(info.name.as_deref(), Some("Synthetic Test Model"));
         assert!(parse_gguf(b"NOPE").is_err());
+    }
+
+    #[test]
+    fn gguf_tensor_extent_beyond_eof_is_rejected() {
+        // One F32 tensor of 10 elements declared, but no payload.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        b.extend_from_slice(&0u64.to_le_bytes()); // 0 kv
+        let name = "w";
+        b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // 1 dim
+        b.extend_from_slice(&10u64.to_le_bytes()); // 10 elements
+        b.extend_from_slice(&0u32.to_le_bytes()); // F32
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset 0
+        assert!(parse_gguf(&b).is_err());
+        // With the 40 payload bytes present it parses.
+        let mut with_payload = b.clone();
+        // Pad to the 32-byte-aligned data_start, then payload.
+        let aligned = (with_payload.len() as u64).div_ceil(32) * 32;
+        with_payload.resize(aligned as usize, 0);
+        with_payload.extend_from_slice(&[0u8; 40]);
+        assert!(parse_gguf(&with_payload).is_ok());
     }
 
     #[test]

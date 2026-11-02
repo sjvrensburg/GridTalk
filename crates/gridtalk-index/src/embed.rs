@@ -239,7 +239,9 @@ fn chunk_lines(text: &str) -> Vec<String> {
     }
     let mut out = Vec::with_capacity(MAX_CHUNKS);
     for i in 0..MAX_CHUNKS {
-        out.push(lines[i * lines.len() / MAX_CHUNKS].to_string());
+        // Span the whole region: first line through LAST line
+        // (i * len / MAX_CHUNKS never reaches the final line).
+        out.push(lines[i * (lines.len() - 1) / (MAX_CHUNKS - 1)].to_string());
     }
     out
 }

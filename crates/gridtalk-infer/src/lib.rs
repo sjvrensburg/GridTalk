@@ -262,7 +262,13 @@ fn read_http_response(
                 if raw.len() - last_progress >= 4096 {
                     last_progress = raw.len();
                     last_progress_at = std::time::Instant::now();
-                } else if last_progress_at.elapsed() > std::time::Duration::from_secs(10) {
+                } else if (last_progress > 0 || header_end.is_some())
+                    && last_progress_at.elapsed() > std::time::Duration::from_secs(30)
+                {
+                    // Only after first progress: a slow FIRST byte
+                    // (a non-streaming endpoint thinking for 10-30 s)
+                    // is governed by the WouldBlock arm and the 300 s
+                    // deadline, not the drip check.
                     return Err(InferError::Http(
                         "endpoint is slow-dripping the response".into(),
                     ));

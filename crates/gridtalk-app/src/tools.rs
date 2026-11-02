@@ -63,7 +63,7 @@ impl ToolRequest {
                 {"name": "cells", "tool": "cells", "description": "Typed cell values and formulas in a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
                 {"name": "formulas", "tool": "formulas", "description": "Formulas in a range with evaluated values", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
                 {"name": "what_if", "tool": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only)", "inputSchema": schema(serde_json::json!({"cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}), &["cell", "value", "target"])},
-                {"name": "graph_overview", "tool": "graph_overview", "description": "All graph nodes and edges", "inputSchema": schema(serde_json::json!({}), &[])}
+                {"name": "graph_overview", "tool": "graph_overview", "description": "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": schema(serde_json::json!({}), &[])}
             ]
         })
     }
@@ -110,7 +110,12 @@ impl<'a> Tools<'a> {
     }
 
     fn sheet(&self, name: &str) -> Option<&gridtalk_graph::SheetSnapshot> {
-        self.wb.sheets.iter().find(|s| s.name == name)
+        // Caller spellings are case-insensitive (expand already
+        // canonicalises sheet1!a1:b2; cells/formulas/what_if agree).
+        self.wb
+            .sheets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
     }
 
     /// The one typed entry point every surface calls.

@@ -28,11 +28,20 @@ for bin in gridtalk gridtalk-ui; do
   fi
 done
 cargo build --locked --release -p gridtalk-app -p gridtalk-ui
-# Install atomically: copy beside the target, then rename over it.
+# Install atomically: stage BOTH binaries beside their targets
+# first, then rename both, so a failure cannot leave a mixed pair.
+trap 'rm -f "$DIR/.gridtalk.tmp-$$" "$DIR/.gridtalk-ui.tmp-$$"' EXIT
 for bin in gridtalk gridtalk-ui; do
   cp "target/release/$bin" "$DIR/.$bin.tmp-$$"
   chmod +x "$DIR/.$bin.tmp-$$"
+done
+for bin in gridtalk gridtalk-ui; do
+  if [ -e "$DIR/$bin" ] && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
+    echo "refusing to overwrite existing $DIR/$bin (set GRIDTALK_FORCE=1 to replace)" >&2
+    exit 1
+  fi
   mv "$DIR/.$bin.tmp-$$" "$DIR/$bin"
 done
+trap - EXIT
 echo "Installed gridtalk and gridtalk-ui into $DIR"
 echo "First run: gridtalk-ui  (a short setup wizard will appear)"
