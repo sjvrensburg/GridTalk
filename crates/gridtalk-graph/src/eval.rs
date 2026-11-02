@@ -595,7 +595,10 @@ impl<'a> Parser<'a> {
     /// Whole-column (A:A) / whole-row (1:1) range at the current
     /// position, bounded to the target sheet's used extents.
     /// Consumes the token on success; restores position otherwise.
-    fn try_whole_range(&mut self) -> Option<(usize, usize, usize, usize, usize)> {
+    /// `Some(None)` is a recognised range that covers no used cell
+    /// (empty sheet, or rows/columns past the used extents).
+    #[allow(clippy::type_complexity)]
+    fn try_whole_range(&mut self) -> Option<Option<(usize, usize, usize, usize, usize)>> {
         let save = self.pos;
         let mut target = self.sheet_idx;
         if matches!(self.peek(), Some('\''))
@@ -660,9 +663,14 @@ impl<'a> Parser<'a> {
             }
             let second = take_letters(self);
             if let (Some(c0), Some(c1)) = (col_of(&first), col_of(&second)) {
-                if !sheet.cells.is_empty() {
-                    return Some((target, 0, c0, sheet.cells.len() - 1, c1));
+                let (lo, hi) = (
+                    c0.min(c1),
+                    c0.max(c1).min(sheet.max_col().saturating_sub(1)),
+                );
+                if sheet.cells.is_empty() || sheet.max_col() == 0 || lo > hi {
+                    return Some(None);
                 }
+                return Some(Some((target, 0, lo, sheet.cells.len() - 1, hi)));
             }
             self.pos = save;
             return None;
@@ -677,8 +685,13 @@ impl<'a> Parser<'a> {
             }
             let second = take_digits(self);
             if let (Ok(r0), Ok(r1)) = (first.parse::<usize>(), second.parse::<usize>()) {
-                if r0 >= 1 && r1 >= 1 && r0 <= 1_048_576 && r1 <= 1_048_576 && sheet.max_col() > 0 {
-                    return Some((target, r0 - 1, 0, r1 - 1, sheet.max_col() - 1));
+                if r0 >= 1 && r1 >= 1 && r0 <= 1_048_576 && r1 <= 1_048_576 {
+                    let lo = r0.min(r1) - 1;
+                    let hi = (r0.max(r1) - 1).min(sheet.cells.len().saturating_sub(1));
+                    if sheet.cells.is_empty() || sheet.max_col() == 0 || lo > hi {
+                        return Some(None);
+                    }
+                    return Some(Some((target, lo, 0, hi, sheet.max_col() - 1)));
                 }
             }
         }
@@ -700,8 +713,16 @@ impl<'a> Parser<'a> {
             let save = self.pos;
             // Whole-column/row ranges (A:A, 1:1) bounded to the
             // sheet's used extents.
-            if let Some((t, r0, c0, r1, c1)) = self.try_whole_range() {
-                self.collect_range(&mut values, t, r0, c0, r1, c1)?;
+            if let Some(whole) = self.try_whole_range() {
+                if let Some((t, r0, c0, r1, c1)) = whole {
+                    let area = (r1 - r0 + 1).saturating_mul(c1 - c0 + 1);
+                    if area > 100_000 {
+                        return Err(EvalError::Parse(format!(
+                            "range of {area} cells exceeds the 100000-cell evaluation cap"
+                        )));
+                    }
+                    self.collect_range(&mut values, t, r0, c0, r1, c1)?;
+                }
             // Try range A1:B9 next.
             } else if let Ok((t0, r0, c0, _)) = self.parse_ref_token() {
                 self.skip_ws();
@@ -1038,6 +1059,11 @@ mod tests {
         let wb = parse_delimited("d", "S", "A,B\n1,=SUM(A:A)\n2,=MIN(C1)\n", ',');
         assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 3.0);
         assert_eq!(eval_cell(&wb.sheets[0], 2, 1).unwrap(), 0.0);
+        // Whole-row ranges clamp to the used rows; columns past the
+        // used extents sum to 0 instead of erroring.
+        let wb = parse_delimited("d", "S", "=SUM(2:1048576),=SUM(Z:Z)\n1,2\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 0, 0).unwrap(), 3.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 0, 1).unwrap(), 0.0);
         // Long dependency chains: 120 cells deep, no depth error.
         let mut csv = String::from("A\n1\n");
         for i in 3..=121 {

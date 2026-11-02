@@ -1027,7 +1027,14 @@ fn snapshot_to_delimited(snapshot: &gridtalk_graph::WorkbookSnapshot, delim: cha
             .iter()
             .map(|c| {
                 let text = cell_input_text(c);
-                if text.contains(delim) || text.contains('"') || text.contains('\n') {
+                // Quote anything the reader would split or trim:
+                // delimiters, quotes, CR/LF, and edge whitespace.
+                if text.contains(delim)
+                    || text.contains('"')
+                    || text.contains('\n')
+                    || text.contains('\r')
+                    || text.trim() != text
+                {
                     format!("\"{}\"", text.replace('"', "\"\""))
                 } else {
                     text
@@ -1928,6 +1935,19 @@ mod tests {
             back.sheets[0].get(1, 1),
             gridtalk_graph::CellValue::Formula { .. }
         ));
+        // CR and edge whitespace survive a CSV round trip.
+        let wb = gridtalk_graph::WorkbookSnapshot {
+            name: "d".into(),
+            sheets: vec![gridtalk_graph::SheetSnapshot {
+                name: "Sheet1".into(),
+                cells: vec![vec![
+                    gridtalk_graph::CellValue::Text("a\rb".into()),
+                    gridtalk_graph::CellValue::Text("  pad ".into()),
+                ]],
+            }],
+        };
+        let back = parse_delimited("d", "Sheet1", &snapshot_to_delimited(&wb, ','), ',');
+        assert_eq!(back.sheets[0].cells, wb.sheets[0].cells);
     }
 
     #[test]

@@ -231,6 +231,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 Some("show") => {
                     let name = args.get(3).ok_or("usage: gridtalk adapter show <name>")?;
+                    // The CARD.md read below joins `name` onto the
+                    // root: a traversal name must never reach it.
+                    if !adapter::valid_adapter_name(name) {
+                        return Err(format!("invalid adapter name {name:?}"));
+                    }
                     let a = adapter::load_adapter(&root, name);
                     println!(
                         "adapter {name} v{} top_k={} max_steps={} ref_context={}",

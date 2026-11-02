@@ -1137,13 +1137,18 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
 }
 
 fn col_from_letters(letters: &str) -> Option<usize> {
+    // Empty or non-letter input (row-only `1:3`, `A.1`) is not a
+    // column: reject it instead of underflowing.
+    if letters.is_empty() || !letters.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
     let mut col = 0usize;
     for ch in letters.to_ascii_uppercase().chars() {
         col = col
             .checked_mul(26)?
             .checked_add(ch as usize - 'A' as usize + 1)?;
     }
-    Some(col - 1)
+    col.checked_sub(1)
 }
 
 /// Every lifted depends_on edge must be re-derivable from raw formulas,
@@ -1582,6 +1587,9 @@ mod tests {
         assert!(g.nodes.iter().any(|n| n.kind == NodeKind::Region));
         let node = g.node_for_cell("Sheet1", 1, 3).unwrap();
         assert_eq!(node.kind, NodeKind::Column); // most specific node wins
+                                                 // Whole-row refs must not panic the independent cross-check.
+        let wb = parse_delimited("d", "S", "A,B\n1,=SUM(1:1)\n", ',');
+        let _ = build_graph(&wb);
     }
 
     #[test]

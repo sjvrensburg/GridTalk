@@ -9,7 +9,7 @@
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
 use gridtalk_graph::eval::{eval_cell_in_workbook, what_if_in_workbook};
-use gridtalk_graph::{formula_refs_qualified, CellValue, WorkbookSnapshot};
+use gridtalk_graph::{formula_refs_qualified, sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
 
@@ -117,7 +117,8 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                     .sheets
                                     .iter()
                                     .position(|s| {
-                                        s.name.eq_ignore_ascii_case(
+                                        sheet_name_eq(
+                                            &s.name,
                                             q.sheet.as_deref().unwrap_or(&sheet.name),
                                         )
                                     })
@@ -130,7 +131,7 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                 let Some(osheet) = wb
                                     .sheets
                                     .iter()
-                                    .find(|s| s.name.eq_ignore_ascii_case(&osheet_name))
+                                    .find(|s| sheet_name_eq(&s.name, &osheet_name))
                                 else {
                                     continue;
                                 };
@@ -299,7 +300,16 @@ pub(crate) fn contains_bounded(answer: &str, needle: &str) -> bool {
         let start = from + pos;
         let end = start + needle.len();
         let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
-        let after_ok = answer[end..].chars().next().is_none_or(boundary);
+        // Sentence punctuation (`... Sheet1!D2.` / `Sheet1!D2: 6`)
+        // ends a reference; a '.'/':' that continues a longer ref
+        // (Sheet1!A1:B2) does not.
+        let mut tail = answer[end..].chars();
+        let after_ok = match tail.next() {
+            None => true,
+            Some(c) if boundary(c) => true,
+            Some('.') | Some(':') => tail.next().is_none_or(|n| n.is_whitespace()),
+            Some(_) => false,
+        };
         if before_ok && after_ok {
             return true;
         }
@@ -323,7 +333,7 @@ fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     citations.iter().any(|cited| {
         contains_bounded(answer, cited)
             && crate::tools::parse_range_uncapped(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
-                sheet.eq_ignore_ascii_case(&esheet) && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
+                sheet_name_eq(&sheet, &esheet) && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
             })
     })
 }
@@ -588,6 +598,11 @@ mod tests {
             "Sheet1!D2",
             "The total is 6 [Sheet1!A1:D4]"
         ));
+        // A citation ending a sentence still counts; a prefix of a
+        // longer range does not.
+        assert!(contains_bounded("See Sheet1!A1:D4.", "Sheet1!A1:D4"));
+        assert!(contains_bounded("Sheet1!D2: 6", "Sheet1!D2"));
+        assert!(!contains_bounded("Sheet1!A1:B2", "Sheet1!A1"));
         // Retrieval hit without an answer citation does not count.
         assert!(!citation_hit(&citations, "Sheet1!D2", "The total is 6"));
         // Out-of-range citations do not count either.

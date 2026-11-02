@@ -4,7 +4,7 @@
 //! external harnesses never scrape human-formatted strings.
 
 use gridtalk_graph::eval::{eval_many_in_workbook, what_if_in_workbook};
-use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
+use gridtalk_graph::{sheet_name_eq, CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
 
@@ -112,10 +112,7 @@ impl<'a> Tools<'a> {
     fn sheet(&self, name: &str) -> Option<&gridtalk_graph::SheetSnapshot> {
         // Caller spellings are case-insensitive (expand already
         // canonicalises sheet1!a1:b2; cells/formulas/what_if agree).
-        self.wb
-            .sheets
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
+        self.wb.sheets.iter().find(|s| sheet_name_eq(&s.name, name))
     }
 
     /// The one typed entry point every surface calls.
@@ -204,7 +201,7 @@ impl<'a> Tools<'a> {
                                 })
                                 .filter(|n| {
                                     n.range.as_ref().is_some_and(|r| {
-                                        r.sheet.eq_ignore_ascii_case(&sheet)
+                                        sheet_name_eq(&r.sheet, &sheet)
                                             && r.r0 <= r0
                                             && r.c0 <= c0
                                             && r.r1 >= r1
@@ -609,7 +606,7 @@ fn parse_range_inner(a1: &str, capped: bool) -> Option<(String, usize, usize, us
         // The end may repeat the sheet qualifier.
         let b_cell = if b.contains('!') {
             let (end_sheet, cell) = split_sheet_prefix(b)?;
-            if !end_sheet.eq_ignore_ascii_case(&sheet) {
+            if !sheet_name_eq(&end_sheet, &sheet) {
                 return None;
             }
             cell
