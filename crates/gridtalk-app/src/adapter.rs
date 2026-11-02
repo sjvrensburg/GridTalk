@@ -390,9 +390,14 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     pointer.version = target;
     std::fs::write(dir.join("adapter.toml"), knob_text(&pointer)).map_err(|e| e.to_string())?;
     // Refresh the root convenience copy from the rolled-back
-    // version (v0 clears it — no resurrected rules).
-    let rolled = load_adapter(root, name);
-    std::fs::write(dir.join("ADAPTER.md"), &rolled.rules).map_err(|e| e.to_string())?;
+    // version (v0 clears it — no resurrected rules; note the root
+    // copy itself must not be the source for v0).
+    let root_rules = if target == 0 {
+        String::new()
+    } else {
+        load_adapter(root, name).rules
+    };
+    std::fs::write(dir.join("ADAPTER.md"), &root_rules).map_err(|e| e.to_string())?;
     Ok(target)
 }
 
@@ -457,6 +462,9 @@ mod tests {
         let back = load_adapter(&root, "demo");
         assert_eq!(back.version, 1);
         assert!(!back.rules.contains("Cite the range"));
+        // Rolling back to v0 clears the rules entirely.
+        assert_eq!(rollback(&root, "demo").unwrap(), 0);
+        assert!(load_adapter(&root, "demo").rules.trim().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
