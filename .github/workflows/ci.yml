@@ -9,6 +9,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
@@ -18,7 +19,7 @@ jobs:
           submodules: true
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev shaderc
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
