@@ -5,18 +5,44 @@ on:
 permissions:
   contents: write
 jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Gate on tests and version match
+        shell: bash
+        run: |
+          cargo test --locked --workspace
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION=$(grep -m1 '^version = ' crates/gridtalk-app/Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG_VERSION crate=$CRATE_VERSION"
+          test "$TAG_VERSION" = "$CRATE_VERSION" || { echo "tag v$TAG_VERSION does not match gridtalk-app version $CRATE_VERSION"; exit 1; }
+      - name: Create the release once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --generate-notes --notes "Binaries: gridtalk (CLI, built with candle-gen local GGUF generation) and gridtalk-ui (desktop). Local model is the private default; external endpoints receive cell values verbatim."
   build:
+    needs: create
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build release binaries
-        run: cargo build --release -p gridtalk-app -p gridtalk-ui
+        run: cargo build --locked --release -p gridtalk-app -p gridtalk-ui --features gridtalk-app/candle-gen
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -24,6 +50,9 @@ jobs:
           mkdir -p dist
           cp target/release/gridtalk target/release/gridtalk-ui dist/
           cp README.md LICENSE-MIT config.example.toml dist/
+          cp vendor/gridcraft/LICENSE-MIT dist/GRIDRAFT-LICENSE-MIT
+          cp vendor/gridcraft/LICENSE-APACHE dist/GRIDRAFT-LICENSE-APACHE
+          cp vendor/gridcraft/NOTICE dist/GRIDRAFT-NOTICE || true
           tar -czf "gridtalk-${{ github.ref_name }}-${{ runner.os }}.tar.gz" -C dist .
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -31,11 +60,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist
           Copy-Item target/release/gridtalk.exe, target/release/gridtalk-ui.exe, README.md, LICENSE-MIT, config.example.toml dist/
+          Copy-Item vendor/gridcraft/LICENSE-MIT dist/GRIDRAFT-LICENSE-MIT
+          Copy-Item vendor/gridcraft/LICENSE-APACHE dist/GRIDRAFT-LICENSE-APACHE
           Compress-Archive -Path dist/* -DestinationPath "gridtalk-${{ github.ref_name }}-Windows.zip"
       - name: Upload to GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --generate-notes
-          gh release upload "${{ github.ref_name }}" gridtalk-* --clobber
+        run: gh release upload "${{ github.ref_name }}" gridtalk-${{ github.ref_name }}-* --clobber

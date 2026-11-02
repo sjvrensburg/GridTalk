@@ -29,9 +29,11 @@ impl std::error::Error for EvalError {}
 
 /// Evaluate one cell: numbers pass through, formulas are computed
 /// recursively, text/empty evaluate to errors in numeric context.
+pub const MAX_EVAL_DEPTH: usize = 64;
+
 pub fn eval_cell(sheet: &SheetSnapshot, row: usize, col: usize) -> Result<f64, EvalError> {
     let mut visited = BTreeSet::new();
-    eval_cell_inner(sheet, row, col, &mut visited)
+    eval_cell_inner(sheet, row, col, &mut visited, 0)
 }
 
 fn eval_cell_inner(
@@ -39,7 +41,13 @@ fn eval_cell_inner(
     row: usize,
     col: usize,
     visited: &mut BTreeSet<(usize, usize)>,
+    depth: usize,
 ) -> Result<f64, EvalError> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(EvalError::Parse(format!(
+            "formula nesting deeper than {MAX_EVAL_DEPTH}"
+        )));
+    }
     if !visited.insert((row, col)) {
         return Err(EvalError::Cycle(format!(
             "cell {}{}",
@@ -54,16 +62,43 @@ fn eval_cell_inner(
                 // A cached value is only trusted when the formula has
                 // no live precedents we can evaluate ourselves.
                 if formula_refs(&expr).is_empty() {
-                    return Ok(*n);
+                    Ok(*n)
+                } else {
+                    let mut parser = Parser {
+                        chars: expr.chars().collect(),
+                        pos: 0,
+                        sheet,
+                        visited,
+                        depth,
+                    };
+                    let v = parser.parse_expr()?;
+                    parser.skip_ws();
+                    if parser.pos != parser.chars.len() {
+                        return Err(EvalError::Parse(format!(
+                            "trailing tokens at {} in formula",
+                            parser.pos
+                        )));
+                    }
+                    Ok(v)
                 }
+            } else {
+                let mut parser = Parser {
+                    chars: expr.chars().collect(),
+                    pos: 0,
+                    sheet,
+                    visited,
+                    depth,
+                };
+                let v = parser.parse_expr()?;
+                parser.skip_ws();
+                if parser.pos != parser.chars.len() {
+                    return Err(EvalError::Parse(format!(
+                        "trailing tokens at {} in formula",
+                        parser.pos
+                    )));
+                }
+                Ok(v)
             }
-            let mut p = Parser {
-                chars: expr.chars().collect(),
-                pos: 0,
-                sheet,
-                visited,
-            };
-            p.parse_expr()
         }
         CellValue::Empty => Ok(0.0),
         other => Err(EvalError::Type(format!(
@@ -79,6 +114,7 @@ struct Parser<'a> {
     pos: usize,
     sheet: &'a SheetSnapshot,
     visited: &'a mut BTreeSet<(usize, usize)>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -169,7 +205,10 @@ impl<'a> Parser<'a> {
                     .map_err(|_| EvalError::Parse(format!("bad number {s}")))
             }
             Some(c) if c.is_ascii_alphabetic() || c == '$' => {
-                // Function name or cell reference.
+                // Function name or cell reference ($A$1, $A1, A$1).
+                if c == '$' {
+                    self.bump();
+                }
                 let start = self.pos;
                 while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
                     self.bump();
@@ -182,7 +221,7 @@ impl<'a> Parser<'a> {
                 } else {
                     // Cell ref: letters may include $ already consumed? Re-read raw.
                     let (_, row, col) = self.finish_ref(&name)?;
-                    eval_cell_inner(self.sheet, row, col, self.visited)
+                    eval_cell_inner(self.sheet, row, col, self.visited, self.depth + 1)
                 }
             }
             other => Err(EvalError::Parse(format!(
@@ -217,7 +256,10 @@ impl<'a> Parser<'a> {
             .to_ascii_uppercase()
             .chars()
         {
-            col = col * 26 + (c as usize - 'A' as usize + 1);
+            col = col
+                .checked_mul(26)
+                .and_then(|v| v.checked_add(c as usize - 'A' as usize + 1))
+                .ok_or_else(|| EvalError::Ref("column too large".into()))?;
         }
         Ok((format!("{letters}{digits}"), row1 - 1, col - 1))
     }
@@ -245,9 +287,21 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(':') {
                     self.bump();
                     let (r1, c1) = self.parse_ref_token()?;
+                    let area = (r0.max(r1) - r0.min(r1) + 1) * (c0.max(c1) - c0.min(c1) + 1);
+                    if area > 100_000 {
+                        return Err(EvalError::Parse(format!(
+                            "range of {area} cells exceeds the 100000-cell evaluation cap"
+                        )));
+                    }
                     for r in r0.min(r1)..=r0.max(r1) {
                         for c in c0.min(c1)..=c0.max(c1) {
-                            values.push(eval_cell_inner(self.sheet, r, c, self.visited)?);
+                            // Excel semantics: SUM/COUNT ignore text
+                            // and empty cells in ranges.
+                            match eval_cell_inner(self.sheet, r, c, self.visited, self.depth + 1) {
+                                Ok(v) => values.push(v),
+                                Err(EvalError::Type(_)) => {}
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                 } else {
@@ -302,6 +356,15 @@ pub fn what_if(
     value: f64,
     target: (usize, usize),
 ) -> Result<(f64, f64), EvalError> {
+    if override_cell.0 > 10_000 || override_cell.1 > 1_000 || target.0 > 10_000 || target.1 > 1_000
+    {
+        return Err(EvalError::Ref(
+            "what-if coordinates beyond the 10000x1000 evaluation grid".into(),
+        ));
+    }
+    if !value.is_finite() {
+        return Err(EvalError::Type("what-if value must be finite".into()));
+    }
     let before = eval_cell(sheet, target.0, target.1)?;
     let mut cloned = sheet.clone();
     while cloned.cells.len() <= override_cell.0 {
@@ -352,8 +415,18 @@ mod tests {
 
     #[test]
     fn cycles_and_div_zero_are_typed_errors() {
-        let wb = parse_delimited("d", "S", "A,B\n=A1,=A1/0\n", ',');
+        // B1 references itself; C1 divides by zero literally.
+        let wb = parse_delimited("d", "S", "A,B,C\n1,=B2,=1/0\n", ',');
         let s = &wb.sheets[0];
-        assert!(matches!(eval_cell(s, 0, 1), Err(EvalError::Type(_))));
+        assert!(matches!(eval_cell(s, 1, 1), Err(EvalError::Cycle(_))));
+        assert!(matches!(eval_cell(s, 1, 2), Err(EvalError::Type(_))));
+        // Absolute refs and trailing-token rejection.
+        let wb2 = parse_delimited("d", "S", "A,B\n2,=$A$2*10\n", ',');
+        assert_eq!(eval_cell(&wb2.sheets[0], 1, 1).unwrap(), 20.0);
+        let wb3 = parse_delimited("d", "S", "A,B\n2,=A2%3\n", ',');
+        assert!(matches!(
+            eval_cell(&wb3.sheets[0], 1, 1),
+            Err(EvalError::Parse(_))
+        ));
     }
 }

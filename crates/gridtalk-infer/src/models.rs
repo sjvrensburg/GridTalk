@@ -49,15 +49,19 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], ModelError> {
-        if self.pos + n > self.b.len() {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| ModelError::NotGguf("length overflow in GGUF header".into()))?;
+        if end > self.b.len() {
             return Err(ModelError::Truncated(format!(
                 "need {n} bytes at {} of {}",
                 self.pos,
                 self.b.len()
             )));
         }
-        let s = &self.b[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.b[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
     fn u32(&mut self) -> Result<u32, ModelError> {
@@ -71,6 +75,15 @@ impl<'a> Reader<'a> {
         Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
     }
     fn skip_value(&mut self, ty: u32) -> Result<Option<String>, ModelError> {
+        self.skip_value_depth(ty, 0)
+    }
+
+    fn skip_value_depth(&mut self, ty: u32, depth: usize) -> Result<Option<String>, ModelError> {
+        if depth > 16 {
+            return Err(ModelError::NotGguf(
+                "GGUF metadata nested deeper than 16".into(),
+            ));
+        }
         match ty {
             0 | 1 | 7 => {
                 self.take(1)?;
@@ -93,8 +106,13 @@ impl<'a> Reader<'a> {
             9 => {
                 let elem = self.u32()?;
                 let count = self.u64()?;
+                if count > 1_000_000 {
+                    return Err(ModelError::NotGguf(format!(
+                        "GGUF array of {count} elements exceeds sanity cap"
+                    )));
+                }
                 for _ in 0..count {
-                    self.skip_value(elem)?;
+                    self.skip_value_depth(elem, depth + 1)?;
                 }
                 Ok(None)
             }
@@ -143,6 +161,24 @@ pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
         name: metadata.get("general.name").cloned(),
         metadata,
     })
+}
+
+/// Parse a GGUF header from a file without loading the whole
+/// (potentially multi-GB) model: reads the first 16 MiB, and only
+/// falls back to a full read if the header itself is larger.
+pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    (&mut file).take(16 * 1024 * 1024).read_to_end(&mut buf)?;
+    match parse_gguf(&buf) {
+        Ok(info) => Ok(info),
+        Err(ModelError::Truncated(_)) => {
+            let bytes = std::fs::read(path)?;
+            parse_gguf(&bytes)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn model_cache_dir() -> PathBuf {
@@ -202,10 +238,18 @@ impl ModelManager {
     }
 
     fn checked_name(name: &str) -> Result<String, ModelError> {
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        // Reject path traversal (separators, leading dot-dot) but
+        // allow interior dots, e.g. "model..v2.gguf".
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == ".."
+            || name.starts_with("../")
+        {
             return Err(ModelError::InvalidName(name.into()));
         }
-        let n = if name.ends_with(".gguf") {
+        let lower = name.to_ascii_lowercase();
+        let n = if lower.ends_with(".gguf") {
             name.to_string()
         } else {
             format!("{name}.gguf")
@@ -213,10 +257,11 @@ impl ModelManager {
         Ok(n)
     }
 
-    /// Copy a local GGUF file into the cache after validating it.
+    /// Copy a local GGUF file into the cache after validating its
+    /// header. Copies to a temp file and renames, so a crash never
+    /// leaves a half-written model in the cache.
     pub fn import(&self, src: &Path) -> Result<ModelEntry, ModelError> {
-        let bytes = std::fs::read(src)?;
-        let info = parse_gguf(&bytes)?;
+        let info = parse_gguf_file(src)?;
         std::fs::create_dir_all(&self.dir)?;
         let file_name = src
             .file_name()
@@ -225,11 +270,14 @@ impl ModelManager {
             .into_owned();
         let name = Self::checked_name(&file_name)?;
         let dest = self.dir.join(&name);
-        std::fs::write(&dest, &bytes)?;
+        let tmp = self.dir.join(format!(".{name}.tmp"));
+        std::fs::copy(src, &tmp)?;
+        let bytes = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        std::fs::rename(&tmp, &dest)?;
         Ok(ModelEntry {
             name,
             path: dest,
-            bytes: bytes.len() as u64,
+            bytes,
             info: Some(info),
         })
     }
@@ -241,9 +289,10 @@ impl ModelManager {
         Ok(())
     }
 
-    /// Download a GGUF over plain http (local mirrors / proxies).
-    /// https is refused with a typed error until a TLS transport
-    /// lands — never silently downgraded.
+    /// Download a GGUF over plain http (local mirrors / proxies),
+    /// streamed to a temp file (never held whole in RAM) and
+    /// renamed into place only after its header validates.
+    /// https is refused until a TLS transport lands.
     pub fn download_http(&self, url: &str, name: &str) -> Result<ModelEntry, ModelError> {
         if url.starts_with("https://") {
             return Err(ModelError::Http(
@@ -257,34 +306,57 @@ impl ModelManager {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        let mut stream = std::net::TcpStream::connect(host_port)?;
+        use std::net::ToSocketAddrs as _;
+        let addr = host_port
+            .to_socket_addrs()
+            .map_err(|e| ModelError::Http(format!("cannot resolve {host_port}: {e}")))?
+            .next()
+            .ok_or_else(|| ModelError::Http(format!("cannot resolve {host_port}")))?;
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .ok();
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nUser-Agent: GridTalk\r\n\r\n"
         );
         stream.write_all(req.as_bytes())?;
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
-        let split = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| ModelError::Http("malformed HTTP response".into()))?;
-        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-        if !head.contains(" 200") {
+        // Read headers byte-wise until CRLFCRLF.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = stream.read(&mut byte)?;
+            if n == 0 {
+                return Err(ModelError::Http("connection closed in headers".into()));
+            }
+            head.push(byte[0]);
+            if head.len() > 64 * 1024 {
+                return Err(ModelError::Http("headers too large".into()));
+            }
+        }
+        let head_text = String::from_utf8_lossy(&head).into_owned();
+        if !head_text.contains(" 200") {
             return Err(ModelError::Http(format!(
                 "unexpected status: {}",
-                head.lines().next().unwrap_or("")
+                head_text.lines().next().unwrap_or("")
             )));
         }
-        let body = &raw[split + 4..];
-        let info = parse_gguf(body)?;
         std::fs::create_dir_all(&self.dir)?;
         let name = Self::checked_name(name)?;
+        let tmp = self.dir.join(format!(".{name}.tmp"));
+        let mut out = std::fs::File::create(&tmp)?;
+        let copied = std::io::copy(&mut stream, &mut out)?;
+        drop(out);
+        let info = parse_gguf_file(&tmp).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e
+        })?;
         let dest = self.dir.join(&name);
-        std::fs::write(&dest, body)?;
+        std::fs::rename(&tmp, &dest)?;
         Ok(ModelEntry {
             name,
             path: dest,
-            bytes: body.len() as u64,
+            bytes: copied,
             info: Some(info),
         })
     }
@@ -321,6 +393,31 @@ mod tests {
         assert_eq!(info.architecture.as_deref(), Some("qwen3moe"));
         assert_eq!(info.name.as_deref(), Some("Synthetic Test Model"));
         assert!(parse_gguf(b"NOPE").is_err());
+    }
+
+    #[test]
+    fn regression_gguf_nesting_overflow_and_names() {
+        // Deeply nested array metadata must error, not overflow the stack.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        let key = "general.architecture";
+        b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        b.extend_from_slice(key.as_bytes());
+        b.extend_from_slice(&9u32.to_le_bytes()); // array
+        for _ in 0..40 {
+            b.extend_from_slice(&9u32.to_le_bytes()); // elem type: array
+            b.extend_from_slice(&1u64.to_le_bytes()); // count 1
+        }
+        b.extend_from_slice(&8u32.to_le_bytes());
+        assert!(parse_gguf(&b).is_err());
+        // Interior dots in names are fine; traversal is not.
+        assert!(ModelManager::checked_name("model..v2").is_ok());
+        assert!(ModelManager::checked_name("MODEL.GGUF").is_ok());
+        assert!(ModelManager::checked_name("../evil").is_err());
+        assert!(ModelManager::checked_name("a/b").is_err());
     }
 
     #[test]

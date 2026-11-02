@@ -58,7 +58,7 @@ pub fn probe_engine(engine: EngineKind, model_path: &Path) -> EngineReport {
         EngineKind::Candle => probe_candle(engine, model_path, arch),
         EngineKind::MistralRs => EngineReport {
             engine,
-            compiled_in: false,
+            compiled_in: engine.compiled_in(),
             gguf_arch: arch,
             tensor_count: None,
             loads: false,
@@ -66,7 +66,7 @@ pub fn probe_engine(engine: EngineKind, model_path: &Path) -> EngineReport {
         },
         EngineKind::LlamaCpp => EngineReport {
             engine,
-            compiled_in: false,
+            compiled_in: engine.compiled_in(),
             gguf_arch: arch,
             tensor_count: None,
             loads: false,

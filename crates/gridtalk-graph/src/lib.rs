@@ -4,7 +4,6 @@
 //! to snapshots so downstream code never touches live grid cells.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,8 +24,10 @@ impl CellValue {
             CellValue::Empty => String::new(),
             CellValue::Text(s) => s.clone(),
             CellValue::Number(n) => {
-                if n.fract() == 0.0 {
+                if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
                     format!("{}", *n as i64)
+                } else if n.fract() == 0.0 {
+                    format!("{n:.0}")
                 } else {
                     format!("{n}")
                 }
@@ -76,9 +77,25 @@ pub struct CellRef {
     pub col: usize, // 0-based
 }
 
+pub fn quote_sheet(name: &str) -> String {
+    if !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+    {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
+}
+
 impl CellRef {
     pub fn a1(&self) -> String {
-        format!("{}!{}{}", self.sheet, col_name(self.col), self.row + 1)
+        format!(
+            "{}!{}{}",
+            quote_sheet(&self.sheet),
+            col_name(self.col),
+            self.row + 1
+        )
     }
 }
 
@@ -107,7 +124,7 @@ impl RangeRef {
     pub fn a1(&self) -> String {
         format!(
             "{}!{}{}:{}{}",
-            self.sheet,
+            quote_sheet(&self.sheet),
             col_name(self.c0),
             self.r0 + 1,
             col_name(self.c1),
@@ -155,6 +172,47 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub regions: Vec<Region>,
+}
+
+/// Region/Column node ids sorted by ascending range area, so the
+/// first containing node is the most specific. Built once and
+/// reused across all lookups (graph construction is not quadratic
+/// in node count per cell).
+pub fn specificity_index(g: &Graph) -> Vec<usize> {
+    let mut idx: Vec<usize> = g
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Region | NodeKind::Column) && n.range.is_some())
+        .map(|n| n.id)
+        .collect();
+    let area = |id: &usize| {
+        g.nodes
+            .iter()
+            .find(|n| n.id == *id)
+            .and_then(|n| n.range.as_ref())
+            .map(|r| (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1))
+            .unwrap_or(usize::MAX)
+    };
+    idx.sort_by_key(|id| area(id));
+    idx
+}
+
+/// Index-based lookup: node ids are assigned sequentially, so
+/// `g.nodes[id]` is the node with that id.
+pub fn node_for_cell_in(
+    g: &Graph,
+    index: &[usize],
+    sheet: &str,
+    row: usize,
+    col: usize,
+) -> Option<usize> {
+    index.iter().copied().find(|id| {
+        g.nodes
+            .get(*id)
+            .and_then(|n| n.range.as_ref())
+            .map(|r| r.sheet == sheet && r.contains(row, col))
+            .unwrap_or(false)
+    })
 }
 
 impl Graph {
@@ -253,7 +311,7 @@ pub fn load_gridcraft_bytes(
         gridcraft_xlsx::read_xlsx(bytes)
     }
     .map_err(|e| IngestError::Parse(format!("gridcraft {ext} reader: {e}")))?;
-    Ok(from_gridcraft_workbook(name, &wb))
+    from_gridcraft_workbook(name, &wb)
 }
 
 #[cfg(not(feature = "gridcraft"))]
@@ -273,7 +331,14 @@ pub fn load_gridcraft_bytes(
 /// canonical text; the cached value (when Gridcraft has one) is kept
 /// alongside so passages can show both.
 #[cfg(feature = "gridcraft")]
-pub fn from_gridcraft_workbook(name: &str, wb: &gridcraft_model::Workbook) -> WorkbookSnapshot {
+/// Cap on densified snapshot cells per sheet: a sparse XLSX with a
+/// single cell at XFD1048576 must not allocate a billion-cell grid.
+pub const MAX_SNAPSHOT_CELLS: usize = 4_000_000;
+
+pub fn from_gridcraft_workbook(
+    name: &str,
+    wb: &gridcraft_model::Workbook,
+) -> Result<WorkbookSnapshot, IngestError> {
     use gridcraft_core::Value;
     let mut sheets = Vec::new();
     for sheet in &wb.sheets {
@@ -281,6 +346,13 @@ pub fn from_gridcraft_workbook(name: &str, wb: &gridcraft_model::Workbook) -> Wo
         for (addr, _) in sheet.cells.iter() {
             max_row = max_row.max(addr.row as usize);
             max_col = max_col.max(addr.col as usize);
+        }
+        let area = (max_row as u64 + 1).saturating_mul(max_col as u64 + 1);
+        if area > MAX_SNAPSHOT_CELLS as u64 {
+            return Err(IngestError::Parse(format!(
+                "sheet {} is too sparse to snapshot ({area} cells > {MAX_SNAPSHOT_CELLS}); trim empty rows/columns at the edges",
+                sheet.name
+            )));
         }
         let mut cells = vec![vec![CellValue::Empty; max_col + 1]; max_row + 1];
         if sheet.cells.iter().next().is_none() {
@@ -308,10 +380,10 @@ pub fn from_gridcraft_workbook(name: &str, wb: &gridcraft_model::Workbook) -> Wo
             cells,
         });
     }
-    WorkbookSnapshot {
+    Ok(WorkbookSnapshot {
         name: name.into(),
         sheets,
-    }
+    })
 }
 
 /// Serialise a snapshot to XLSX bytes via Gridcraft (used for
@@ -331,10 +403,19 @@ pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
                     CellValue::Text(t) => gs.set_value(addr, Value::Text(t.as_str().into())),
                     CellValue::Number(n) => gs.set_value(addr, Value::Number(*n)),
                     CellValue::Bool(b) => gs.set_value(addr, Value::Bool(*b)),
-                    CellValue::Formula { expr, .. } => gs.set_cell(
-                        addr,
-                        gridcraft_model::Cell::formula(gridcraft_model::Formula::new(expr)),
-                    ),
+                    CellValue::Formula { expr, cached } => {
+                        let mut cell =
+                            gridcraft_model::Cell::formula(gridcraft_model::Formula::new(expr));
+                        if let Some(cached) = cached {
+                            cell.value = match cached.as_ref() {
+                                CellValue::Number(n) => Value::Number(*n),
+                                CellValue::Bool(b) => Value::Bool(*b),
+                                CellValue::Text(s) => Value::Text(s.as_str().into()),
+                                _ => Value::Empty,
+                            };
+                        }
+                        gs.set_cell(addr, cell)
+                    }
                 }
             }
         }
@@ -349,16 +430,13 @@ pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
 }
 
 pub fn parse_delimited(name: &str, sheet: &str, text: &str, delim: char) -> WorkbookSnapshot {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut rows: Vec<Vec<CellValue>> = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() && rows.is_empty() {
+    for fields in split_delimited_stream(text, delim) {
+        if fields.len() == 1 && fields[0].is_empty() && rows.is_empty() {
             continue;
         }
-        let row = split_delimited(line, delim)
-            .into_iter()
-            .map(|f| infer_value(&f))
-            .collect();
-        rows.push(row);
+        rows.push(fields.into_iter().map(|f| infer_value(&f)).collect());
     }
     WorkbookSnapshot {
         name: name.into(),
@@ -369,12 +447,25 @@ pub fn parse_delimited(name: &str, sheet: &str, text: &str, delim: char) -> Work
     }
 }
 
-fn split_delimited(line: &str, delim: char) -> Vec<String> {
-    // Minimal RFC4180-style splitter: handles double-quoted fields.
-    let mut out = Vec::new();
+/// RFC4180-style stream splitter: quoted fields may contain the
+/// delimiter, newlines and leading/trailing spaces (preserved);
+/// unquoted fields are trimmed. `""` inside quotes is a quote.
+fn split_delimited_stream(text: &str, delim: char) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<String> = Vec::new();
     let mut cur = String::new();
+    let mut quoted = false;
     let mut in_q = false;
-    let mut chars = line.chars().peekable();
+    let mut field_quoted = false;
+    let mut chars = text.chars().peekable();
+    let push_field = |row: &mut Vec<String>, cur: &mut String, field_quoted: bool| {
+        let v = std::mem::take(cur);
+        row.push(if field_quoted {
+            v
+        } else {
+            v.trim().to_string()
+        });
+    };
     while let Some(ch) = chars.next() {
         if in_q {
             if ch == '"' {
@@ -387,17 +478,31 @@ fn split_delimited(line: &str, delim: char) -> Vec<String> {
             } else {
                 cur.push(ch);
             }
-        } else if ch == '"' {
+        } else if ch == '"' && cur.is_empty() && !quoted {
             in_q = true;
+            quoted = true;
+            field_quoted = true;
         } else if ch == delim {
-            out.push(cur.trim().to_string());
-            cur = String::new();
+            push_field(&mut row, &mut cur, field_quoted);
+            quoted = false;
+            field_quoted = false;
+        } else if ch == '\n' || ch == '\r' {
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            push_field(&mut row, &mut cur, field_quoted);
+            quoted = false;
+            field_quoted = false;
+            rows.push(std::mem::take(&mut row));
         } else {
             cur.push(ch);
         }
     }
-    out.push(cur.trim().to_string());
-    out
+    if !cur.is_empty() || !row.is_empty() || field_quoted {
+        push_field(&mut row, &mut cur, field_quoted);
+        rows.push(row);
+    }
+    rows
 }
 
 fn infer_value(f: &str) -> CellValue {
@@ -411,7 +516,10 @@ fn infer_value(f: &str) -> CellValue {
         };
     }
     if let Ok(n) = f.parse::<f64>() {
-        return CellValue::Number(n);
+        if n.is_finite() {
+            return CellValue::Number(n);
+        }
+        return CellValue::Text(f.to_string());
     }
     match f.to_ascii_lowercase().as_str() {
         "true" => CellValue::Bool(true),
@@ -420,90 +528,236 @@ fn infer_value(f: &str) -> CellValue {
     }
 }
 
-/// Extract A1-style references (e.g. B2, $A$1:B9 parts split upstream)
-/// from a formula expression. Returns (row, col) 0-based pairs.
-pub fn formula_refs(expr: &str) -> Vec<(usize, usize)> {
-    let bytes = expr.as_bytes();
+/// One formula reference, with its sheet qualifier when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedRef {
+    pub sheet: Option<String>,
+    pub row: usize,
+    pub col: usize,
+}
+
+fn parse_a1_at(chars: &[char], mut i: usize) -> Option<(usize, usize, usize)> {
+    // Optional $, letters, optional $, digits. Returns (row, col, next).
+    if i < chars.len() && chars[i] == '$' {
+        i += 1;
+    }
+    let ls = i;
+    while i < chars.len() && chars[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == ls || i - ls > 3 {
+        return None;
+    }
+    let letters: String = chars[ls..i].iter().collect();
+    if i < chars.len() && chars[i] == '$' {
+        i += 1;
+    }
+    let ds = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == ds {
+        return None;
+    }
+    let row1: usize = chars[ds..i].iter().collect::<String>().parse().ok()?;
+    if row1 == 0 {
+        return None;
+    }
+    let mut col = 0usize;
+    for c in letters.to_ascii_uppercase().chars() {
+        col = col
+            .checked_mul(26)?
+            .checked_add(c as usize - 'A' as usize + 1)?;
+    }
+    Some((row1 - 1, col - 1, i))
+}
+
+/// Extract references from a formula, expanding ranges to every
+/// interior cell. String literals and numbers (including scientific
+/// notation like 1E5) never produce references. Sheet-qualified
+/// refs (`Sheet2!A1`, `'My Sheet'!A1:B2`) keep their sheet.
+pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
+    let chars: Vec<char> = expr.chars().collect();
     let mut refs = Vec::new();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'$' {
-            let start = i;
-            let mut j = i;
-            while j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'$') {
-                j += 1;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
             }
-            let letters: String = expr[start..j].chars().filter(|c| *c != '$').collect();
-            let mut k = j;
-            while k < bytes.len() && bytes[k].is_ascii_digit() {
-                k += 1;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+        {
+            // Skip a numeric literal incl. exponent.
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
             }
-            if !letters.is_empty() && k > j && letters.len() <= 3 {
-                if let Ok(row1) = expr[j..k].parse::<usize>() {
-                    if row1 >= 1 {
-                        let mut col = 0usize;
-                        for c in letters.to_ascii_uppercase().chars() {
-                            col = col * 26 + (c as usize - 'A' as usize + 1);
-                        }
-                        refs.push((row1 - 1, col - 1));
-                        i = k;
-                        continue;
+            if i < chars.len() && (chars[i] == 'E' || chars[i] == 'e') {
+                let mut j = i + 1;
+                if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_digit() {
+                    i = j;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
                     }
                 }
             }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
+            continue;
         }
+        // Sheet qualifier: Name! or 'Quoted Name'!
+        let mut sheet: Option<String> = None;
+        let mut start = i;
+        if c == '\'' {
+            let mut j = i + 1;
+            let mut name = String::new();
+            while j < chars.len() && chars[j] != '\'' {
+                name.push(chars[j]);
+                j += 1;
+            }
+            if j + 1 < chars.len() && chars[j] == '\'' && chars[j + 1] == '!' {
+                sheet = Some(name);
+                start = j + 2;
+            }
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < chars.len()
+                && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
+            {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '!' {
+                sheet = Some(chars[i..j].iter().collect());
+                start = j + 1;
+            }
+        }
+        let at = if sheet.is_some() { start } else { i };
+        if let Some((r0, c0, next)) = parse_a1_at(&chars, at) {
+            // Range?
+            if next < chars.len() && chars[next] == ':' {
+                if let Some((r1, c1, end)) = parse_a1_at(&chars, next + 1) {
+                    let (lo_r, hi_r) = (r0.min(r1), r0.max(r1));
+                    let (lo_c, hi_c) = (c0.min(c1), c0.max(c1));
+                    // Cap expansion; huge ranges are represented by corners + interior sampling is wrong,
+                    // so refuse to expand beyond 100k cells and emit corners only with full expansion below that.
+                    if (hi_r - lo_r + 1).saturating_mul(hi_c - lo_c + 1) <= 100_000 {
+                        for r in lo_r..=hi_r {
+                            for cc in lo_c..=hi_c {
+                                refs.push(QualifiedRef {
+                                    sheet: sheet.clone(),
+                                    row: r,
+                                    col: cc,
+                                });
+                            }
+                        }
+                    } else {
+                        refs.push(QualifiedRef {
+                            sheet: sheet.clone(),
+                            row: r0,
+                            col: c0,
+                        });
+                        refs.push(QualifiedRef {
+                            sheet: sheet.clone(),
+                            row: r1,
+                            col: c1,
+                        });
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            refs.push(QualifiedRef {
+                sheet,
+                row: r0,
+                col: c0,
+            });
+            i = next;
+            continue;
+        }
+        i += 1;
     }
     refs
+}
+
+/// Extract A1-style references from a formula expression.
+/// Returns (row, col) 0-based pairs, ranges expanded.
+pub fn formula_refs(expr: &str) -> Vec<(usize, usize)> {
+    formula_refs_qualified(expr)
+        .into_iter()
+        .map(|q| (q.row, q.col))
+        .collect()
 }
 
 /// Detect contiguous non-empty rectangular regions per sheet and infer
 /// a header row (first row all-text, row below contains a number).
 pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
+    // Connected-component (4-neighbour) bounding boxes: a region is
+    // the rectangle enclosing a contiguous block of non-empty cells,
+    // whatever the per-row widths are.
+    let rows = sheet.cells.len();
+    let cols = sheet.max_col();
+    let mut visited = vec![vec![false; cols]; rows];
     let mut regions = Vec::new();
-    let mut visited = vec![vec![false; sheet.max_col()]; sheet.cells.len()];
-    for r in 0..sheet.cells.len() {
-        for c in 0..sheet.max_col() {
+    for r in 0..rows {
+        for c in 0..cols {
             if visited[r][c] || sheet.get(r, c).is_empty() {
                 continue;
             }
-            // Grow rectangle right/down while cells are non-empty.
-            let mut r1 = r;
-            let mut c1 = c;
-            while c1 + 1 < sheet.max_col() && !sheet.get(r, c1 + 1).is_empty() {
-                c1 += 1;
-            }
-            while r1 + 1 < sheet.cells.len() && (c..=c1).any(|cc| !sheet.get(r1 + 1, cc).is_empty())
-            {
-                r1 += 1;
-            }
-            for rr in r..=r1 {
-                for cc in c..=c1 {
-                    if rr < visited.len() && cc < visited[rr].len() {
-                        visited[rr][cc] = true;
+            let (mut r0, mut r1, mut c0, mut c1) = (r, r, c, c);
+            let mut stack = vec![(r, c)];
+            visited[r][c] = true;
+            while let Some((cr, cc)) = stack.pop() {
+                r0 = r0.min(cr);
+                r1 = r1.max(cr);
+                c0 = c0.min(cc);
+                c1 = c1.max(cc);
+                for (nr, nc) in [
+                    (cr.wrapping_sub(1), cc),
+                    (cr + 1, cc),
+                    (cr, cc.wrapping_sub(1)),
+                    (cr, cc + 1),
+                ] {
+                    if nr < rows && nc < cols && !visited[nr][nc] && !sheet.get(nr, nc).is_empty() {
+                        visited[nr][nc] = true;
+                        stack.push((nr, nc));
                     }
                 }
             }
-            let first_all_text = (c..=c1).all(|cc| matches!(sheet.get(r, cc), CellValue::Text(_)));
-            let below_has_num =
-                r1 > r && (c..=c1).any(|cc| matches!(sheet.get(r + 1, cc), CellValue::Number(_)));
-            let header_row = if first_all_text && below_has_num {
-                Some(r)
+            // Mark the whole bounding box so interior blanks do not reseed.
+            for row in visited.iter_mut().take(r1 + 1).skip(r0) {
+                for cell in row.iter_mut().take(c1 + 1).skip(c0) {
+                    *cell = true;
+                }
+            }
+            let first_all_text =
+                (c0..=c1).all(|cc| matches!(sheet.get(r0, cc), CellValue::Text(_)));
+            let below_has_typed = r1 > r0
+                && (c0..=c1).any(|cc| {
+                    matches!(
+                        sheet.get(r0 + 1, cc),
+                        CellValue::Number(_) | CellValue::Bool(_) | CellValue::Formula { .. }
+                    )
+                });
+            let header_row = if first_all_text && below_has_typed {
+                Some(r0)
             } else {
                 None
             };
             let headers = if header_row.is_some() {
-                (c..=c1).map(|cc| sheet.get(r, cc).display()).collect()
+                (c0..=c1).map(|cc| sheet.get(r0, cc).display()).collect()
             } else {
-                (c..=c1).map(col_name).collect()
+                (c0..=c1).map(col_name).collect()
             };
             regions.push(Region {
                 range: RangeRef {
                     sheet: sheet.name.clone(),
-                    r0: r,
-                    c0: c,
+                    r0,
+                    c0,
                     r1,
                     c1,
                 },
@@ -515,9 +769,6 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
     regions
 }
 
-/// Build the lifted graph. Formula dependencies are lifted to the
-/// region containing the referenced cell, so edges are region->region,
-/// never cell->cell. Returns the graph plus invariant violations.
 pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
     let mut g = Graph::default();
     let mut next = 0usize;
@@ -534,7 +785,6 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             id
         };
     let wb_id = push(&mut g, NodeKind::Workbook, wb.name.clone(), None);
-    let mut region_node: BTreeMap<String, usize> = BTreeMap::new();
     for sheet in &wb.sheets {
         let srange = if sheet.cells.is_empty() {
             None
@@ -556,7 +806,6 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
         for region in detect_regions(sheet) {
             let label = format!("{} region {}", sheet.name, region.range.a1());
             let rid = push(&mut g, NodeKind::Region, label, Some(region.range.clone()));
-            region_node.insert(region.range.a1(), rid);
             g.edges.push(Edge {
                 from: sid,
                 to: rid,
@@ -581,17 +830,20 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             g.regions.push(region);
         }
     }
-    // Lifted dependency edges, re-derived from formulas.
+    // Lifted dependency edges, re-derived from formulas. Targets are
+    // resolved on their own sheet (Sheet2!A1 does not mean this sheet),
+    // using a pre-sorted specificity index instead of rescanning nodes.
+    let specificity = specificity_index(&g);
     let mut seen = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    let src = g.node_for_cell(&sheet.name, r, c).map(|n| n.id);
-                    for (rr, cc) in formula_refs(expr) {
-                        if let (Some(s), Some(t)) =
-                            (src, g.node_for_cell(&sheet.name, rr, cc).map(|n| n.id))
-                        {
+                    let src = node_for_cell_in(&g, &specificity, &sheet.name, r, c);
+                    for q in formula_refs_qualified(expr) {
+                        let target_sheet = q.sheet.as_deref().unwrap_or(&sheet.name);
+                        let dst = node_for_cell_in(&g, &specificity, target_sheet, q.row, q.col);
+                        if let (Some(s), Some(t)) = (src, dst) {
                             if s != t && seen.insert((s, t)) {
                                 g.edges.push(Edge {
                                     from: s,
@@ -613,20 +865,69 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
 /// and vice versa. Mirrors ExcelGRAG's lifted-edge invariant test.
 pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
     let mut problems = Vec::new();
+    // Structural invariants, independent of how edges were derived:
+    // unique ids, in-bounds ranges, containment edges actually contain.
+    let mut ids = std::collections::BTreeSet::new();
+    for n in &g.nodes {
+        if !ids.insert(n.id) {
+            problems.push(format!("duplicate node id {}", n.id));
+        }
+        if let Some(r) = &n.range {
+            match wb.sheets.iter().find(|s| s.name == r.sheet) {
+                None => problems.push(format!("node {} range on unknown sheet {}", n.id, r.sheet)),
+                Some(s) => {
+                    if r.r1 >= s.cells.len().max(1) && !s.cells.is_empty() && r.r1 >= s.cells.len()
+                    {
+                        // Regions are built from the sheet, so this flags hand-made graphs.
+                        if r.r0 > r.r1 || r.c0 > r.c1 {
+                            problems.push(format!("node {} has inverted range", n.id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for e in &g.edges {
+        if e.kind == "contains" {
+            let parent = g
+                .nodes
+                .iter()
+                .find(|n| n.id == e.from)
+                .and_then(|n| n.range.as_ref());
+            let child = g
+                .nodes
+                .iter()
+                .find(|n| n.id == e.to)
+                .and_then(|n| n.range.as_ref());
+            if let (Some(pa), Some(ch)) = (parent, child) {
+                if pa.sheet == ch.sheet
+                    && !(pa.r0 <= ch.r0 && pa.c0 <= ch.c0 && pa.r1 >= ch.r1 && pa.c1 >= ch.c1)
+                {
+                    problems.push(format!(
+                        "contains edge {}->{} does not contain",
+                        e.from, e.to
+                    ));
+                }
+            }
+        }
+    }
+    // Lifted-edge completeness, re-derived independently (qualified refs).
     let lifted: std::collections::BTreeSet<(usize, usize)> = g
         .edges
         .iter()
         .filter(|e| e.kind == "depends_on")
         .map(|e| (e.from, e.to))
         .collect();
+    let specificity = specificity_index(g);
     let mut expected = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    if let Some(s) = g.node_for_cell(&sheet.name, r, c).map(|n| n.id) {
-                        for (rr, cc) in formula_refs(expr) {
-                            if let Some(t) = g.node_for_cell(&sheet.name, rr, cc).map(|n| n.id) {
+                    if let Some(s) = node_for_cell_in(g, &specificity, &sheet.name, r, c) {
+                        for q in formula_refs_qualified(expr) {
+                            let ts = q.sheet.as_deref().unwrap_or(&sheet.name);
+                            if let Some(t) = node_for_cell_in(g, &specificity, ts, q.row, q.col) {
                                 if s != t {
                                     expected.insert((s, t));
                                 }
@@ -669,6 +970,7 @@ pub struct IncrementalSnapshot {
     last_edit: Option<std::time::Instant>,
     pub debounce: std::time::Duration,
     pub revision: u64,
+    dropped: usize,
 }
 
 impl IncrementalSnapshot {
@@ -680,6 +982,7 @@ impl IncrementalSnapshot {
             last_edit: None,
             debounce: std::time::Duration::from_millis(500),
             revision: 0,
+            dropped: 0,
         }
     }
 
@@ -708,7 +1011,8 @@ impl IncrementalSnapshot {
     pub fn poll(&mut self, now: std::time::Instant) -> bool {
         let due = self
             .last_edit
-            .map(|t| now.duration_since(t) >= self.debounce)
+            .and_then(|t| now.checked_duration_since(t))
+            .map(|d| d >= self.debounce)
             .unwrap_or(false);
         if due && !self.pending.is_empty() {
             self.flush();
@@ -718,10 +1022,24 @@ impl IncrementalSnapshot {
         }
     }
 
+    /// Edits dropped because their sheet does not exist (cumulative).
+    pub fn dropped_edits(&self) -> usize {
+        self.dropped
+    }
+
     /// Apply pending edits immediately, patching only edited cells.
-    pub fn flush(&mut self) {
+    /// Returns how many edits were applied; edits to unknown sheets
+    /// are counted in `dropped_edits` instead of vanishing silently.
+    pub fn flush(&mut self) -> usize {
         let edits = std::mem::take(&mut self.pending);
+        let mut applied = 0usize;
         for edit in edits {
+            let known = self.snapshot.sheets.iter().any(|s| s.name == edit.sheet);
+            if !known {
+                self.dropped += 1;
+                continue;
+            }
+            applied += 1;
             if let Some(sheet) = self
                 .snapshot
                 .sheets
@@ -738,7 +1056,10 @@ impl IncrementalSnapshot {
                 row[edit.col] = edit.value;
             }
         }
-        self.revision += 1;
+        if applied > 0 {
+            self.revision += 1;
+        }
+        applied
     }
 
     /// Dirty ranges since the last flush, then clears the list.
@@ -864,6 +1185,52 @@ mod tests {
         assert_eq!(wb.sheets[0].get(0, 0), CellValue::Text("Item".into()));
         assert_eq!(wb.sheets[0].get(1, 0), CellValue::Text("Apples".into()));
         assert_eq!(wb.sheets[0].get(1, 1), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn refs_expand_ranges_and_skip_literals() {
+        // Range expands to all 6 interior cells.
+        assert_eq!(formula_refs("SUM(A1:B3)").len(), 6);
+        // String literal and scientific notation produce no refs.
+        assert_eq!(formula_refs("\"A1\"&1E5+B2"), vec![(1, 1)]);
+        // Sheet-qualified refs keep their sheet.
+        let q = formula_refs_qualified("Sheet2!A1+'My Sheet'!B2");
+        assert_eq!(q[0].sheet.as_deref(), Some("Sheet2"));
+        assert_eq!(q[1].sheet.as_deref(), Some("My Sheet"));
+    }
+
+    #[test]
+    fn csv_stream_handles_bom_multiline_and_quoted_spaces() {
+        let wb = parse_delimited(
+            "d",
+            "S",
+            "\u{feff}Name,Note\n\"  spaced  \",\"line1\nline2\"\n",
+            ',',
+        );
+        assert_eq!(wb.sheets[0].get(0, 0), CellValue::Text("Name".into()));
+        assert_eq!(wb.sheets[0].get(1, 0), CellValue::Text("  spaced  ".into()));
+        assert_eq!(
+            wb.sheets[0].get(1, 1),
+            CellValue::Text("line1\nline2".into())
+        );
+        // NaN / inf stay text, never numbers.
+        let wb2 = parse_delimited("d", "S", "A\nNaN\n", ',');
+        assert_eq!(wb2.sheets[0].get(1, 0), CellValue::Text("NaN".into()));
+    }
+
+    #[test]
+    fn cross_sheet_formula_lifts_to_other_sheet() {
+        let mut wb = parse_delimited("d", "Sheet1", "A,B\n1,=Sheet2!A2\n", ',');
+        wb.sheets.push(SheetSnapshot {
+            name: "Sheet2".into(),
+            cells: vec![
+                vec![CellValue::Text("X".into())],
+                vec![CellValue::Number(9.0)],
+            ],
+        });
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert!(g.edges.iter().any(|e| e.kind == "depends_on"));
     }
 
     #[test]

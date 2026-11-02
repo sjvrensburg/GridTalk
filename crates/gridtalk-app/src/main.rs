@@ -57,8 +57,27 @@ fn main() {
     }
 }
 
+const COMMANDS: &[&str] = &[
+    "ask",
+    "investigate",
+    "graph",
+    "view",
+    "spike",
+    "generate",
+    "models",
+    "open-in-gridcraft",
+    "help",
+    "--help",
+    "-h",
+];
+
 fn run(args: &[String]) -> Result<(), String> {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
+    if !COMMANDS.contains(&cmd) {
+        return Err(format!(
+            "unknown command {cmd:?}; run `gridtalk help` for usage"
+        ));
+    }
     match cmd {
         "ask" => {
             let file = args
@@ -88,6 +107,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 .collect::<Vec<_>>()
                 .join("\n---\n");
             let cfg = config_from_env();
+            warn_if_external(&cfg);
             let backend = backend_from_config(&cfg.inference);
             let req = ChatRequest {
                 system: "You answer questions about a spreadsheet using only the cited context. Always cite the range.".into(),
@@ -111,7 +131,10 @@ fn run(args: &[String]) -> Result<(), String> {
         "graph" => {
             let file = args.get(2).ok_or("usage: gridtalk graph <file.csv>")?;
             let wb = load_workbook(file)?;
-            let (graph, _) = build_graph(&wb);
+            let (graph, violations) = build_graph(&wb);
+            if !violations.is_empty() {
+                eprintln!("warning: graph invariants violated: {violations:?}");
+            }
             for n in &graph.nodes {
                 let kind = match n.kind {
                     NodeKind::Workbook => "workbook",
@@ -130,7 +153,13 @@ fn run(args: &[String]) -> Result<(), String> {
             // Terminal rendering of the dual view: grid left, graph right.
             let file = args.get(2).ok_or("usage: gridtalk view <file.csv>")?;
             let wb = load_workbook(file)?;
-            let (graph, _) = build_graph(&wb);
+            if wb.sheets.is_empty() {
+                return Err("workbook has no sheets".into());
+            }
+            let (graph, violations) = build_graph(&wb);
+            if !violations.is_empty() {
+                eprintln!("warning: graph invariants violated: {violations:?}");
+            }
             let mut state = ViewState::default();
             if let Some(sheet) = wb.sheets.first() {
                 println!("Sheet: {}", sheet.name);
@@ -155,7 +184,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     state.selected_range.as_ref().map(|r| r.a1())
                 );
             }
-            state.select_cell(&graph, &wb.sheets[0].name, 1, 1);
+            state.select_cell(
+                &graph,
+                wb.sheets.first().map(|s| s.name.as_str()).unwrap_or(""),
+                1,
+                1,
+            );
             println!(
                 "select_cell(B2) -> highlighted_node {:?}",
                 state.highlighted_node
@@ -183,7 +217,9 @@ fn run(args: &[String]) -> Result<(), String> {
             };
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
-            let inv = investigate::investigate(&question, &tools, backend.as_ref(), 8);
+            warn_if_external(&cfg);
+            let inv = investigate::investigate(&question, &tools, backend.as_ref(), 8)
+                .map_err(|e| format!("backend failed: {e}"))?;
             for step in &inv.trail {
                 println!(
                     "[tool] {} ({}) -> {}",
@@ -219,6 +255,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     .ok_or("usage: gridtalk generate <model.gguf> <tokenizer.json> <prompt...>")?;
                 let tokenizer = args.get(3).ok_or("missing tokenizer.json path")?;
                 let prompt = args[4..].join(" ");
+                if prompt.trim().is_empty() {
+                    return Err("usage: gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (prompt must not be empty)".into());
+                }
                 let backend = gridtalk_infer::generate::CandleLlamaBackend {
                     model_path: std::path::PathBuf::from(model),
                     tokenizer_path: std::path::PathBuf::from(tokenizer),
@@ -291,6 +330,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     println!("removed {name}");
                     Ok(())
                 }
+                Some(other) => Err(format!(
+                    "unknown models subcommand {other:?}; usage: gridtalk models [import <file.gguf>|remove <name>]"
+                )),
                 _ => {
                     let entries = mgr.list();
                     if entries.is_empty() {
@@ -309,10 +351,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        _ => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk models [import <file.gguf>|remove <name>]\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+        "help" | "--help" | "-h" => {
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <tokenizer.json> <prompt...> (candle-gen builds)\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
+        _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),
     }
 }
 
@@ -324,14 +367,48 @@ pub fn gridcraft_binary() -> Option<std::path::PathBuf> {
             return Some(path);
         }
     }
+    let exe_name = if cfg!(windows) {
+        "gridcraft.exe"
+    } else {
+        "gridcraft"
+    };
+    // Beside the running executable (installed layouts).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // PATH lookup.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Build tree (development).
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     for profile in ["release", "debug"] {
-        let candidate = root.join(format!("vendor/gridcraft/target/{profile}/gridcraft"));
+        let candidate = root.join(format!("vendor/gridcraft/target/{profile}/{exe_name}"));
         if candidate.exists() {
             return Some(candidate);
         }
     }
     None
+}
+
+/// Warn (once per invocation) before passages leave the machine.
+fn warn_if_external(cfg: &Config) {
+    if cfg.inference.backend == "openai-compatible" {
+        let url = cfg.inference.base_url.as_deref().unwrap_or("");
+        eprintln!(
+            "gridtalk: note: external backend {url} will receive spreadsheet passages (including cell values) verbatim. Use a local model or a redacting proxy if that is not acceptable."
+        );
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

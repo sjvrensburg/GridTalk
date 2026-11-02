@@ -4,7 +4,8 @@
 //! docs/decisions/0002-no-redaction.md).
 
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::Write;
+use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -122,6 +123,31 @@ impl ChatBackend for EchoBackend {
     }
 }
 
+/// Backend for an engine that was requested but is not compiled
+/// into this build. Surfaces a typed error instead of silently
+/// falling back to echo, so misconfiguration is visible.
+pub struct UnavailableBackend {
+    pub engine: String,
+    pub reason: String,
+}
+
+impl ChatBackend for UnavailableBackend {
+    fn name(&self) -> &str {
+        "unavailable"
+    }
+    fn stream(
+        &self,
+        _req: &ChatRequest,
+        _cancel: &CancelToken,
+        _on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), InferError> {
+        Err(InferError::EngineUnavailable(format!(
+            "engine '{}' requested but not available: {}",
+            self.engine, self.reason
+        )))
+    }
+}
+
 /// Probe the local engine ladder and return the first compiled-in
 /// rung. The Phase 3 spike replaces `compiled_in` with a runtime
 /// load test per engine (see docs/spikes/inference-engine.md).
@@ -141,6 +167,129 @@ pub struct OpenAiCompatibleBackend {
     pub api_key: Option<String>,
 }
 
+fn reject_crlf(field: &str, value: &str) -> Result<(), InferError> {
+    if value.contains(['\r', '\n']) {
+        return Err(InferError::Http(format!("{field} contains CR/LF")));
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host_port: &str) -> bool {
+    let host = host_port
+        .trim_start_matches('[')
+        .split([':', ']'])
+        .next()
+        .unwrap_or("");
+    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
+}
+
+fn connect_timeout(host_port: &str) -> Result<std::net::TcpStream, InferError> {
+    let addrs: Vec<std::net::SocketAddr> = host_port
+        .to_socket_addrs()
+        .map_err(|e| InferError::Http(format!("cannot resolve {host_port}: {e}")))?
+        .collect();
+    let mut last: Option<InferError> = None;
+    for addr in addrs {
+        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
+            Ok(s) => {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                    .ok();
+                s.set_write_timeout(Some(std::time::Duration::from_secs(30)))
+                    .ok();
+                return Ok(s);
+            }
+            Err(e) => last = Some(InferError::Io(e)),
+        }
+    }
+    Err(last.unwrap_or_else(|| InferError::Http(format!("cannot resolve {host_port}"))))
+}
+
+fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| InferError::Http("bad chunked encoding (size line)".into()))?;
+        let size_str = String::from_utf8_lossy(&rest[..line_end])
+            .trim()
+            .to_string();
+        let size = usize::from_str_radix(&size_str, 16)
+            .map_err(|_| InferError::Http(format!("bad chunk size {size_str:?}")))?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        if rest.len() < size + 2 {
+            return Err(InferError::Http("truncated chunk".into()));
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
+        if out.len() > 16 * 1024 * 1024 {
+            return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+        }
+    }
+}
+
+/// Read an HTTP/1.1 response (status checked, chunked decoded,
+/// 16 MiB cap) and return the body text.
+fn read_http_response(stream: &mut std::net::TcpStream) -> Result<String, InferError> {
+    use std::io::Read as _;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() > 16 * 1024 * 1024 {
+            return Err(InferError::Http("response exceeds 16 MiB cap".into()));
+        }
+    }
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| InferError::Http("malformed HTTP response".into()))?;
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status: u32 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| InferError::Http("missing HTTP status".into()))?;
+    if (300..400).contains(&status) {
+        let loc = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("location:")
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        return Err(InferError::Http(format!(
+            "endpoint redirected (HTTP {status} -> {loc}); redirects are not followed, configure the final URL"
+        )));
+    }
+    if !(200..300).contains(&status) {
+        return Err(InferError::Http(format!(
+            "endpoint returned HTTP {status}: {}",
+            String::from_utf8_lossy(&raw[split + 4..])
+                .chars()
+                .take(200)
+                .collect::<String>()
+        )));
+    }
+    let lower = head.to_ascii_lowercase();
+    let body = &raw[split + 4..];
+    let decoded = if lower.contains("transfer-encoding: chunked") {
+        decode_chunked(body)?
+    } else {
+        body.to_vec()
+    };
+    String::from_utf8(decoded).map_err(|e| InferError::Http(format!("response is not UTF-8: {e}")))
+}
+
 impl ChatBackend for OpenAiCompatibleBackend {
     fn name(&self) -> &str {
         "openai-compatible"
@@ -154,6 +303,11 @@ impl ChatBackend for OpenAiCompatibleBackend {
         if cancel.load(Ordering::Relaxed) {
             return Err(InferError::Cancelled);
         }
+        reject_crlf("base_url", &self.base_url)?;
+        reject_crlf("model", &self.model)?;
+        if let Some(k) = &self.api_key {
+            reject_crlf("api_key", k)?;
+        }
         if self.base_url.starts_with("https://") {
             return Err(InferError::Http(
                 "https endpoints need a TLS transport or local proxy; none configured".into(),
@@ -166,6 +320,11 @@ impl ChatBackend for OpenAiCompatibleBackend {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
         };
+        if self.api_key.is_some() && !is_loopback_host(host_port) {
+            return Err(InferError::Http(format!(
+                "refusing to send an API key over cleartext http to non-loopback host {host_port}; use a loopback redacting proxy or a TLS endpoint"
+            )));
+        }
         let path = format!("{path_prefix}/chat/completions");
         let body = serde_json::json!({
             "model": self.model,
@@ -177,7 +336,9 @@ impl ChatBackend for OpenAiCompatibleBackend {
             ]
         })
         .to_string();
-        let mut stream = std::net::TcpStream::connect(host_port)?;
+        // Note: stream:false, so tokens are replayed word-by-word
+        // locally; cancellation is honoured between words.
+        let mut stream = connect_timeout(host_port)?;
         let mut req_text = format!(
             "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
@@ -188,13 +349,8 @@ impl ChatBackend for OpenAiCompatibleBackend {
         req_text.push_str("\r\n");
         stream.write_all(req_text.as_bytes())?;
         stream.write_all(body.as_bytes())?;
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw)?;
-        let json_start = raw
-            .find("\r\n\r\n")
-            .map(|i| i + 4)
-            .ok_or_else(|| InferError::Http("malformed HTTP response".into()))?;
-        let value: serde_json::Value = serde_json::from_str(&raw[json_start..])
+        let raw = read_http_response(&mut stream)?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| InferError::Http(format!("bad JSON response: {e}")))?;
         let content = value["choices"][0]["message"]["content"]
             .as_str()
@@ -212,7 +368,7 @@ impl ChatBackend for OpenAiCompatibleBackend {
 /// Resolve a backend from settings. `local` with no compiled engine
 /// falls back to EchoBackend so the app always runs; the UI surfaces
 /// that no real model is loaded.
-pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn ChatBackend> {
+pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn ChatBackend + Send> {
     match cfg.backend.as_str() {
         "openai-compatible" => Box::new(OpenAiCompatibleBackend {
             base_url: cfg
@@ -226,6 +382,12 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .and_then(|env| std::env::var(env).ok()),
         }),
         _ => {
+            if cfg.engine == "mistralrs" || cfg.engine == "llamacpp" {
+                return Box::new(UnavailableBackend {
+                    engine: cfg.engine.clone(),
+                    reason: "that rung of the inference ladder is not compiled into this build (see docs/spikes/inference-engine.md)".into(),
+                });
+            }
             #[cfg(feature = "candle-gen")]
             {
                 if let Some(backend) = crate::generate::candle_backend_from_config(cfg) {
@@ -289,39 +451,31 @@ pub mod config {
     }
 
     impl Config {
-        /// Minimal TOML reader for the flat [inference] table we write.
-        /// (Avoids a toml dependency for a six-key file.)
+        /// Parse with a real TOML parser. Malformed config warns on
+        /// stderr and yields defaults rather than silently
+        /// misparsing individual keys.
         pub fn parse(text: &str) -> Config {
-            let mut cfg = Config::default();
-            let mut in_inference = false;
-            for line in text.lines() {
-                let line = line.trim();
-                if line.starts_with('[') {
-                    in_inference = line == "[inference]";
-                    continue;
-                }
-                if !in_inference {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    let v = v.trim().trim_matches('"').to_string();
-                    match k.trim() {
-                        "backend" => cfg.inference.backend = v,
-                        "engine" => cfg.inference.engine = v,
-                        "model" => cfg.inference.model = Some(v),
-                        "model_path" => cfg.inference.model_path = Some(v),
-                        "base_url" => cfg.inference.base_url = Some(v),
-                        "api_key_env" => cfg.inference.api_key_env = Some(v),
-                        _ => {}
-                    }
+            match toml::from_str::<Config>(text) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("gridtalk: warning: malformed config ({e}); using defaults");
+                    Config::default()
                 }
             }
-            cfg
         }
         pub fn load(path: &std::path::Path) -> Config {
-            std::fs::read_to_string(path)
-                .map(|t| Config::parse(&t))
-                .unwrap_or_default()
+            match std::fs::read_to_string(path) {
+                Ok(text) => Config::parse(&text),
+                Err(e) => {
+                    if path.exists() {
+                        eprintln!(
+                            "gridtalk: warning: cannot read config {} ({e}); using defaults",
+                            path.display()
+                        );
+                    }
+                    Config::default()
+                }
+            }
         }
     }
 }
@@ -426,6 +580,84 @@ mod tests {
             "passage must be sent verbatim"
         );
         assert!(out.contains("Sheet1!A1"));
+    }
+
+    #[test]
+    fn regression_http_status_chunked_and_key_guards() {
+        use std::io::{Read, Write};
+        // Chunked + non-200 handling against a mock server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Read the full request (headers + Content-Length body)
+            // before responding, or the client sees a reset.
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    let len: usize = text[..pos]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = "{\"choices\":[{\"message\":{\"content\":\"chunked ok\"}}]}";
+            let half = body.len() / 2;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                half,
+                &body[..half],
+                body.len() - half,
+                &body[half..]
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let b = OpenAiCompatibleBackend {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "m".into(),
+            api_key: None,
+        };
+        let req = ChatRequest {
+            system: "s".into(),
+            user: "u".into(),
+            max_tokens: 4,
+        };
+        let cancel: CancelToken = Arc::new(AtomicBool::new(false));
+        let mut out = String::new();
+        b.stream(&req, &cancel, &mut |t| out.push_str(t)).unwrap();
+        assert!(out.contains("chunked ok"));
+        server.join().unwrap();
+        // API key must never go over cleartext http to a remote host.
+        let remote = OpenAiCompatibleBackend {
+            base_url: "http://203.0.113.9/v1".into(),
+            model: "m".into(),
+            api_key: Some("secret".into()),
+        };
+        assert!(matches!(
+            remote.stream(&req, &cancel, &mut |_| {}),
+            Err(InferError::Http(_))
+        ));
+        // CRLF in config fields is rejected, not injected.
+        let bad = OpenAiCompatibleBackend {
+            base_url: "http://127.0.0.1:9/v1\r\nX-Injected: 1".into(),
+            model: "m".into(),
+            api_key: None,
+        };
+        assert!(bad.stream(&req, &cancel, &mut |_| {}).is_err());
     }
 
     #[test]

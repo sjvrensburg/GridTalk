@@ -14,7 +14,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 
 - [x] Public repo `sjvrensburg/GridTalk`
 - [x] Gridcraft vendored as submodule at `vendor/gridcraft`, pinned in `UPSTREAM.md`
-- [x] Workspace crates: `gridtalk-graph`, `gridtalk-index`, `gridtalk-infer`, `gridtalk-app`
+- [x] Workspace crates: `gridtalk-graph`, `gridtalk-index`, `gridtalk-infer`, `gridtalk-app`, `gridtalk-ui`
 - [x] Decision records 0001 (fork-vs-embed), 0002 (no-redaction)
 - [x] Settings skeleton (`gridtalk-infer::config`, `config.example.toml`)
 - [x] CI: fmt, clippy, test
@@ -60,3 +60,24 @@ supports it unchanged by pointing `base_url` at the proxy.
 `cargo test --workspace`, `cargo clippy --workspace --all-targets`,
 `cargo fmt --check` on every push. Synthetic fixtures only — never
 commit a real spreadsheet.
+
+## Code review (multi-agent, adversarially interrogated)
+
+A 6-reviewer / 6-skeptic workflow produced 130 surviving findings
+(7 refuted, including the standard-IDF and provably-safe unwrap
+claims). All high and medium findings, and the low findings with
+code-level fixes, were addressed in the review-fix commit:
+formula-ref range expansion and literal skipping, cross-sheet
+lifting, stream CSV parsing, evaluator `$` refs / trailing tokens
+/ aggregate semantics / depth and area caps, HTTP status +
+chunked + timeouts + key-over-cleartext refusal, GGUF depth and
+overflow guards, header-only model I/O with atomic renames, EOS
+by token id with incremental BPE decode, hybrid `vector_only`
+flagging, async (worker-thread) chat in the UI, formula-preserving
+cell editing with save-to-disk, sheet tabs, virtualised rows, a
+real file dialog, and CI/release hardening (least-privilege
+permissions, `--locked`, candle-gen CI job, create-once releases
+with a version gate). Remaining known limits are unchanged and
+documented: mistral.rs / llama-cpp rungs not yet compiled in,
+Qwen3-MoE rejected by candle with a typed error, and the release
+workflow first exercised on a `v*` tag.

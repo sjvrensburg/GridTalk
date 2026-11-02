@@ -7,7 +7,6 @@
 backend = "local"
 # Local engine ladder: "candle" | "mistralrs" | "llamacpp"
 engine = "candle"
-# model = "Qwen3-30B-A3B-Q4_K_M"
-# model_path = "/home/you/.cache/gridtalk/models/model.gguf"
+# model_path = "/home/you/.cache/gridtalk/models/SmolLM2-135M-Instruct.Q4_K_M.gguf"  # llama-arch GGUF; Qwen3-MoE needs the mistral.rs rung
 # base_url = "http://127.0.0.1:11434/v1"   # external backend / redacting proxy
 # api_key_env = "GRIDTALK_API_KEY"

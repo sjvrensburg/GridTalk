@@ -18,3 +18,10 @@ once XLSX/ODS integration lands. Engine internals are never forked.
 
 Monthly upstream rebases (half-day budget). The submodule is excluded
 from the GridTalk workspace so upstream's build never slows ours.
+
+## Update (Phase 2, landed)
+
+GridTalk now path-depends on Gridcraft's `xlsx`, `model`, and
+`core` crates for XLSX/ODS ingestion (see `load_gridcraft_bytes`).
+The UI did *not* adopt `gridcraft-ui-egui`; see decision 0003 for
+the companion-app composition that replaced direct embedding.

@@ -40,8 +40,8 @@ Run it with: `gridtalk spike <model.gguf>`.
       `gridtalk --features candle-gen generate` on an AMD Ryzen AI
       MAX+ 395 (CPU only, release build):
       prompt 24 tokens, generated 48 tokens,
-      **first token 546 ms** (includes weight load),
-      **31.4 tok/s**. Debug build: 7.1 s / 2.2 tok/s — release
+      **first token 541 ms** (includes weight load),
+      **31.9 tok/s**. Debug build: 7.1 s / 2.2 tok/s — release
       builds are required for interactive use. The target
       Qwen3-MoE model remains unproven on candle (its arch is
       rejected with a typed error naming `qwen3moe`); that is the

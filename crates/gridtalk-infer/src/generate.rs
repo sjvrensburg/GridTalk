@@ -74,6 +74,17 @@ impl CandleLlamaBackend {
         if prompt_tokens.is_empty() {
             return Err(InferError::EngineUnavailable("empty prompt".into()));
         }
+        const MAX_CONTEXT: usize = 2048;
+        if prompt_tokens.len() + req.max_tokens > MAX_CONTEXT {
+            return Err(InferError::EngineUnavailable(format!(
+                "prompt ({} tokens) + max_tokens ({}) exceeds the {MAX_CONTEXT}-token context; shorten the context",
+                prompt_tokens.len(),
+                req.max_tokens
+            )));
+        }
+        let eos_id = tokenizer
+            .token_to_id("</s>")
+            .or_else(|| tokenizer.token_to_id("<|end_of_text|>"));
 
         let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(
             self.seed,
@@ -100,8 +111,14 @@ impl CandleLlamaBackend {
         let first_token_ms = started.elapsed().as_secs_f64() * 1000.0;
         tokens.push(next);
         generated += 1;
-        if let Ok(text) = tokenizer.decode(&[next], true) {
-            on_token(&text);
+        let mut emitted = String::new();
+        if Some(next) != eos_id {
+            if let Ok(text) = tokenizer.decode(&tokens[prompt_tokens.len()..], true) {
+                if let Some(delta) = text.strip_prefix(&emitted) {
+                    on_token(delta);
+                    emitted = text;
+                }
+            }
         }
 
         while generated < req.max_tokens {
@@ -122,11 +139,17 @@ impl CandleLlamaBackend {
                 .map_err(|e| InferError::EngineUnavailable(format!("sample: {e}")))?;
             tokens.push(next);
             generated += 1;
-            if let Ok(text) = tokenizer.decode(&[next], true) {
-                if text.contains("</s>") {
-                    break;
+            if Some(next) == eos_id {
+                break;
+            }
+            // Decode the whole generated suffix and emit only the
+            // new text: per-token decode corrupts BPE merges and
+            // multi-byte UTF-8 split across tokens.
+            if let Ok(text) = tokenizer.decode(&tokens[prompt_tokens.len()..], true) {
+                if let Some(delta) = text.strip_prefix(&emitted) {
+                    on_token(delta);
+                    emitted = text;
                 }
-                on_token(&text);
             }
         }
 
@@ -163,8 +186,8 @@ impl ChatBackend for CandleLlamaBackend {
 pub fn candle_backend_from_config(
     cfg: &crate::config::InferenceConfig,
 ) -> Option<CandleLlamaBackend> {
-    if cfg.engine != EngineKind::Candle.feature_name() && cfg.engine != "candle" {
-        // EngineKind::feature_name for Candle is "candle".
+    if cfg.engine != EngineKind::Candle.feature_name() {
+        return None;
     }
     let model_path = cfg.model_path.as_ref().map(PathBuf::from)?;
     let tokenizer_path = model_path.with_file_name("tokenizer.json");

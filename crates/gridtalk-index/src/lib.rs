@@ -16,28 +16,42 @@ pub struct Hit {
     pub range: RangeRef,
     pub score: f64,
     pub passage: String,
+    /// Query terms that matched lexically. Empty for hits that came
+    /// only from the vector (morphological) ranker.
     pub matched_terms: Vec<String>,
+    /// True when this hit had no lexical match and was rescued by
+    /// the embedding ranker alone. Morphological, not semantic.
+    #[serde(default)]
+    pub vector_only: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct Index {
     docs: Vec<(RangeRef, String, BTreeMap<String, usize>)>,
     df: BTreeMap<String, usize>,
+    /// Regions skipped because their sheet was absent (diagnostic).
+    pub dropped_regions: usize,
 }
 
 fn tokenize(s: &str) -> Vec<String> {
-    s.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 1)
-        .map(|t| t.to_string())
+    embed::tokenize(s)
+}
+
+fn dedup_terms(terms: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    terms
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
         .collect()
 }
 
 impl Index {
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let mut idx = Index::default();
+        let sheets: BTreeMap<&str, &gridtalk_graph::SheetSnapshot> =
+            wb.sheets.iter().map(|s| (s.name.as_str(), s)).collect();
         for region in &graph.regions {
-            if let Some(sheet) = wb.sheets.iter().find(|s| s.name == region.range.sheet) {
+            if let Some(sheet) = sheets.get(region.range.sheet.as_str()) {
                 let passage = render_passage(sheet, region);
                 let mut tf: BTreeMap<String, usize> = BTreeMap::new();
                 for t in tokenize(&passage) {
@@ -47,6 +61,8 @@ impl Index {
                     *idx.df.entry(t.clone()).or_default() += 1;
                 }
                 idx.docs.push((region.range.clone(), passage, tf));
+            } else {
+                idx.dropped_regions += 1;
             }
         }
         idx
@@ -55,7 +71,7 @@ impl Index {
     /// TF-IDF ranked lexical search. Returns hits with the rendered
     /// passage so callers can cite the exact range.
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        let terms = tokenize(query);
+        let terms = dedup_terms(tokenize(query));
         let n = self.docs.len().max(1) as f64;
         let mut hits: Vec<Hit> = self
             .docs
@@ -70,12 +86,17 @@ impl Index {
                         matched.push(t.clone());
                     }
                 }
+                let doc_len: usize = tf.values().sum();
+                if doc_len > 0 {
+                    score /= 1.0 + (doc_len as f64).ln() * 0.1;
+                }
                 if score > 0.0 {
                     Some(Hit {
                         range: range.clone(),
                         score,
                         passage: passage.clone(),
                         matched_terms: matched,
+                        vector_only: false,
                     })
                 } else {
                     None
@@ -93,7 +114,7 @@ impl Index {
 
     /// Doc indices ranked by lexical score (for hybrid fusion).
     pub fn ranking(&self, query: &str) -> Vec<usize> {
-        let terms = tokenize(query);
+        let terms = dedup_terms(tokenize(query));
         let n = self.docs.len().max(1) as f64;
         let mut scored: Vec<(usize, f64)> = self
             .docs
@@ -165,16 +186,24 @@ impl HybridIndex {
             .into_iter()
             .map(|h| h.doc)
             .collect();
-        let fused = reciprocal_rank_fusion(&[lexical_ranking, vector_ranking], 60, limit);
-        let terms = tokenize(query);
+        let fused = reciprocal_rank_fusion(&[lexical_ranking.clone(), vector_ranking], 60, limit);
+        let terms = dedup_terms(tokenize(query));
         fused
             .into_iter()
             .filter_map(|(doc, score)| {
-                self.lexical.doc(doc).map(|(range, passage)| Hit {
-                    range: range.clone(),
-                    score,
-                    passage: passage.to_string(),
-                    matched_terms: terms.clone(),
+                self.lexical.doc(doc).map(|(range, passage)| {
+                    let lexically_matched: Vec<String> = terms
+                        .iter()
+                        .filter(|term| embed::tokenize(passage).iter().any(|tok| tok == *term))
+                        .cloned()
+                        .collect();
+                    Hit {
+                        range: range.clone(),
+                        score,
+                        passage: passage.to_string(),
+                        vector_only: lexically_matched.is_empty(),
+                        matched_terms: lexically_matched,
+                    }
                 })
             })
             .collect()
@@ -202,6 +231,26 @@ mod tests {
         assert_eq!(hits[0].range.a1(), "Sheet1!A1:C3");
         assert!(hits[0].passage.contains("Provision"));
         assert!(idx.search("nonexistentterm", 5).is_empty());
+    }
+
+    #[test]
+    fn regression_single_char_dedup_and_vector_only_flag() {
+        let wb = parse_delimited("d", "Sheet1", "A,B\n5,Provision\n", ',');
+        let (g, _) = build_graph(&wb);
+        let idx = Index::build(&wb, &g);
+        // Single-character query term is kept and matches.
+        assert_eq!(idx.search("5", 5).len(), 1);
+        // Duplicate query terms do not change the score.
+        let one = idx.search("provision", 5);
+        let two = idx.search("provision provision", 5);
+        assert_eq!(one.len(), two.len());
+        assert!((one[0].score - two[0].score).abs() < 1e-9);
+        // Hybrid: morphological rescue is flagged, not claimed lexical.
+        let hybrid = HybridIndex::build(&wb, &g);
+        let hits = hybrid.search("provisions", 5);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].vector_only);
+        assert!(hits[0].matched_terms.is_empty());
     }
 
     #[test]

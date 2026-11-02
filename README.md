@@ -13,7 +13,15 @@ GridTalk has exactly two trust postures. There is no redaction layer in GridTalk
 
 ## Status
 
-Phase 1 scaffolding. See `docs/plan.md` for the phased implementation plan and `docs/decisions/` for architecture decision records.
+Working local-first prototype: CSV/TSV/XLSX/ODS ingestion (via the
+vendored Gridcraft engine), a lifted property graph with cited
+answers, hybrid lexical+embedding search, an investigate tool
+harness, a dual-view desktop UI, and real local GGUF generation on
+candle for llama-family models (feature `candle-gen`). With no
+model configured, chat uses a deterministic echo backend so the
+pipeline is demoable offline — it does not generate prose. See
+`docs/plan.md` for the phased plan (with honest checkboxes) and
+`docs/decisions/` for architecture records.
 
 ## Licence
 
