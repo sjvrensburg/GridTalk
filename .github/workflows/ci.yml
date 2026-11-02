@@ -19,11 +19,15 @@ jobs:
           submodules: true
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc glslang-tools
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install vulkan-sdk -y
+        run: |
+          choco install vulkan-sdk -y
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --component rustfmt,clippy --profile minimal && rustup default stable

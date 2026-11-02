@@ -44,11 +44,15 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc glslang-tools
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install vulkan-sdk -y
+        run: |
+          choco install vulkan-sdk -y
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Build release binaries
         run: cargo build --locked --release -p gridtalk-app -p gridtalk-ui
       - name: Package (unix)
