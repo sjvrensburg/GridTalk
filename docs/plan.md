@@ -14,7 +14,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 
 - [x] Public repo `sjvrensburg/GridTalk`
 - [x] Gridcraft vendored as submodule at `vendor/gridcraft`, pinned in `UPSTREAM.md`
-- [x] Workspace crates: `gridtalk-graph`, `gridtalk-index`, `gridtalk-infer`, `gridtalk-app`, `gridtalk-ui`
+- [x] Workspace crates: `gridtalk-adapter`, `gridtalk-graph`, `gridtalk-index`, `gridtalk-infer`, `gridtalk-app`, `gridtalk-ui`
 - [x] Decision records 0001 (fork-vs-embed), 0002 (no-redaction)
 - [x] Settings skeleton (`gridtalk-infer::config`, `config.example.toml`)
 - [x] CI: fmt, clippy, test

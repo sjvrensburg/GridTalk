@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gridtalk-adapter",
     "crates/gridtalk-graph",
     "crates/gridtalk-index",
     "crates/gridtalk-infer",

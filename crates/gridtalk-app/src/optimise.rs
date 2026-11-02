@@ -11,9 +11,9 @@
 //! The proposer is deliberately replaceable: Phase E can drive
 //! the same evaluate/gate/commit steps from hermit's evolvers.
 
-use crate::adapter::{append_card, commit_version, Adapter};
 use crate::bench::{run_bench_with, BenchTask, TaskResult};
 use crate::tools::Tools;
+use gridtalk_adapter::{append_card, commit_version, Adapter};
 use gridtalk_infer::ChatBackend;
 
 #[derive(Debug, Clone)]
@@ -355,7 +355,7 @@ pub fn optimise_round(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::load_adapter;
+    use gridtalk_adapter::load_adapter;
     use gridtalk_graph::{build_graph, parse_delimited, WorkbookSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::{ChatRequest, InferError};

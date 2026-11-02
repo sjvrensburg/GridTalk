@@ -10,6 +10,7 @@ name = "gridtalk-ui"
 path = "src/main.rs"
 
 [dependencies]
+gridtalk-adapter = { path = "../gridtalk-adapter" }
 gridtalk-graph = { path = "../gridtalk-graph" }
 gridtalk-index = { path = "../gridtalk-index" }
 gridtalk-infer = { path = "../gridtalk-infer" }

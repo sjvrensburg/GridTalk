@@ -6,6 +6,10 @@
 
 mod layout;
 
+use gridtalk_adapter::{
+    adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
+    valid_adapter_name,
+};
 use gridtalk_graph::{
     build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
 };
@@ -65,69 +69,6 @@ pub fn config_dir() -> std::path::PathBuf {
         Ok(home) if !home.is_empty() => std::path::PathBuf::from(home).join(".config/gridtalk"),
         _ => std::path::PathBuf::from(".config/gridtalk"),
     }
-}
-
-/// Adapters root, mirroring gridtalk-app's `adapters_root`
-/// exactly (same precedence and platform bases, so UI chat and
-/// the CLI see the same adapters):
-/// GRIDTALK_CONFIG_DIR, then GRIDTALK_CONFIG's parent, then the
-/// platform config dir (LOCALAPPDATA on Windows, XDG_CONFIG_HOME
-/// or ~/.config on Linux).
-pub fn adapters_root() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("GRIDTALK_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return std::path::PathBuf::from(dir).join("adapters");
-        }
-    }
-    if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
-        if let Some(parent) = std::path::PathBuf::from(&cfg).parent() {
-            if !parent.as_os_str().is_empty() {
-                return parent.join("adapters");
-            }
-        }
-    }
-    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        if !appdata.is_empty() {
-            return std::path::PathBuf::from(appdata).join("gridtalk/adapters");
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return std::path::PathBuf::from(xdg).join("gridtalk/adapters");
-        }
-    }
-    // adapter.rs dirs_path fallback: HOME/.config (not the Roaming
-    // config_dir), so the mirror is exact.
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => {
-            std::path::PathBuf::from(home).join(".config/gridtalk/adapters")
-        }
-        _ => config_dir().join("adapters"),
-    }
-}
-
-/// Mirror of gridtalk-app's adapter-name rule: a single path
-/// component, never `.`/`..`/separators/NUL.
-fn valid_adapter_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name != "__invalid__"
-        && !name.starts_with('.')
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
-}
-
-/// Bound assembled adapter text like the CLI does
-/// (investigate.rs MAX_SYSTEM_CHARS = 12_000).
-fn cap_adapter_text(mut text: String) -> String {
-    const MAX_SYSTEM_CHARS: usize = 12_000;
-    if text.chars().count() > MAX_SYSTEM_CHARS {
-        text = text.chars().take(MAX_SYSTEM_CHARS).collect();
-        text.push_str("\n[adapter content truncated]");
-    }
-    text
 }
 
 /// Mirror of gridtalk-app's `gridcraft_binary` resolution.
@@ -643,206 +584,29 @@ impl GridTalkApp {
         violations
     }
 
-    /// Load the active adapter for chat, mirroring the app
-    /// crate's prompt assembly: rules, trigger-matched skills,
-    /// then the per-workbook sidecar last.
-    /// Per-workbook `.gridtalk.md` sidecar text, formatted for the
-    /// prompt (empty when absent/blank). Applies with or without an
-    /// active adapter.
-    fn sidecar_text(&self) -> String {
-        if let Some(path) = &self.current_path {
-            let sidecar = std::path::PathBuf::from(format!("{}.gridtalk.md", path.display()));
-            if let Ok(notes) = std::fs::read_to_string(&sidecar) {
-                if !notes.trim().is_empty() {
-                    return format!(
-                        "\n\nWorkbook notes (from the .gridtalk.md sidecar):\n{}",
-                        notes.trim()
-                    );
-                }
-            }
-        }
-        String::new()
-    }
-
+    /// Adapter prompt text for chat, built by the same
+    /// `gridtalk_adapter` code the CLI uses: rules, trigger-matched
+    /// skills, then the per-workbook `.gridtalk.md` sidecar (which
+    /// applies with or without an active adapter). Returns the
+    /// capped text and the adapter's `top_k`.
     fn active_adapter_prompt(&self, question: &str) -> (String, usize) {
-        if self.active_adapter.is_empty() {
-            return (cap_adapter_text(self.sidecar_text()), 3);
-        }
-        let dir = adapters_root().join(&self.active_adapter);
-        let knobs = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
-        let get = |key: &str| {
-            knobs.lines().find_map(|l| {
-                let (k, v) = l.trim().split_once('=')?;
-                if k.trim() == key {
-                    let v = v.trim();
-                    let v = v
-                        .strip_prefix('"')
-                        .and_then(|q| q.split('"').next())
-                        .unwrap_or(v);
-                    let v = v.split(" #").next().unwrap_or(v);
-                    Some(v.trim().to_string())
-                } else {
-                    None
-                }
-            })
-        };
-        let version: u32 = get("version").and_then(|v| v.parse().ok()).unwrap_or(0);
-        // Per-version knobs win over the root copy (matching
-        // gridtalk-app's load_from_dir); root values seed.
-        let vknobs = if version > 0 {
-            std::fs::read_to_string(dir.join(format!("v{version}/adapter.toml")))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let get_v = |key: &str| -> Option<String> {
-            // Same value cleaning as the root getter: strip a
-            // trailing " #" comment, then one pair of quotes.
-            vknobs.lines().find_map(|l| {
-                let (k, v) = l.trim().split_once('=')?;
-                if k.trim() == key {
-                    let v = v.trim();
-                    let v = v
-                        .strip_prefix('"')
-                        .and_then(|q| q.split('"').next())
-                        .unwrap_or(v);
-                    let v = v.split(" #").next().unwrap_or(v);
-                    Some(v.trim().to_string())
-                } else {
-                    None
-                }
-            })
-        };
-        let top_k: usize = get_v("top_k")
-            .and_then(|v| v.parse().ok())
-            .or_else(|| get("top_k").and_then(|v| v.parse().ok()))
-            .unwrap_or(3);
-        let rules_dir = if version > 0 && dir.join(format!("v{version}")).is_dir() {
-            dir.join(format!("v{version}"))
-        } else {
-            dir.clone()
-        };
-        let mut text = String::new();
-        let rules = std::fs::read_to_string(rules_dir.join("ADAPTER.md")).unwrap_or_default();
-        if !rules.trim().is_empty() {
-            text.push_str(&format!(
-                "\n\nAdapter rules (learned for this workbook shape):\n{}",
-                rules.trim()
-            ));
-        }
-        // Skills: the first `Triggers:` line anywhere in the file
-        // scopes the skill (word-boundary match); none = always.
-        let q_words: Vec<String> = question
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string())
-            .collect();
-        if let Ok(entries) = std::fs::read_dir(rules_dir.join("skills")) {
-            let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-            paths.sort();
-            for path in paths {
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                let Ok(body) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                // Mirror load_skills: the first Triggers line anywhere
-                // in the file is metadata (stripped from the body);
-                // an explicit empty one means never auto-apply.
-                let mut triggers: Vec<String> = Vec::new();
-                let mut has_header = false;
-                let mut found_header = false;
-                let mut body_lines: Vec<&str> = Vec::new();
-                for line in body.lines() {
-                    let parsed = if !found_header {
-                        line.trim()
-                            .strip_prefix("Triggers:")
-                            .or_else(|| line.trim().strip_prefix("triggers:"))
-                    } else {
-                        None
-                    };
-                    if let Some(rest) = parsed {
-                        has_header = true;
-                        found_header = true;
-                        let parsed: Vec<String> = rest
-                            .split(',')
-                            .map(|t| t.trim().to_lowercase())
-                            .filter(|t| !t.is_empty())
-                            .collect();
-                        triggers = if parsed.is_empty() {
-                            vec!["\u{1}never".to_string()]
-                        } else if parsed == ["(always)"] {
-                            Vec::new()
-                        } else {
-                            parsed
-                        };
-                    } else {
-                        body_lines.push(line);
-                    }
-                }
-                let skill_body = body_lines.join("\n");
-                let applies = !triggers.iter().any(|t| t == "\u{1}never")
-                    && (triggers.is_empty()
-                        || !has_header
-                        || triggers.iter().any(|t| {
-                            let tw: Vec<&str> = t
-                                .split(|c: char| !c.is_alphanumeric())
-                                .filter(|w| !w.is_empty())
-                                .collect();
-                            !tw.is_empty()
-                                && tw.len() <= q_words.len()
-                                && q_words
-                                    .windows(tw.len())
-                                    .any(|w| w.iter().map(|s| s.as_str()).collect::<Vec<_>>() == tw)
-                        }));
-                if applies && !skill_body.trim().is_empty() {
-                    let skill_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("skill");
-                    text.push_str(&format!("\n\nSkill: {}\n{}", skill_name, skill_body.trim()));
-                }
-            }
-        }
-        // Per-workbook sidecar applies last.
-        let sidecar = self.sidecar_text();
-        text.push_str(&sidecar);
-        (cap_adapter_text(text), top_k.clamp(1, 25))
+        let sidecar = self.current_path.as_deref().and_then(sidecar_rules);
+        let adapter = (!self.active_adapter.is_empty())
+            .then(|| load_adapter(&adapters_root(), &self.active_adapter));
+        let top_k = adapter.as_ref().map_or(3, |a| a.top_k.clamp(1, 25));
+        let text = prompt_text(adapter.as_ref(), question, sidecar.as_deref());
+        (cap_prompt(text), top_k)
     }
 
     /// Refresh the adapter picker cache (filesystem reads happen
     /// on open/selection change, never per frame).
     fn refresh_adapter_cache(&mut self) {
         let root = adapters_root();
-        let mut names: Vec<String> = std::fs::read_dir(&root)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| e.path().is_dir())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        names.sort();
-        names.retain(|n| valid_adapter_name(n));
-        self.adapter_cache = names
-            .iter()
+        self.adapter_cache = list_adapters(&root)
+            .into_iter()
             .map(|name| {
-                let knobs = std::fs::read_to_string(root.join(name).join("adapter.toml"))
-                    .unwrap_or_default();
-                let version = knobs
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.trim().split_once('=')?;
-                        if k.trim() == "version" {
-                            let v = v.trim().trim_matches('"');
-                            let v = v.split(" #").next().unwrap_or(v).trim();
-                            Some(v.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "0".into());
-                (name.clone(), version)
+                let version = load_adapter(&root, &name).version.to_string();
+                (name, version)
             })
             .collect();
         self.adapter_card_cache = if self.active_adapter.is_empty() {

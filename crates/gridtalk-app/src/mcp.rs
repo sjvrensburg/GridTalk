@@ -12,7 +12,7 @@
 //! write tool in the list at all.
 
 use crate::tools::{ToolRequest, Tools};
-use gridtalk_graph::{build_graph, load_path, WorkbookSnapshot};
+use gridtalk_graph::{build_graph, load_bytes, IngestError, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -56,26 +56,32 @@ impl OpenWorkbook {
         })
     }
 
-    fn hash_of(path: &PathBuf) -> Option<u64> {
-        let bytes = std::fs::read(path).ok()?;
-        // FNV-1a over the content: cheap and deterministic.
+    /// FNV-1a over the content: cheap and deterministic.
+    fn hash_bytes(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
-        for b in &bytes {
+        for b in bytes {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        Some(h)
+        h
     }
 
-    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, i64, u64)> {
-        let (mtime, len, ctime) = Self::stat_of(path)?;
-        let hash = Self::hash_of(path)?;
-        Some((mtime, len, ctime, hash))
+    fn hash_of(path: &PathBuf) -> Option<u64> {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| Self::hash_bytes(&bytes))
     }
 
     fn load(path: &PathBuf) -> Result<Self, String> {
-        let stamp = Self::stamp_of(path);
-        let wb = load_path(path).map_err(|e| e.to_string())?;
+        // Stat before reading, so a write landing between the two
+        // leaves a stale stamp (forcing a reload), never a fresh
+        // stamp on stale content. The file is read once: the same
+        // bytes are hashed and parsed.
+        let stat = Self::stat_of(path);
+        let bytes = std::fs::read(path).map_err(|e| IngestError::from(e).to_string())?;
+        let stamp = stat.map(|(mtime, len, ctime)| (mtime, len, ctime, Self::hash_bytes(&bytes)));
+        let wb = load_bytes(path, &bytes).map_err(|e| e.to_string())?;
+        drop(bytes);
         let (graph, violations) = build_graph(&wb);
         if !violations.is_empty() {
             return Err(format!("graph invariants violated: {violations:?}"));

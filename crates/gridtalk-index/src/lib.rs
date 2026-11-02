@@ -48,35 +48,60 @@ fn dedup_terms(terms: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-impl Index {
-    pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
-        let mut idx = Index::default();
-        // Regions arrive in workbook sheet order, contiguous per
-        // sheet. Assign them to sheets by IDENTITY (region counts
-        // re-derived per sheet), so duplicate sheet names render
-        // from their own sheet instead of collapsing by name.
-        let derived_regions: Vec<Vec<gridtalk_graph::Region>> = wb
-            .sheets
+/// The sheet each graph region renders from, or `None` when the
+/// graph does not match the workbook (stale or mismatched graph),
+/// so one sheet's cells never render under another sheet's
+/// citation range.
+///
+/// Graphs from `build_graph` record each region's sheet index in
+/// `region_sheets`; those are used directly, checked against the
+/// sheet's name and extent, without re-scanning cells. Hand-built
+/// graphs fall back to re-detecting regions per sheet and matching
+/// them by sheet-local ordinal.
+fn region_sheet_assignments<'a>(
+    wb: &'a WorkbookSnapshot,
+    graph: &Graph,
+) -> Vec<Option<&'a gridtalk_graph::SheetSnapshot>> {
+    if graph.region_sheets.len() == graph.regions.len() {
+        return graph
+            .regions
             .iter()
-            .map(gridtalk_graph::detect_regions)
+            .zip(&graph.region_sheets)
+            .map(|(region, &sheet_idx)| {
+                wb.sheets.get(sheet_idx).filter(|sheet| {
+                    let r = &region.range;
+                    gridtalk_graph::sheet_name_eq(&sheet.name, &r.sheet)
+                        && r.r0 <= r.r1
+                        && r.c0 <= r.c1
+                        && r.r1 < sheet.cells.len()
+                        && r.c1 < sheet.max_col()
+                })
+            })
             .collect();
-        let region_counts: Vec<usize> = derived_regions.iter().map(|r| r.len()).collect();
-        // Prefix sums: region idx -> sheet in O(log sheets).
-        let mut prefix: Vec<usize> = Vec::with_capacity(region_counts.len() + 1);
-        prefix.push(0);
-        for count in &region_counts {
-            prefix.push(prefix.last().unwrap() + count);
-        }
-        let sheet_of_region = |idx: usize| -> Option<&gridtalk_graph::SheetSnapshot> {
-            let sheet_idx = prefix.partition_point(|end| *end <= idx).saturating_sub(1);
-            wb.sheets.get(sheet_idx)
-        };
-        for (region_idx, region) in graph.regions.iter().enumerate() {
-            // A stale/mismatched graph must not render one sheet's
-            // cells under another sheet's citation range.
-            // Validate beyond the name: the graph region must equal
-            // the re-derived region at its sheet-local ordinal, or
-            // a stale graph could cross-render duplicate sheets.
+    }
+    // Regions arrive in workbook sheet order, contiguous per sheet.
+    // Assign them to sheets by IDENTITY (region counts re-derived
+    // per sheet), so duplicate sheet names render from their own
+    // sheet instead of collapsing by name.
+    let derived_regions: Vec<Vec<gridtalk_graph::Region>> = wb
+        .sheets
+        .iter()
+        .map(gridtalk_graph::detect_regions)
+        .collect();
+    // Prefix sums: region idx -> sheet in O(log sheets).
+    let mut prefix: Vec<usize> = Vec::with_capacity(derived_regions.len() + 1);
+    prefix.push(0);
+    for regions in &derived_regions {
+        prefix.push(prefix.last().unwrap() + regions.len());
+    }
+    graph
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(region_idx, region)| {
+            // The graph region must equal the re-derived region at
+            // its sheet-local ordinal, or a stale graph could
+            // cross-render duplicate sheets.
             let sheet_idx = prefix
                 .partition_point(|end| *end <= region_idx)
                 .saturating_sub(1);
@@ -86,20 +111,24 @@ impl Index {
                 .and_then(|rs| rs.get(local_ordinal))
                 .is_some_and(|derived| {
                     let d = &derived.range;
-                    (d.r0, d.c0, d.r1, d.c1)
-                        == (
-                            region.range.r0,
-                            region.range.c0,
-                            region.range.r1,
-                            region.range.c1,
-                        )
+                    let r = &region.range;
+                    (d.r0, d.c0, d.r1, d.c1) == (r.r0, r.c0, r.r1, r.c1)
                 });
-            let assigned = if ordinal_ok {
-                sheet_of_region(region_idx)
-                    .filter(|sheet| gridtalk_graph::sheet_name_eq(&sheet.name, &region.range.sheet))
-            } else {
-                None
-            };
+            if !ordinal_ok {
+                return None;
+            }
+            wb.sheets
+                .get(sheet_idx)
+                .filter(|sheet| gridtalk_graph::sheet_name_eq(&sheet.name, &region.range.sheet))
+        })
+        .collect()
+}
+
+impl Index {
+    pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
+        let mut idx = Index::default();
+        let assignments = region_sheet_assignments(wb, graph);
+        for (region, assigned) in graph.regions.iter().zip(assignments) {
             if let Some(sheet) = assigned {
                 let passage = render_passage(sheet, region);
                 // Index the body only: the "Range Sheet1!A1:B2" header
@@ -315,6 +344,33 @@ impl HybridIndex {
 mod tests {
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
+
+    #[test]
+    fn recorded_region_sheets_match_redetection_and_reject_mismatches() {
+        let mut wb = parse_delimited("demo", "Sheet1", "Item,Qty\nApples,2\n", ',');
+        let mut second = parse_delimited("demo", "Sheet1", "Name,Cost\nRent,9\n", ',');
+        wb.sheets.append(&mut second.sheets);
+        let (g, _) = build_graph(&wb);
+        assert_eq!(g.region_sheets, vec![0, 1]);
+        // Duplicate sheet names render from their own sheet.
+        let fast = Index::build(&wb, &g);
+        assert_eq!(fast.dropped_regions, 0);
+        assert_eq!(fast.search("rent", 5).len(), 1);
+        // The re-detection fallback (hand-built graphs) agrees.
+        let mut hand = g.clone();
+        hand.region_sheets.clear();
+        let slow = Index::build(&wb, &hand);
+        assert_eq!(slow.dropped_regions, 0);
+        assert_eq!(slow.doc_count(), fast.doc_count());
+        // A graph from another workbook never renders here: a
+        // renamed sheet or a smaller sheet drops the region.
+        let mut renamed = wb.clone();
+        renamed.sheets[1].name = "Other".into();
+        assert_eq!(Index::build(&renamed, &g).dropped_regions, 1);
+        let mut shrunk = wb.clone();
+        shrunk.sheets[1].cells.truncate(1);
+        assert_eq!(Index::build(&shrunk, &g).dropped_regions, 1);
+    }
 
     #[test]
     fn search_finds_cited_region() {

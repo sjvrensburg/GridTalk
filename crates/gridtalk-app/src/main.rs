@@ -3,13 +3,13 @@
 //! the grid<->graph two-way sync state machine that the egui front
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
-mod adapter;
 mod bench;
 mod investigate;
 mod mcp;
 mod optimise;
 mod tools;
 
+use gridtalk_adapter as adapter;
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
 use gridtalk_index::{HybridIndex, Index};
 use gridtalk_infer::config::Config;

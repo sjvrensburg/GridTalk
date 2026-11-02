@@ -402,7 +402,7 @@ pub fn run_bench_with(
     backend: &dyn ChatBackend,
     split: &str,
     max_steps: usize,
-    adapter: Option<&crate::adapter::Adapter>,
+    adapter: Option<&gridtalk_adapter::Adapter>,
 ) -> Result<BenchReport, gridtalk_infer::InferError> {
     let mut results = Vec::new();
     for task in tasks.iter().filter(|t| split == "all" || t.split == split) {
