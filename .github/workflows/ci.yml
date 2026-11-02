@@ -26,10 +26,19 @@ jobs:
           curl -sL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
           mkdir -p "$HOME/vulkan-sdk"
           tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
-          SDK_DIR=$(echo "$HOME"/vulkan-sdk/*/x86_64)
+          # Tarball layout after --strip-components=1 is
+          # $HOME/vulkan-sdk/x86_64 (setup-env.sh in the SDK
+          # computes the same: <root>/$(uname -m)).
+          SDK_DIR="$HOME/vulkan-sdk/x86_64"
+          test -x "$SDK_DIR/bin/glslc"
+          test -f "$SDK_DIR/include/vulkan/vulkan.h"
+          test -f "$SDK_DIR/lib/libvulkan.so"
           echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
           echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
           echo "CMAKE_PREFIX_PATH=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$SDK_DIR/lib" >> "$GITHUB_ENV"
+          echo "SDK installed at $SDK_DIR:"
+          ls "$SDK_DIR/bin/glslc" "$SDK_DIR/share/cmake/SPIRV-Headers"
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
         uses: jakoch/install-vulkan-sdk-action@v1
@@ -38,6 +47,17 @@ jobs:
           install_runtime: true
           cache: true
           stripdown: true
+      - name: Use Ninja generator (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # MSBuild's vcvars batch breaks in the vulkan-shaders-gen
+          # subproject on GitHub runners ("cannot find batch label
+          # VCEnd"); Ninja avoids that path entirely.
+          choco install ninja -y
+          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
+          Get-ChildItem "$env:VULKAN_SDK" | Select-Object -First 5
       - name: Install Rust
         shell: bash
         run: rustup toolchain install stable --component rustfmt,clippy --profile minimal && rustup default stable
