@@ -737,7 +737,17 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                     // Skip Name! or 'Quoted Name'! after the colon.
                     if j < chars.len() && chars[j] == '\'' {
                         j += 1;
-                        while j < chars.len() && chars[j] != '\'' {
+                        // Doubled-apostrophe aware, like the
+                        // range-start scanner: '' is an escaped
+                        // quote inside the name, not its end.
+                        while j < chars.len() {
+                            if chars[j] == '\'' {
+                                if chars.get(j + 1) == Some(&'\'') {
+                                    j += 2;
+                                    continue;
+                                }
+                                break;
+                            }
                             j += 1;
                         }
                         if j + 1 < chars.len() && chars[j + 1] == '!' {
@@ -795,6 +805,20 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                                 cc += cstep;
                             }
                             rr += rstep;
+                        }
+                        // The stepped grid may stop short of the
+                        // high corner; the independent extractor
+                        // includes range endpoints, so emit it too.
+                        if (hi_r != lo_r || hi_c != lo_c)
+                            && !refs
+                                .iter()
+                                .any(|q| q.row == hi_r && q.col == hi_c && q.sheet == sheet)
+                        {
+                            refs.push(QualifiedRef {
+                                sheet: sheet.clone(),
+                                row: hi_r,
+                                col: hi_c,
+                            });
                         }
                     }
                     i = end;

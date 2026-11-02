@@ -25,7 +25,9 @@ pub struct Candidate {
 fn failing(results: &[TaskResult], kind: &str) -> usize {
     results
         .iter()
-        .filter(|r| r.kind == kind && !r.passed)
+        // Errored tasks (backend/tool failures) are not evidence
+        // the harness needs a new rule or knob.
+        .filter(|r| r.kind == kind && !r.passed && r.error.is_none())
         .count()
 }
 

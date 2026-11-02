@@ -51,15 +51,27 @@ fn dedup_terms(terms: Vec<String>) -> Vec<String> {
 impl Index {
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let mut idx = Index::default();
-        // Duplicate sheet names must not collapse: the first sheet
-        // of a name wins (later duplicates keep their own regions
-        // out rather than rendering another sheet's cells).
-        let mut sheets: BTreeMap<&str, &gridtalk_graph::SheetSnapshot> = BTreeMap::new();
-        for sh in &wb.sheets {
-            sheets.entry(sh.name.as_str()).or_insert(sh);
-        }
-        for region in &graph.regions {
-            if let Some(sheet) = sheets.get(region.range.sheet.as_str()) {
+        // Regions arrive in workbook sheet order, contiguous per
+        // sheet. Assign them to sheets by IDENTITY (region counts
+        // re-derived per sheet), so duplicate sheet names render
+        // from their own sheet instead of collapsing by name.
+        let region_counts: Vec<usize> = wb
+            .sheets
+            .iter()
+            .map(|sh| gridtalk_graph::detect_regions(sh).len())
+            .collect();
+        let sheet_of_region = |idx: usize| -> Option<&gridtalk_graph::SheetSnapshot> {
+            let mut acc = 0;
+            for (i, count) in region_counts.iter().enumerate() {
+                if idx < acc + count {
+                    return wb.sheets.get(i);
+                }
+                acc += count;
+            }
+            None
+        };
+        for (region_idx, region) in graph.regions.iter().enumerate() {
+            if let Some(sheet) = sheet_of_region(region_idx) {
                 let passage = render_passage(sheet, region);
                 // Index the body only: the "Range Sheet1!A1:B2" header
                 // is citation boilerplate, not content.

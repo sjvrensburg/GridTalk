@@ -259,6 +259,27 @@ pub struct TaskResult {
 /// Citation precision is scored on structured citations only: a
 /// cited *range* counts when it contains the expected cell. An
 /// answer merely restating the question's citation does not.
+/// `answer` mentions `needle` as a standalone reference, not as a
+/// substring of a longer ref (Sheet1!A1 inside Sheet1!A10:B20).
+fn contains_bounded(answer: &str, needle: &str) -> bool {
+    let boundary = |c: char| !(c.is_alphanumeric() || matches!(c, '!' | ':' | '.' | '$'));
+    let mut from = 0;
+    while let Some(pos) = answer[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
+        let after_ok = answer[end..].chars().next().is_none_or(boundary);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= answer.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // The cited range must also be *used* in the answer text —
     // retrieval alone does not count as citing.
@@ -269,7 +290,7 @@ fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // contain the expected cell (combining two different ranges
     // was a false positive).
     citations.iter().any(|cited| {
-        answer.contains(cited.as_str())
+        contains_bounded(answer, cited)
             && crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
                 sheet == esheet && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
             })

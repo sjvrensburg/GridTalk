@@ -81,9 +81,9 @@ pub fn adapters_root() -> std::path::PathBuf {
     }
     if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
         if let Some(parent) = std::path::PathBuf::from(&cfg).parent() {
-            if !parent.as_os_str().is_empty() {
-                return parent.join("adapters");
-            }
+            // Matches gridtalk-app: a bare filename's parent is
+            // Some(""), which joins to a CWD-relative "adapters".
+            return parent.join("adapters");
         }
     }
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
@@ -490,7 +490,7 @@ fn write_wizard_config(
             out.push(format!("{k} = \"{v}\""));
         }
     }
-    std::fs::write(&path, out.join("\n") + "\n")?;
+    write_atomic_bytes(&path, (out.join("\n") + "\n").as_bytes()).map_err(std::io::Error::other)?;
     Ok(path)
 }
 
@@ -640,10 +640,18 @@ impl GridTalkApp {
             String::new()
         };
         let get_v = |key: &str| -> Option<String> {
+            // Same value cleaning as the root getter: strip a
+            // trailing " #" comment, then one pair of quotes.
             vknobs.lines().find_map(|l| {
                 let (k, v) = l.trim().split_once('=')?;
                 if k.trim() == key {
-                    Some(v.trim().trim_matches('"').to_string())
+                    let v = v.trim();
+                    let v = v
+                        .strip_prefix('"')
+                        .and_then(|q| q.split('"').next())
+                        .unwrap_or(v);
+                    let v = v.split(" #").next().unwrap_or(v);
+                    Some(v.trim().to_string())
                 } else {
                     None
                 }
@@ -684,22 +692,37 @@ impl GridTalkApp {
                 let Ok(body) = std::fs::read_to_string(&path) else {
                     continue;
                 };
+                // Mirror load_skills: a Triggers line in the first
+                // three lines is metadata (stripped from the body);
+                // an explicit empty one means never auto-apply.
                 let mut triggers: Vec<String> = Vec::new();
                 let mut has_header = false;
-                for line in body.lines().take(3) {
-                    if let Some(rest) = line
-                        .trim()
-                        .strip_prefix("Triggers:")
-                        .or_else(|| line.trim().strip_prefix("triggers:"))
-                    {
+                let mut body_lines: Vec<&str> = Vec::new();
+                for (idx, line) in body.lines().enumerate() {
+                    let parsed = if idx < 3 {
+                        line.trim()
+                            .strip_prefix("Triggers:")
+                            .or_else(|| line.trim().strip_prefix("triggers:"))
+                    } else {
+                        None
+                    };
+                    if let Some(rest) = parsed {
                         has_header = true;
-                        triggers = rest
+                        let parsed: Vec<String> = rest
                             .split(',')
                             .map(|t| t.trim().to_lowercase())
                             .filter(|t| !t.is_empty())
                             .collect();
+                        triggers = if parsed.is_empty() {
+                            vec!["\u{1}never".to_string()]
+                        } else {
+                            parsed
+                        };
+                    } else {
+                        body_lines.push(line);
                     }
                 }
+                let skill_body = body_lines.join("\n");
                 let applies = !has_header
                     || triggers.iter().any(|t| {
                         let tw: Vec<&str> = t
@@ -712,8 +735,9 @@ impl GridTalkApp {
                                 .windows(tw.len())
                                 .any(|w| w.iter().map(|s| s.as_str()).collect::<Vec<_>>() == tw)
                     });
-                if applies {
-                    text.push_str(&format!("\n\nSkill:\n{}", body.trim()));
+                if applies && !skill_body.trim().is_empty() {
+                    let skill_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("skill");
+                    text.push_str(&format!("\n\nSkill: {}\n{}", skill_name, skill_body.trim()));
                 }
             }
         }

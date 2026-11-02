@@ -111,8 +111,8 @@ def _extract_numbers(text: str) -> list[float]:
                 core = groups[0] + "." + groups[1]  # decimal comma
             else:
                 continue  # 1,200,50 etc: ambiguous
-        if "_" in core:
-            continue  # Rust f64 parse rejects underscores; float() does not
+        if "_" in core or not core.isascii():
+            continue  # Rust rejects underscores and non-ASCII digits
         try:
             value = float(core)  # .5, 1e5, 1.2e-3, -1.2e-3; ranges fail here
         except ValueError:
@@ -161,9 +161,11 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     for line in str((extra or {}).get("stdout", "")).splitlines():
         if line.strip().startswith("citations:"):
             cited += [c.strip() for c in line.split(":", 1)[1].split(",")]
-    if not any(c and c in (answer or "") for c in cited):
-        return False
     for c in cited:
+        # The SAME cited range must appear in the answer and
+        # contain the expected cell (bench.rs citation_hit).
+        if not c or c not in (answer or ""):
+            continue
         rng = c.rpartition("!")[2] if "!" in c else c
         sheet = c.rpartition("!")[0].strip("'") or None if "!" in c else None
         lo_s, _, hi_s = rng.partition(":")
@@ -181,7 +183,7 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
     raw = task.get("expected")
     try:
         expected = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         try:
             expected = _final_number(str(raw))
         except Exception:
@@ -190,6 +192,14 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
         return JudgeResult(
             score=0.0,
             feedback=f"task {task.get('id', '?')}: unparseable expected value {raw!r}",
+            extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
+        )
+    import math as _math
+
+    if not _math.isfinite(expected):
+        return JudgeResult(
+            score=0.0,
+            feedback=f"task {task.get('id', '?')}: non-finite expected value {raw!r}",
             extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
         )
     got = _final_number(str(output.output))
@@ -228,8 +238,15 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             raise ValueError(f"task {row['id']}: expected must be a number or numeric string")
         if isinstance(exp, str) and _final_number(exp) is None:
             raise ValueError(f"task {row['id']}: expected {exp!r} is not numeric")
-        if isinstance(exp, (int, float)) and exp != exp:
-            raise ValueError(f"task {row['id']}: expected must be finite")
+        if isinstance(exp, (int, float)):
+            import math
+
+            try:
+                finite = math.isfinite(exp)
+            except OverflowError:  # huge int like 10**400
+                finite = False
+            if not finite:
+                raise ValueError(f"task {row['id']}: expected must be finite")
         if row["id"] in seen:
             raise ValueError(f"duplicate bench task id: {row['id']}")
         seen.add(row["id"])

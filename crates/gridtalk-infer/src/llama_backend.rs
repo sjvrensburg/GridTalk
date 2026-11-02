@@ -89,6 +89,13 @@ fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64, u64
                 mix(&tail[..n]);
             }
         }
+        // Middle window too: weights live between head and tail.
+        if meta.len() > 131072 && f.seek(SeekFrom::Start(meta.len() / 2 - 32768)).is_ok() {
+            let mut mid = vec![0u8; 65536];
+            if let Ok(n) = f.read(&mut mid) {
+                mix(&mid[..n]);
+            }
+        }
     }
     Some((modified, meta.len(), hash))
 }
@@ -259,6 +266,11 @@ impl LlamaCppBackend {
         let mut generated = 0usize;
         let mut text_bytes: Vec<u8> = Vec::new();
         let mut emitted = String::new();
+        // Incremental decoded text for stop-marker scanning: only
+        // the new piece plus a small tail window is rescanned per
+        // token (the whole-buffer rescan was O(n^2)).
+        let mut cumulative = String::new();
+        let mut scanned_len = 0usize;
         let mut n_cur = prompt_tokens.len() as i32;
 
         while generated < req.max_tokens {
@@ -277,9 +289,11 @@ impl LlamaCppBackend {
             }
             let piece = vocab.token_to_piece(token, true, None);
             text_bytes.extend_from_slice(&piece);
-            // Stop markers can be split across BPE pieces, so check
-            // the cumulative text and truncate at the marker.
-            let cumulative = String::from_utf8_lossy(&text_bytes).into_owned();
+            // Stop markers can be split across BPE pieces, so scan
+            // the cumulative text (new piece + tail window only).
+            cumulative.push_str(&String::from_utf8_lossy(&piece));
+            let scan_from = scanned_len.saturating_sub(32).min(cumulative.len());
+            let scan_window = &cumulative[scan_from..];
             // Any "<|...|>" special in the *text* is a stop marker
             // (possibly split across pieces, e.g. "<|im_end|").
             let mut stop_marker = false;
@@ -291,7 +305,8 @@ impl LlamaCppBackend {
                 "<end_of_turn>",
                 "<|end|>",
             ] {
-                if let Some(at) = cumulative.find(marker) {
+                if let Some(rel_at) = scan_window.find(marker) {
+                    let at = scan_from + rel_at;
                     // `at` indexes the decoded string; truncate there
                     // and re-encode (a lossy offset into raw bytes
                     // could split a UTF-8 sequence).
@@ -308,7 +323,9 @@ impl LlamaCppBackend {
                     break;
                 }
             }
-            let _ = &cumulative;
+            if !stop_marker {
+                scanned_len = cumulative.len();
+            }
             generated += 1;
             if stop_marker {
                 break;

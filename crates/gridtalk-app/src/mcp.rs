@@ -25,17 +25,26 @@ struct OpenWorkbook {
     /// (mtime, len, content hash): stat first on every call;
     /// the file is only re-read/hashed when stat changed, and
     /// only reloaded when the hash also changed.
-    stamp: Option<(SystemTime, u64, u64)>,
+    stamp: Option<(SystemTime, u64, i64, u64)>,
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
 }
 
 impl OpenWorkbook {
-    fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64)> {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+    fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64, i64)> {
+        std::fs::metadata(path).ok().and_then(|m| {
+            // ctime catches same-mtime/same-length replacements
+            // (e.g. a file swapped by rename) the pair would alias.
+            #[cfg(unix)]
+            let ctime = {
+                use std::os::unix::fs::MetadataExt as _;
+                m.ctime()
+            };
+            #[cfg(not(unix))]
+            let ctime = 0i64;
+            m.modified().ok().map(|t| (t, m.len(), ctime))
+        })
     }
 
     fn hash_of(path: &PathBuf) -> Option<u64> {
@@ -49,10 +58,10 @@ impl OpenWorkbook {
         Some(h)
     }
 
-    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, u64)> {
-        let (mtime, len) = Self::stat_of(path)?;
+    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, i64, u64)> {
+        let (mtime, len, ctime) = Self::stat_of(path)?;
         let hash = Self::hash_of(path)?;
-        Some((mtime, len, hash))
+        Some((mtime, len, ctime, hash))
     }
 
     fn load(path: &PathBuf) -> Result<Self, String> {
@@ -76,19 +85,19 @@ impl OpenWorkbook {
         // Stat first (cheap): unchanged stat means no re-read at
         // all. Changed stat re-hashes; only a changed hash (real
         // content change) triggers the expensive reload.
-        let Some((mtime, len)) = Self::stat_of(&self.path) else {
+        let Some((mtime, len, ctime)) = Self::stat_of(&self.path) else {
             return Err(format!(
                 "workbook {} was deleted or became unreadable",
                 self.path.display()
             ));
         };
-        if let Some((old_mtime, old_len, old_hash)) = self.stamp {
-            if (mtime, len) == (old_mtime, old_len) {
+        if let Some((old_mtime, old_len, old_ctime, old_hash)) = self.stamp {
+            if (mtime, len, ctime) == (old_mtime, old_len, old_ctime) {
                 return Ok(());
             }
             if Self::hash_of(&self.path) == Some(old_hash) {
                 // Content-preserving touch: refresh the stamp.
-                self.stamp = Some((mtime, len, old_hash));
+                self.stamp = Some((mtime, len, ctime, old_hash));
                 return Ok(());
             }
         }

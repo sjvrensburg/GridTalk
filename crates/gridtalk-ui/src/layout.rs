@@ -60,11 +60,18 @@ pub fn compute_layout_cancellable(
         );
     }
     let ids: Vec<usize> = graph.nodes.iter().map(|n| n.id).collect();
-    // Cap the O(n^2) repulsion at the first 500 nodes; larger
-    // graphs keep their seeded positions for the rest (edge
-    // attraction still applies to every node).
+    // Cap the O(n^2) repulsion at 500 nodes STRIDE-SAMPLED across
+    // all ids (not the first 500 in build order, which left every
+    // tail node repulsion-free). Non-sampled nodes are moved only
+    // by edge attraction and their seeded positions.
     const MAX_REPEL_NODES: usize = 500;
-    let repel_ids: Vec<usize> = ids.iter().take(MAX_REPEL_NODES).copied().collect();
+    let repel_ids: Vec<usize> = if ids.len() <= MAX_REPEL_NODES {
+        ids.clone()
+    } else {
+        (0..MAX_REPEL_NODES)
+            .map(|i| ids[i * ids.len() / MAX_REPEL_NODES])
+            .collect()
+    };
     for _ in 0..iterations {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;

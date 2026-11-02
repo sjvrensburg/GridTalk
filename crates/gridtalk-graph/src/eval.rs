@@ -333,7 +333,23 @@ impl<'a> Parser<'a> {
                 while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
                     self.bump();
                 }
-                let name: String = self.chars[start..self.pos].iter().collect();
+                let mut name: String = self.chars[start..self.pos].iter().collect();
+                // Digit-bearing function names (LOG10(...)): extend
+                // the token over digits when a '(' follows, else it
+                // is a cell ref (LOG10 the cell) as before.
+                if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    let save = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric()) {
+                        self.bump();
+                    }
+                    let extended: String = self.chars[start..self.pos].iter().collect();
+                    self.skip_ws();
+                    if self.peek() == Some('(') {
+                        name = extended;
+                    } else {
+                        self.pos = save;
+                    }
+                }
                 self.skip_ws();
                 if name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE") {
                     let v = if name.eq_ignore_ascii_case("TRUE") {

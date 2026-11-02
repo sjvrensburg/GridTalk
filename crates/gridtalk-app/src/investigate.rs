@@ -105,8 +105,11 @@ pub fn investigate_with(
             // Directly-read ref_context cells are citations too —
             // but only when the named sheet actually exists (the
             // tool calls above return error text for a bad sheet).
-            let sheet_ok = parse_cell_ref(&clean)
-                .is_some_and(|(sheet_name, _, _)| tools.sheet_for(&sheet_name).is_some());
+            let sheet_ok = parse_cell_ref(&clean).is_some_and(|(sheet_name, r, c)| {
+                tools
+                    .sheet_for(&sheet_name)
+                    .is_some_and(|sh| r < sh.cells.len() && c < sh.max_col())
+            });
             if sheet_ok && !citations.contains(&clean) {
                 citations.push(clean.clone());
             }
@@ -319,11 +322,25 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
     for qref in qualified_refs(question) {
         if parse_cell_ref(&qref).is_some() {
             if let Some(pos) = question.find(&qref) {
-                for next in question[pos + qref.len()..].split_whitespace().take(12) {
+                // Accept a number only as the immediate value or
+                // after an introducer (is/becomes/=/to/set): scanning
+                // blindly invents overrides from unrelated numbers
+                // later in the question.
+                let tail: Vec<&str> = question[pos + qref.len()..].split_whitespace().collect();
+                for (j, next) in tail.iter().take(12).enumerate() {
                     let n =
                         next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
                     if let Ok(v) = n.parse::<f64>() {
-                        return Some((qref, v));
+                        let introduced = j == 0
+                            || tail[..j].iter().rev().take(3).any(|t| {
+                                matches!(
+                                    t.trim_matches(|c: char| !c.is_alphanumeric()),
+                                    "is" | "becomes" | "equals" | "to" | "set" | "at"
+                                ) || t.contains('=')
+                            });
+                        if introduced {
+                            return Some((qref, v));
+                        }
                     }
                 }
             }

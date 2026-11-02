@@ -356,6 +356,11 @@ impl<'a> Tools<'a> {
                 if self.sheet(&target_sheet).is_none() {
                     return ToolResult::err("what_if", format!("no sheet named {target_sheet}"));
                 }
+                // Canonicalise to the workbook's own sheet names:
+                // callers may write sheet1!a1 in any case, and the
+                // evaluator matches sheet names exactly.
+                let override_sheet = self.sheet(&override_sheet).unwrap().name.clone();
+                let target_sheet = self.sheet(&target_sheet).unwrap().name.clone();
                 match what_if_in_workbook(
                     self.wb,
                     (&override_sheet, orow, ocol),

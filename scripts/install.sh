@@ -35,11 +35,15 @@ for bin in gridtalk gridtalk-ui; do
   cp "target/release/$bin" "$DIR/.$bin.tmp-$$"
   chmod +x "$DIR/.$bin.tmp-$$"
 done
+# Recheck BOTH targets before the first rename, so a binary that
+# appeared during the build cannot leave a mixed pair installed.
 for bin in gridtalk gridtalk-ui; do
   if [ -e "$DIR/$bin" ] && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
     echo "refusing to overwrite existing $DIR/$bin (set GRIDTALK_FORCE=1 to replace)" >&2
     exit 1
   fi
+done
+for bin in gridtalk gridtalk-ui; do
   mv "$DIR/.$bin.tmp-$$" "$DIR/$bin"
 done
 trap - EXIT

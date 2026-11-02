@@ -313,7 +313,11 @@ fn read_http_response(
                         return Err(InferError::Cancelled);
                     }
                 }
-                if last_progress_at.elapsed() > std::time::Duration::from_secs(30) {
+                // Pre-first-byte waits are governed by the 300 s
+                // deadline, not the stall budget.
+                if (last_progress > 0 || header_end.is_some())
+                    && last_progress_at.elapsed() > std::time::Duration::from_secs(30)
+                {
                     return Err(InferError::Http(
                         "endpoint stalled for over 30 seconds".into(),
                     ));

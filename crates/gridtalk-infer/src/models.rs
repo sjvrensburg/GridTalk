@@ -21,6 +21,9 @@ pub struct GgufInfo {
 pub enum ModelError {
     NotGguf(String),
     Truncated(String),
+    /// Tensor extent beyond EOF: not a header truncation, so the
+    /// windowed header reader must not retry on it.
+    Extent(String),
     Io(std::io::Error),
     Http(String),
     InvalidName(String),
@@ -31,6 +34,7 @@ impl std::fmt::Display for ModelError {
         match self {
             ModelError::NotGguf(m) => write!(f, "not a GGUF file: {m}"),
             ModelError::Truncated(m) => write!(f, "truncated GGUF: {m}"),
+            ModelError::Extent(m) => write!(f, "GGUF tensor extent invalid: {m}"),
             ModelError::Io(e) => write!(f, "io error: {e}"),
             ModelError::Http(m) => write!(f, "download error: {m}"),
             ModelError::InvalidName(m) => write!(f, "invalid model name: {m}"),
@@ -149,6 +153,9 @@ impl<'a> Reader<'a> {
 
 /// (block elements, bytes per block) for known GGML tensor types.
 fn ggml_type_layout(ty: u32) -> Option<(u64, u64)> {
+    // Enum order and block sizes from the vendored ggml.h /
+    // ggml-common.h (llama-cpp-sys-2 0.1.160), cross-checked
+    // against its static_assert block sizes (QK_K = 256).
     Some(match ty {
         0 => (1, 4),      // F32
         1 => (1, 2),      // F16
@@ -164,11 +171,26 @@ fn ggml_type_layout(ty: u32) -> Option<(u64, u64)> {
         13 => (256, 176), // Q5_K
         14 => (256, 210), // Q6_K
         15 => (256, 292), // Q8_K
-        16 => (1, 1),     // I8
-        17 => (1, 2),     // I16
-        18 => (1, 4),     // I32
-        19 => (1, 8),     // I64
-        20 => (1, 8),     // F64
+        16 => (256, 66),  // IQ2_XXS
+        17 => (256, 74),  // IQ2_XS
+        18 => (256, 98),  // IQ3_XXS
+        19 => (256, 50),  // IQ1_S
+        20 => (32, 18),   // IQ4_NL
+        21 => (256, 110), // IQ3_S
+        22 => (256, 82),  // IQ2_S
+        23 => (256, 136), // IQ4_XS
+        24 => (1, 1),     // I8
+        25 => (1, 2),     // I16
+        26 => (1, 4),     // I32
+        27 => (1, 8),     // I64
+        28 => (1, 8),     // F64
+        29 => (256, 56),  // IQ1_M
+        30 => (1, 2),     // BF16
+        34 => (256, 54),  // TQ1_0
+        35 => (256, 66),  // TQ2_0
+        39 => (32, 17),   // MXFP4
+        41 => (32, 6),    // Q1_0
+        42 => (32, 10),   // Q2_0
         _ => return None,
     })
 }
@@ -244,7 +266,7 @@ fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelErr
             .and_then(|v| v.checked_add(*size))
             .ok_or_else(|| ModelError::NotGguf(format!("tensor {name} extent overflow")))?;
         if end > file_len {
-            return Err(ModelError::Truncated(format!(
+            return Err(ModelError::Extent(format!(
                 "tensor {name} extends to {end}, beyond the {file_len}-byte file"
             )));
         }
@@ -288,6 +310,16 @@ pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
 }
 
 use std::io::Seek as _;
+
+/// Best-effort directory fsync (durability after rename).
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
 
 /// Unique temp file in the cache dir (O_EXCL via create_new, so a
 /// pre-planted symlink at a predictable name is never followed).
@@ -422,6 +454,7 @@ impl ModelManager {
         let copy_result = (|| -> Result<u64, ModelError> {
             let mut from = std::fs::File::open(src)?;
             let n = std::io::copy(&mut from, &mut tmp_file)?;
+            tmp_file.sync_all()?;
             drop(tmp_file);
             // Re-validate the copied bytes, not just the source
             // (the source may have changed during the copy).
@@ -438,6 +471,7 @@ impl ModelManager {
         std::fs::rename(&tmp, &dest).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
+        sync_dir(&self.dir);
         Ok(ModelEntry {
             name,
             path: dest,
@@ -583,6 +617,7 @@ impl ModelManager {
                     return Err(ModelError::Http("download exceeds the 64 GiB cap".into()));
                 }
             }
+            out.sync_all()?;
             Ok(total)
         })();
         let copied = match copied {
@@ -609,6 +644,7 @@ impl ModelManager {
         std::fs::rename(&tmp, &dest).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
+        sync_dir(&self.dir);
         Ok(ModelEntry {
             name,
             path: dest,
@@ -674,6 +710,34 @@ mod tests {
         with_payload.resize(aligned as usize, 0);
         with_payload.extend_from_slice(&[0u8; 40]);
         assert!(parse_gguf(&with_payload).is_ok());
+    }
+
+    #[test]
+    fn gguf_iq_type_sizes_use_the_ggml_enum() {
+        // Type 16 is IQ2_XXS (256 elements / 66-byte blocks), NOT
+        // I8: a 256-element tensor needs exactly 66 payload bytes.
+        let build = |ty: u32, payload: usize| -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"GGUF");
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(b"w");
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&256u64.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            let aligned = (b.len() as u64).div_ceil(32) * 32;
+            b.resize(aligned as usize, 0);
+            b.extend_from_slice(&vec![0u8; payload]);
+            b
+        };
+        assert!(parse_gguf(&build(16, 10)).is_err());
+        assert!(parse_gguf(&build(16, 66)).is_ok());
+        // Type 24 is I8: 256 elements need 256 bytes.
+        assert!(parse_gguf(&build(24, 66)).is_err());
+        assert!(parse_gguf(&build(24, 256)).is_ok());
     }
 
     #[test]

@@ -231,11 +231,11 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                 .to_string();
             let mut triggers = Vec::new();
             let mut body_lines = Vec::new();
-            // Only a Triggers line on line 0 is metadata; every
-            // later line is body, verbatim (commit_version writes
-            // the metadata line first, so bodies round-trip).
+            // A Triggers line in the first three lines is
+            // metadata (hand-written skills may lead with a title
+            // or blank line; docs/adapters.md promises this).
             for (idx, line) in text.lines().enumerate() {
-                let header = idx == 0;
+                let header = idx < 3;
                 let parsed = if header {
                     line.trim()
                         .strip_prefix("Triggers:")
@@ -335,6 +335,7 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_file_name(format!(
@@ -342,8 +343,23 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         path.file_name().and_then(|f| f.to_str()).unwrap_or("file"),
         std::process::id()
     ));
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    match std::fs::rename(&tmp, path) {
+    // fsync the temp file before rename and the parent directory
+    // after, so a power loss cannot lose a committed adapter.
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    match result {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -420,11 +436,10 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
     }
     // Root pointer + a copy of the active files for easy reading,
     // each swapped in atomically so a crash cannot truncate them.
-    // The version is already committed (vN renamed in), so a failed
-    // convenience copy must warn, not report the commit as failed.
-    if let Err(e) = write_atomic(&dir.join("adapter.toml"), &knob_text(&committed)) {
-        eprintln!("gridtalk: warning: committed v{next} but root adapter.toml update failed: {e}");
-    }
+    // The root adapter.toml is the version POINTER (load_adapter
+    // reads it), so its failure is a failed commit: propagate.
+    // Only the ADAPTER.md convenience copy is best-effort.
+    write_atomic(&dir.join("adapter.toml"), &knob_text(&committed))?;
     if let Err(e) = write_atomic(&dir.join("ADAPTER.md"), &committed.rules) {
         eprintln!("gridtalk: warning: committed v{next} but root ADAPTER.md update failed: {e}");
     }
@@ -441,9 +456,12 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     let target = current.version - 1;
     if target > 0 {
         let vdir = dir.join(format!("v{target}"));
+        let toml_ok =
+            std::fs::read_to_string(vdir.join("adapter.toml")).is_ok_and(|t| !t.trim().is_empty());
         if !vdir.is_dir()
-            || !vdir.join("adapter.toml").is_file()
+            || !toml_ok
             || !vdir.join("ADAPTER.md").is_file()
+            || !vdir.join("skills").is_dir()
         {
             return Err(format!(
                 "adapter {name} cannot roll back: v{target} is missing or incomplete on disk"
@@ -465,7 +483,14 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
     } else {
         load_adapter(root, name).rules
     };
-    write_atomic(&dir.join("ADAPTER.md"), &root_rules)?;
+    // The pointer already moved; a failed convenience refresh
+    // must warn, not report failure (a retry would roll back a
+    // second version).
+    if let Err(e) = write_atomic(&dir.join("ADAPTER.md"), &root_rules) {
+        eprintln!(
+            "gridtalk: warning: rolled back to v{target} but root ADAPTER.md refresh failed: {e}"
+        );
+    }
     Ok(target)
 }
 
