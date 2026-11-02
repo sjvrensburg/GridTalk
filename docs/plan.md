@@ -38,9 +38,9 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] OpenAI-compatible external backend (verbatim send, http; https = typed error until TLS lands)
 - [x] Deterministic echo backend for tests/demos
 - [x] Inference spike harness: `gridtalk spike` probes candle → mistral.rs → llama-cpp FFI (candle loads GGUF today; other rungs report why not — see `docs/spikes/inference-engine.md`)
-- [ ] Local embeddings (bge-small via fastembed/ONNX) + hybrid fusion *(not started)*
+- [x] Local embeddings + hybrid fusion: offline n-gram `EmbeddingModel` (bge-small ONNX remains an adapter swap behind the same trait), cosine vector index, Reciprocal Rank Fusion of lexical+vector rankings (`HybridIndex`, used by chat + investigate)
 - [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|remove|list`, http download (https = typed error)
-- [ ] Investigate tool-loop harness (Phase 3b, behind a toggle)
+- [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → cells → formulas → what_if tools with a recorded trail and citations; formula evaluator with what-if recomputation
 
 ## Phase 4: Dual-view & polish — IN PROGRESS
 
@@ -49,7 +49,11 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] egui graph pane: force layout computed in a worker thread, cached per revision, click-to-select nodes
 - [x] Split / Graph-full / Grid-full modes persisted per workbook (`~/.config/gridtalk/ui-state.json`)
 - [x] Settings window (config path, verbatim-send notice)
-- [ ] First-run wizard, installers (Linux/macOS/Windows) *(not started)*
+- [x] First-run wizard (privacy posture → backend/model → ready; writes `config.toml`, persisted `first_run_done`)
+- [x] Installers: tag-triggered release workflow (Linux/macOS/Windows archives attached to the GitHub Release) + `scripts/install.sh`; release workflow is exercised on the first `v*` tag
+
+- [x] Real-model generation: candle (`candle-gen`) generates from a real llama-family GGUF — SmolLM2-135M Q4_K_M at 31.9 tok/s, 541 ms first token (CPU, release). See `docs/spikes/inference-engine.md`
+- [x] Gridcraft ribbon reuse: companion-app composition (`gridtalk open-in-gridcraft`), decision 0003 — embedding rejected (forked egui + `SheetApp` ownership)
 
 ## Validation
 

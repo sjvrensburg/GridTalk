@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [features]
 candle = ["gridtalk-infer/candle"]
+candle-gen = ["gridtalk-infer/candle-gen"]
 mistralrs = ["gridtalk-infer/mistralrs"]
 llamacpp = ["gridtalk-infer/llamacpp"]
 

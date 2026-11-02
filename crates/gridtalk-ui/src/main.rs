@@ -9,7 +9,7 @@ mod layout;
 use gridtalk_graph::{
     build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
 };
-use gridtalk_index::Index;
+use gridtalk_index::HybridIndex as Index;
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
 use layout::{spawn_layout, LayoutWorker, Pos};
@@ -40,6 +40,8 @@ impl ViewMode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiPrefs {
     pub mode_by_workbook: BTreeMap<String, ViewMode>,
+    #[serde(default)]
+    pub first_run_done: bool,
 }
 
 impl UiPrefs {
@@ -116,6 +118,10 @@ pub struct GridTalkApp {
     status: String,
     show_settings: bool,
     config_path: String,
+    wizard_step: u8,
+    wizard_backend: String,
+    wizard_model_path: String,
+    wizard_base_url: String,
 }
 
 impl Default for GridTalkApp {
@@ -135,8 +141,37 @@ impl Default for GridTalkApp {
             status: "Open a workbook (File > Open, or pass a path as argv[1]).".into(),
             show_settings: false,
             config_path: std::env::var("GRIDTALK_CONFIG").unwrap_or_default(),
+            wizard_step: 0,
+            wizard_backend: "local".into(),
+            wizard_model_path: String::new(),
+            wizard_base_url: "http://127.0.0.1:11434/v1".into(),
         }
     }
+}
+
+/// Write the wizard's choices to the GridTalk config file.
+fn write_wizard_config(
+    backend: &str,
+    model_path: &str,
+    base_url: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = UiPrefs::path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+    let mut text = String::from("[inference]\n");
+    text.push_str(&format!("backend = \"{backend}\"\n"));
+    text.push_str("engine = \"candle\"\n");
+    if !model_path.is_empty() {
+        text.push_str(&format!("model_path = \"{model_path}\"\n"));
+    }
+    if backend == "openai-compatible" {
+        text.push_str(&format!("base_url = \"{base_url}\"\n"));
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 impl GridTalkApp {
@@ -290,6 +325,70 @@ impl eframe::App for GridTalkApp {
                 ui.label(&self.status);
             });
         });
+
+        if !self.prefs.first_run_done {
+            let mut finish = false;
+            egui::Window::new("Welcome to GridTalk")
+                .collapsible(false)
+                .show(&ctx, |ui| {
+                    match self.wizard_step {
+                        0 => {
+                            ui.heading("Talk to your spreadsheet — locally.");
+                            ui.label("GridTalk answers questions about your workbook with cell citations.");
+                            ui.label("Local model: nothing leaves this PC.");
+                            ui.label("External endpoint: cell values are sent verbatim (no redaction in GridTalk).");
+                            if ui.button("Next").clicked() {
+                                self.wizard_step = 1;
+                            }
+                        }
+                        1 => {
+                            ui.heading("Choose inference");
+                            ui.radio_value(&mut self.wizard_backend, "local".to_string(), "Local GGUF model (private)");
+                            if self.wizard_backend == "local" {
+                                ui.label("Model .gguf path (tokenizer.json must sit beside it):");
+                                ui.text_edit_singleline(&mut self.wizard_model_path);
+                                ui.label("Import models with: gridtalk models import <file.gguf>");
+                            }
+                            ui.radio_value(&mut self.wizard_backend, "openai-compatible".to_string(), "OpenAI-compatible endpoint");
+                            if self.wizard_backend == "openai-compatible" {
+                                ui.label("Base URL (a redacting proxy can live here):");
+                                ui.text_edit_singleline(&mut self.wizard_base_url);
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Back").clicked() {
+                                    self.wizard_step = 0;
+                                }
+                                if ui.button("Next").clicked() {
+                                    self.wizard_step = 2;
+                                }
+                            });
+                        }
+                        _ => {
+                            ui.heading("Ready");
+                            ui.label("Open a workbook from the top-left, then ask a question in the chat pane.");
+                            ui.label("Tip: click a graph node to jump to its cells; click a cell to find its graph node.");
+                            if ui.button("Finish").clicked() {
+                                finish = true;
+                            }
+                        }
+                    }
+                });
+            if finish {
+                match write_wizard_config(
+                    &self.wizard_backend,
+                    &self.wizard_model_path,
+                    &self.wizard_base_url,
+                ) {
+                    Ok(p) => {
+                        self.config_path = p.display().to_string();
+                        self.status = format!("Setup saved to {}", p.display());
+                    }
+                    Err(e) => self.status = format!("Could not save setup: {e}"),
+                }
+                self.prefs.first_run_done = true;
+                self.prefs.save();
+            }
+        }
 
         if self.show_settings {
             egui::Window::new("Settings").show(&ctx, |ui| {
@@ -531,6 +630,16 @@ mod tests {
         let json = serde_json::to_string(&prefs).unwrap();
         let back: UiPrefs = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mode_by_workbook.get("d"), Some(&ViewMode::GraphFull));
+    }
+
+    #[test]
+    fn wizard_config_round_trips_through_parser() {
+        let text = "[inference]\nbackend = \"local\"\nengine = \"candle\"\nmodel_path = \"/models/m.gguf\"\n";
+        let cfg = gridtalk_infer::config::Config::parse(text);
+        assert_eq!(cfg.inference.backend, "local");
+        assert_eq!(cfg.inference.model_path.as_deref(), Some("/models/m.gguf"));
+        // First-run default: wizard not yet done.
+        assert!(!UiPrefs::default().first_run_done);
     }
 
     #[test]

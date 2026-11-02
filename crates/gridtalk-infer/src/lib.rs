@@ -78,6 +78,9 @@ pub type CancelToken = Arc<AtomicBool>;
 pub mod models;
 pub mod probe;
 
+#[cfg(feature = "candle-gen")]
+pub mod generate;
+
 pub trait ChatBackend: Send {
     fn name(&self) -> &str;
     /// Stream tokens through `on_token`. Implementations must poll
@@ -222,7 +225,17 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .as_ref()
                 .and_then(|env| std::env::var(env).ok()),
         }),
-        _ => Box::new(EchoBackend),
+        _ => {
+            #[cfg(feature = "candle-gen")]
+            {
+                if let Some(backend) = crate::generate::candle_backend_from_config(cfg) {
+                    if backend.model_path.exists() {
+                        return Box::new(backend);
+                    }
+                }
+            }
+            Box::new(EchoBackend)
+        }
     }
 }
 

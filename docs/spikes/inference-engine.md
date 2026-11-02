@@ -34,15 +34,27 @@ Run it with: `gridtalk spike <model.gguf>`.
 - [ ] llama-cpp FFI rung: probe reports `compiled_in=false`.
       Enabling it requires the native llama.cpp build; kept last
       deliberately.
-- [ ] Real-model latency/throughput (first-token, tok/s, CPU/GPU):
-      not measured — requires downloading a real GGUF
-      (`gridtalk models import <file.gguf>`), then re-running
-      `gridtalk --features candle spike <model>`.
+- [x] **Real-model generation + benchmark (2026-11-02).**
+      Model: SmolLM2-135M-Instruct Q4_K_M GGUF (101 MB, arch
+      `llama`) + its `tokenizer.json`, run through
+      `gridtalk --features candle-gen generate` on an AMD Ryzen AI
+      MAX+ 395 (CPU only, release build):
+      prompt 24 tokens, generated 48 tokens,
+      **first token 546 ms** (includes weight load),
+      **31.4 tok/s**. Debug build: 7.1 s / 2.2 tok/s — release
+      builds are required for interactive use. The target
+      Qwen3-MoE model remains unproven on candle (its arch is
+      rejected with a typed error naming `qwen3moe`); that is the
+      trigger to evaluate rung 2 (mistral.rs).
 
-## Interim decision
+## Decision
 
-candle is the default rung (it loads GGUF today). mistral.rs is
-next if candle's architecture coverage blocks the target model.
-llama-cpp FFI remains the fallback of last resort. Until a real
-model is wired, local chat uses the deterministic echo backend so
-the full pipeline stays demoable.
+candle is the default rung: it loads GGUF and *generates* today
+for llama-family models (feature `candle-gen`; configured via
+`model_path` in config, with `tokenizer.json` beside the model).
+Users whose model architecture candle rejects (e.g. Qwen3-MoE)
+get a typed error naming the architecture — evaluating mistral.rs
+(rung 2) is the next step for those models, and llama-cpp FFI
+remains the fallback of last resort. With no model configured,
+local chat uses the deterministic echo backend so the full
+pipeline stays demoable.

@@ -747,6 +747,8 @@ impl IncrementalSnapshot {
     }
 }
 
+pub mod eval;
+
 /// Render a region as a cited passage for the LLM context.
 pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
     let mut out = format!("Range {}\n", region.range.a1());

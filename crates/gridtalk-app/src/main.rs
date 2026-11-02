@@ -3,8 +3,10 @@
 //! the grid<->graph two-way sync state machine that the egui front
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
+mod investigate;
+
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
-use gridtalk_index::Index;
+use gridtalk_index::{HybridIndex, Index};
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
 use std::sync::atomic::AtomicBool;
@@ -160,6 +162,96 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        "investigate" => {
+            let file = args
+                .get(2)
+                .ok_or("usage: gridtalk investigate <file> <question...>")?;
+            let question = args[3..].join(" ");
+            if question.is_empty() {
+                return Err("usage: gridtalk investigate <file> <question...>".into());
+            }
+            let wb = load_workbook(file)?;
+            let (graph, violations) = build_graph(&wb);
+            if !violations.is_empty() {
+                return Err(format!("graph invariants violated: {violations:?}"));
+            }
+            let hybrid = HybridIndex::build(&wb, &graph);
+            let tools = investigate::Tools {
+                wb: &wb,
+                graph: &graph,
+                hybrid: &hybrid,
+            };
+            let cfg = config_from_env();
+            let backend = backend_from_config(&cfg.inference);
+            let inv = investigate::investigate(&question, &tools, backend.as_ref(), 8);
+            for step in &inv.trail {
+                println!(
+                    "[tool] {} ({}) -> {}",
+                    step.tool,
+                    step.args,
+                    step.result.replace('\n', " | ")
+                );
+            }
+            println!("\ncitations: {}", inv.citations.join(", "));
+            println!("\n--- answer ({}) ---\n{}", backend.name(), inv.answer);
+            Ok(())
+        }
+        "open-in-gridcraft" => {
+            let file = args
+                .get(2)
+                .ok_or("usage: gridtalk open-in-gridcraft <file>")?;
+            let bin = gridcraft_binary().ok_or(
+                "Gridcraft binary not found. Build it once with: cargo build --manifest-path vendor/gridcraft/Cargo.toml -p gridcraft (or set GRIDTALK_GRIDCRAFT_BIN)",
+            )?;
+            println!("Launching Gridcraft ({}) on {file}", bin.display());
+            println!("Edit and save there, then re-open the file in GridTalk to re-snapshot it.");
+            std::process::Command::new(&bin)
+                .arg(file)
+                .spawn()
+                .map_err(|e| format!("failed to launch Gridcraft: {e}"))?;
+            Ok(())
+        }
+        "generate" => {
+            #[cfg(feature = "candle-gen")]
+            {
+                let model = args
+                    .get(2)
+                    .ok_or("usage: gridtalk generate <model.gguf> <tokenizer.json> <prompt...>")?;
+                let tokenizer = args.get(3).ok_or("missing tokenizer.json path")?;
+                let prompt = args[4..].join(" ");
+                let backend = gridtalk_infer::generate::CandleLlamaBackend {
+                    model_path: std::path::PathBuf::from(model),
+                    tokenizer_path: std::path::PathBuf::from(tokenizer),
+                    seed: 42,
+                    temperature: 0.7,
+                };
+                let req = ChatRequest {
+                    system: "You are a helpful spreadsheet assistant.".into(),
+                    user: prompt,
+                    max_tokens: 48,
+                };
+                let cancel = Arc::new(AtomicBool::new(false));
+                let stats = backend
+                    .generate_with_stats(&req, &cancel, &mut |t| print!("{t}"))
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "\n\n[bench] prompt_tokens={} generated={} first_token_ms={:?} total_ms={:.0} tok/s={:.1}",
+                    stats.prompt_tokens,
+                    stats.generated_tokens,
+                    stats.first_token_ms.map(|v| (v * 10.0).round() / 10.0),
+                    stats.total_ms,
+                    stats.tokens_per_sec
+                );
+                Ok(())
+            }
+            #[cfg(not(feature = "candle-gen"))]
+            {
+                Err(
+                    "generate requires a candle-gen build: cargo run -p gridtalk-app --features candle-gen -- generate ..."
+                        .into(),
+                )
+            }
+        }
         "spike" => {
             let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
             for report in gridtalk_infer::probe::probe_ladder(std::path::Path::new(file)) {
@@ -222,6 +314,24 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Locate the Gridcraft desktop binary (decision 0003).
+pub fn gridcraft_binary() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("GRIDTALK_GRIDCRAFT_BIN") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for profile in ["release", "debug"] {
+        let candidate = root.join(format!("vendor/gridcraft/target/{profile}/gridcraft"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn truncate(s: &str, n: usize) -> String {
