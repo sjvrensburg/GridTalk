@@ -4,7 +4,7 @@
 //! authority for full recalculation; this evaluator answers
 //! "what happens to this formula if that cell changes" locally.
 
-use crate::{formula_refs, CellValue, SheetSnapshot};
+use crate::{CellValue, SheetSnapshot};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,11 +117,13 @@ fn eval_cell_value(
         CellValue::Bool(b) => Ok(if b { 1.0 } else { 0.0 }),
         CellValue::Empty => Ok(0.0),
         CellValue::Formula { expr, cached } => {
-            if let Some(crate::CellValue::Number(n)) = cached.as_deref() {
-                if formula_refs(&expr).is_empty() {
-                    return Ok(*n);
-                }
-            }
+            // The expression is the truth; a stale cached value is
+            // only a fallback for formulas we cannot evaluate
+            // (unsupported functions), never an override of it.
+            let cached_num = match cached.as_deref() {
+                Some(crate::CellValue::Number(n)) => Some(*n),
+                _ => None,
+            };
             let mut parser = Parser {
                 chars: expr.chars().collect(),
                 pos: 0,
@@ -131,15 +133,24 @@ fn eval_cell_value(
                 depth,
                 nest: 0,
             };
-            let v = parser.parse_expr()?;
-            parser.skip_ws();
-            if parser.pos != parser.chars.len() {
-                return Err(EvalError::Parse(format!(
-                    "trailing tokens at {} in formula",
-                    parser.pos
-                )));
+            let evaluated = (|| -> Result<f64, EvalError> {
+                let v = parser.parse_expr()?;
+                parser.skip_ws();
+                if parser.pos != parser.chars.len() {
+                    return Err(EvalError::Parse(format!(
+                        "trailing tokens at {} in formula",
+                        parser.pos
+                    )));
+                }
+                Ok(v)
+            })();
+            match evaluated {
+                Ok(v) => Ok(v),
+                Err(e) => match cached_num {
+                    Some(n) => Ok(n),
+                    None => Err(e),
+                },
             }
-            Ok(v)
         }
         other => Err(EvalError::Type(format!(
             "cell contains non-numeric {other:?}"
@@ -460,7 +471,12 @@ impl<'a> Parser<'a> {
         let save = self.pos;
         if let Ok((t, r, c)) = self.parse_ref_token() {
             self.skip_ws();
-            if matches!(self.peek(), Some(',') | Some(')'))
+            let overridden = self
+                .state
+                .override_cell
+                .is_some_and(|(os, orow, ocol, _)| (os, orow, ocol) == (t, r, c));
+            if !overridden
+                && matches!(self.peek(), Some(',') | Some(')'))
                 && matches!(self.sheets[t].get(r, c), CellValue::Empty)
             {
                 return Ok(());
@@ -501,6 +517,14 @@ impl<'a> Parser<'a> {
                             // Excel semantics: aggregates ignore empty
                             // and text cells in ranges, but formula
                             // errors (e.g. #DIV/0!) propagate.
+                            // A simulated override wins over the
+                            // stored cell, whatever its type.
+                            if let Some((os, orow, ocol, value)) = self.state.override_cell {
+                                if (os, orow, ocol) == (range_sheet, r, c) {
+                                    values.push(value);
+                                    continue;
+                                }
+                            }
                             let cell = self.sheets[range_sheet].get(r, c);
                             if matches!(
                                 cell,
@@ -570,6 +594,16 @@ pub fn eval_cell_with_override(
     value: f64,
     target_ref: (&str, usize, usize),
 ) -> Result<f64, EvalError> {
+    if !value.is_finite() {
+        return Err(EvalError::Type("what-if value must be finite".into()));
+    }
+    for (sheet, r, c) in [override_ref, target_ref] {
+        if r > 10_000 || c > 1_000 {
+            return Err(EvalError::Ref(format!(
+                "coordinates beyond the evaluation grid on {sheet}"
+            )));
+        }
+    }
     let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
     let find = |name: &str| {
         sheets
@@ -775,6 +809,25 @@ mod tests {
             cells: vec![vec![CellValue::Number(5.0)]],
         });
         assert!(eval_cell_in_workbook(&wb, "Sheet1", 1, 0).is_err());
+    }
+
+    #[test]
+    fn eval_regressions_round4() {
+        // An override of an Empty cell inside a SUM range counts.
+        let wb = parse_delimited("d", "S", "A,B\n,=SUM(A2:A2)\n", ',');
+        let (before, after) = what_if_in_workbook(&wb, ("S", 1, 0), 7.0, ("S", 1, 1)).unwrap();
+        assert_eq!((before, after), (0.0, 7.0));
+        // A stale cache never overrides the expression (1+2 != 999).
+        let sheet = crate::SheetSnapshot {
+            name: "S".into(),
+            cells: vec![vec![CellValue::Formula {
+                expr: "1+2".into(),
+                cached: Some(Box::new(CellValue::Number(999.0))),
+            }]],
+        };
+        assert_eq!(eval_cell(&sheet, 0, 0).unwrap(), 3.0);
+        // with_override validates finiteness like what_if.
+        assert!(eval_cell_with_override(&wb, ("S", 1, 0), f64::NAN, ("S", 1, 1)).is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub fn probe_model(model_path: &Path) -> EngineReport {
             tensor_count: Some(info.tensor_count as usize),
             header_ok: true,
             detail: format!(
-                "GGUF header OK (arch {:?}, {} tensors; header only — not a load test); llama.cpp loads every GGUF architecture, with all layers offloaded to Vulkan when a driver is present",
+                "GGUF header OK (arch {:?}, {} tensors). Header-only check: the engine has NOT loaded this file; run `gridtalk generate` for a real load test",
                 info.architecture, info.tensor_count
             ),
         },

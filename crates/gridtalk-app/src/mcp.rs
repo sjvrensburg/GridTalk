@@ -18,20 +18,27 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 struct OpenWorkbook {
     path: PathBuf,
-    /// (len, content hash) captured *before* reading, so a write
-    /// during the load cannot stamp new metadata onto old content,
-    /// and a content-preserving touch does not force a reload.
-    stamp: Option<(u64, u64)>,
+    /// (mtime, len, content hash): stat first on every call;
+    /// the file is only re-read/hashed when stat changed, and
+    /// only reloaded when the hash also changed.
+    stamp: Option<(SystemTime, u64, u64)>,
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
 }
 
 impl OpenWorkbook {
-    fn stamp_of(path: &PathBuf) -> Option<(u64, u64)> {
+    fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64)> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+    }
+
+    fn hash_of(path: &PathBuf) -> Option<u64> {
         let bytes = std::fs::read(path).ok()?;
         // FNV-1a over the content: cheap and deterministic.
         let mut h: u64 = 0xcbf29ce484222325;
@@ -39,7 +46,13 @@ impl OpenWorkbook {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        Some((bytes.len() as u64, h))
+        Some(h)
+    }
+
+    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, u64)> {
+        let (mtime, len) = Self::stat_of(path)?;
+        let hash = Self::hash_of(path)?;
+        Some((mtime, len, hash))
     }
 
     fn load(path: &PathBuf) -> Result<Self, String> {
@@ -60,11 +73,23 @@ impl OpenWorkbook {
     }
 
     fn fresh(&mut self) -> Result<(), String> {
-        // (length, content hash): same-mtime replacements and
-        // content changes are picked up; mere touches are not.
-        if Self::stamp_of(&self.path) != self.stamp {
-            *self = OpenWorkbook::load(&self.path.clone())?;
+        // Stat first (cheap): unchanged stat means no re-read at
+        // all. Changed stat re-hashes; only a changed hash (real
+        // content change) triggers the expensive reload.
+        let Some((mtime, len)) = Self::stat_of(&self.path) else {
+            return Ok(());
+        };
+        if let Some((old_mtime, old_len, old_hash)) = self.stamp {
+            if (mtime, len) == (old_mtime, old_len) {
+                return Ok(());
+            }
+            if Self::hash_of(&self.path) == Some(old_hash) {
+                // Content-preserving touch: refresh the stamp.
+                self.stamp = Some((mtime, len, old_hash));
+                return Ok(());
+            }
         }
+        *self = OpenWorkbook::load(&self.path.clone())?;
         Ok(())
     }
 
@@ -85,6 +110,9 @@ pub struct McpServer {
     order: std::collections::VecDeque<String>,
     next_id: u64,
     initialized: bool,
+    /// True only once an `initialize` *request* has succeeded;
+    /// a bare notifications/initialized never unlocks the server.
+    initialize_seen: bool,
 }
 
 impl Default for McpServer {
@@ -94,6 +122,7 @@ impl Default for McpServer {
             order: std::collections::VecDeque::new(),
             next_id: 1,
             initialized: false,
+            initialize_seen: false,
         }
     }
 }
@@ -133,7 +162,11 @@ impl McpServer {
         // any id-based early return so notifications/initialized
         // can actually land.
         if request.get("id").is_none() {
-            if request.get("method").and_then(|m| m.as_str()) == Some("notifications/initialized") {
+            // A bare notifications/initialized never unlocks the
+            // server: only a completed initialize request does.
+            if request.get("method").and_then(|m| m.as_str()) == Some("notifications/initialized")
+                && self.initialize_seen
+            {
                 self.initialized = true;
             }
             return None;
@@ -154,9 +187,10 @@ impl McpServer {
         };
         let result = match method.as_str() {
             "initialize" => {
-                if self.initialized {
+                if self.initialize_seen {
                     Err((-32602, "already initialized".to_string()))
                 } else {
+                    self.initialize_seen = true;
                     self.initialized = true;
                     let client_version = request
                         .pointer("/params/protocolVersion")
@@ -215,6 +249,19 @@ impl McpServer {
             .ok_or((-32602, "missing or non-string argument: name".to_string()))?
             .to_string();
         let name = name.as_str();
+        const KNOWN_TOOLS: [&str; 8] = [
+            "open_workbook",
+            "close_workbook",
+            "search",
+            "expand",
+            "get_cells",
+            "list_formulas",
+            "what_if",
+            "graph_overview",
+        ];
+        if !KNOWN_TOOLS.contains(&name) {
+            return Err((-32602, format!("unknown tool: {name}")));
+        }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
         // Reject unknown arguments per tool (schemas declare
         // additionalProperties: false).
@@ -301,7 +348,7 @@ impl McpServer {
                 let id = req_str(&args, "workbook_id")?;
                 if self.workbooks.remove(id).is_some() {
                     self.order.retain(|x| x != id);
-                    text_result(format!("closed {id}"), false)
+                    structured_result(json!({"closed": id}), false)
                 } else {
                     Err((-32602, format!("unknown workbook_id {id}")))
                 }
@@ -374,6 +421,7 @@ pub fn serve_stdio() -> Result<(), String> {
     // until OOM before any parse error could be reported.
     const MAX_LINE: usize = 1024 * 1024;
     let mut reader = std::io::BufReader::new(stdin.lock());
+    let mut discarding = false;
     loop {
         let mut raw: Vec<u8> = Vec::new();
         loop {
@@ -402,9 +450,14 @@ pub fn serve_stdio() -> Result<(), String> {
             let done = chunk.ends_with(b"\n");
             raw.extend_from_slice(&chunk);
             if raw.len() > MAX_LINE {
-                let resp = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "request line exceeds the 1 MiB cap"}});
-                writeln!(stdout, "{resp}").map_err(|e| e.to_string())?;
-                stdout.flush().map_err(|e| e.to_string())?;
+                if !discarding {
+                    // One error per oversized frame, then discard
+                    // through the newline without parsing the tail.
+                    discarding = true;
+                    let resp = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "request line exceeds the 1 MiB cap"}});
+                    writeln!(stdout, "{resp}").map_err(|e| e.to_string())?;
+                    stdout.flush().map_err(|e| e.to_string())?;
+                }
                 raw.clear();
                 if done {
                     break;
@@ -415,6 +468,12 @@ pub fn serve_stdio() -> Result<(), String> {
             if done {
                 break;
             }
+        }
+        if discarding {
+            // The oversized frame ended at its newline; resume
+            // normal framing with the next line.
+            discarding = false;
+            continue;
         }
         if raw.is_empty() {
             break;
@@ -515,6 +574,15 @@ mod tests {
             .handle(&json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]))
             .unwrap();
         assert_eq!(batch["error"]["code"], -32600);
+        // A bare notifications/initialized must NOT unlock the
+        // server (no initialize request was ever answered).
+        let mut fresh2 = McpServer::default();
+        let _ = fresh2.handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        let locked = rpc(
+            &mut fresh2,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        assert_eq!(locked["error"]["code"], -32002);
         // Unsupported protocol versions are negotiated down.
         let mut fresh = McpServer::default();
         let init = rpc(

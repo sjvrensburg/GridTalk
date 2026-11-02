@@ -88,4 +88,14 @@ jobs:
       - name: Install Rust 1.95
         shell: bash
         run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
-      - run: cargo check --locked -p gridtalk-graph -p gridtalk-index
+      - name: Install Vulkan SDK (MSRV job, for the infer build script)
+        shell: bash
+        run: |
+          SDK_DIR="$HOME/vulkan-sdk/x86_64"
+          mkdir -p "$HOME/vulkan-sdk"
+          curl -fL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
+          echo "ed66477d587a5587dc3601b1c2cdcc1fab5529c505f53a00171876cecd9b4fbe  /tmp/vulkan-sdk.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          echo "VULKAN_SDK=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
+      - run: cargo check --locked -p gridtalk-graph -p gridtalk-index -p gridtalk-infer

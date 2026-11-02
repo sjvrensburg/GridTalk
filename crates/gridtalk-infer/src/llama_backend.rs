@@ -56,6 +56,7 @@ struct CachedState {
 struct CachedModel {
     path: PathBuf,
     stamp: Option<(std::time::SystemTime, u64)>,
+    n_gpu_layers: u32,
     model: LlamaModel,
 }
 
@@ -115,10 +116,11 @@ impl LlamaCppBackend {
         }
         let state = guard.as_mut().unwrap();
         let stamp = file_stamp(&self.model_path);
-        let needs_load = state
-            .model
-            .as_ref()
-            .is_none_or(|cached| cached.path != self.model_path || cached.stamp != stamp);
+        let needs_load = state.model.as_ref().is_none_or(|cached| {
+            cached.path != self.model_path
+                || cached.stamp != stamp
+                || cached.n_gpu_layers != self.n_gpu_layers
+        });
         if needs_load {
             let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
             let loaded =
@@ -132,6 +134,7 @@ impl LlamaCppBackend {
             state.model = Some(CachedModel {
                 path: self.model_path.clone(),
                 stamp,
+                n_gpu_layers: self.n_gpu_layers,
                 model: loaded,
             });
         }
@@ -241,7 +244,14 @@ impl LlamaCppBackend {
             // Any "<|...|>" special in the *text* is a stop marker
             // (possibly split across pieces, e.g. "<|im_end|").
             let mut stop_marker = false;
-            for marker in ["<|im_end|>", "<|end_of_text|>", "<|endoftext|>"] {
+            for marker in [
+                "<|im_end|>",
+                "<|end_of_text|>",
+                "<|endoftext|>",
+                "<|eot_id|>",
+                "<end_of_turn>",
+                "<|end|>",
+            ] {
                 if let Some(at) = cumulative.find(marker) {
                     text_bytes.truncate(at);
                     if let Ok(text) = std::str::from_utf8(&text_bytes) {

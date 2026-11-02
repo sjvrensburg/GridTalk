@@ -29,11 +29,26 @@ pub struct Investigation {
 /// search -> cells -> formulas (plus what_if when the question asks
 /// for it); the backend then composes the final cited answer from
 /// the gathered context. Every step lands in the trail.
+#[allow(dead_code)] // convenience wrapper over investigate_with
 pub fn investigate(
     question: &str,
     tools: &Tools,
     backend: &dyn ChatBackend,
     max_steps: usize,
+) -> Result<Investigation, gridtalk_infer::InferError> {
+    investigate_with(question, tools, backend, max_steps, None, None)
+}
+
+/// Adapter-aware variant: the adapter's rules/skills are appended
+/// to the system prompt, its `top_k` sizes the search, and an
+/// optional per-workbook sidecar's rules are appended last.
+pub fn investigate_with(
+    question: &str,
+    tools: &Tools,
+    backend: &dyn ChatBackend,
+    max_steps: usize,
+    adapter: Option<&crate::adapter::Adapter>,
+    sidecar: Option<&str>,
 ) -> Result<Investigation, gridtalk_infer::InferError> {
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
@@ -58,7 +73,8 @@ pub fn investigate(
     // Citations come from the structured hits, never scraped from
     // display text. The search step reuses this one search (it is
     // recorded in the trail, not re-executed).
-    let hits = tools.hybrid.search(question, 3);
+    let top_k = adapter.map(|a| a.top_k).unwrap_or(3);
+    let hits = tools.hybrid.search(question, top_k);
     let citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
     let search_result = if hits.is_empty() {
@@ -76,6 +92,18 @@ pub fn investigate(
     });
 
     let mut context = format!("search results:\n{search_result}");
+    // Adapter knob: a question naming a cell gets that cell's
+    // formulas/cells directly, even when retrieval missed it.
+    if adapter.is_some_and(|a| a.ref_context) && trail.len() < max_steps {
+        if let Some(clean) = qualified_refs(question).into_iter().next() {
+            let formulas = run("formulas", &format!("range={clean}"), &mut trail);
+            context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
+            if trail.len() < max_steps {
+                let cells = run("cells", &format!("range={clean}"), &mut trail);
+                context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
+            }
+        }
+    }
     if let Some(range) = &top_range {
         if trail.len() < max_steps {
             let expanded = run("expand", &format!("range={range}"), &mut trail);
@@ -95,7 +123,16 @@ pub fn investigate(
     let lower = question.to_lowercase();
     if lower.contains("what if") && trail.len() < max_steps {
         if let Some((cell, value)) = parse_what_if(question) {
-            if let Some(range) = &top_range {
+            // With an explicit target the what-if runs even when
+            // retrieval missed; without one it needs the top region
+            // to find a dependent formula.
+            let explicit_target = parse_what_if_target(question, &cell);
+            if top_range.is_none() && explicit_target.is_none() {
+                context.push_str(
+                    "\n\nwhat-if: skipped — retrieval found no region and the question names no target cell.",
+                );
+            }
+            if let Some(range) = top_range.as_ref().or(explicit_target.as_ref()) {
                 if let Some((sheet, _, _, _, _)) = parse_range(range) {
                     // Target: an explicit Sheet!Cell in the question,
                     // else the first formula cell in the top region,
@@ -129,7 +166,7 @@ pub fn investigate(
                         }
                         None
                     };
-                    match parse_what_if_target(question).or_else(dependent_target) {
+                    match parse_what_if_target(question, &cell).or_else(dependent_target) {
                         Some(target) => {
                             let result = run(
                                 "what_if",
@@ -149,8 +186,24 @@ pub fn investigate(
         }
     }
 
+    let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
+    if let Some(a) = adapter {
+        system.push_str(&a.prompt_for(question));
+    }
+    if let Some(sidecar) = sidecar {
+        if !sidecar.trim().is_empty() {
+            system.push_str("\n\nWorkbook notes (from the .gridtalk.md sidecar):\n");
+            system.push_str(sidecar.trim());
+        }
+    }
+    // Bound the prompt: adapter/skill/sidecar text is user input.
+    const MAX_SYSTEM_CHARS: usize = 12_000;
+    if system.chars().count() > MAX_SYSTEM_CHARS {
+        system = system.chars().take(MAX_SYSTEM_CHARS).collect();
+        system.push_str("\n[adapter content truncated]");
+    }
     let req = ChatRequest {
-        system: "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".into(),
+        system,
         user: format!("Question: {question}\n\nTool results:\n{context}"),
         max_tokens: 512,
     };
@@ -160,7 +213,10 @@ pub fn investigate(
     // raw context masquerading as an answer.
     backend.stream(&req, &cancel, &mut |t| answer.push_str(t))?;
     if answer.trim().is_empty() {
-        answer = context.clone();
+        // Never substitute raw tool context as if it were an
+        // answer; say plainly that the backend produced nothing.
+        answer = "(the backend returned an empty answer; see the trail for the tool results)"
+            .to_string();
     }
     // Citation guarantee: the printed answer must cite a range we
     // actually retrieved.
@@ -173,6 +229,71 @@ pub fn investigate(
         trail,
         citations,
     })
+}
+
+/// All sheet-qualified cell refs in a question, in order,
+/// honouring quoted sheet names ('My Sheet'!B2) — whitespace
+/// tokenising alone would shred those.
+pub fn qualified_refs(question: &str) -> Vec<String> {
+    let chars: Vec<char> = question.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        if chars[i] == '\'' {
+            // Quoted sheet name up to the closing quote (with ''
+            // escapes), then '!'.
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < chars.len() {
+                if chars[j] == '\'' {
+                    if chars.get(j + 1) == Some(&'\'') {
+                        j += 2;
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if closed && chars.get(j + 1) == Some(&'!') {
+                let mut k = j + 2;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '$') {
+                    k += 1;
+                }
+                let token: String = chars[start..k].iter().collect();
+                if parse_cell_ref(&token).is_some() {
+                    out.push(token);
+                }
+                i = k;
+                continue;
+            }
+            i += 1;
+        } else if chars[i].is_alphabetic() || chars[i] == '_' {
+            let mut j = i;
+            while j < chars.len()
+                && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
+            {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'!') {
+                let mut k = j + 1;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '$') {
+                    k += 1;
+                }
+                let token: String = chars[start..k].iter().collect();
+                if parse_cell_ref(&token).is_some() {
+                    out.push(token);
+                }
+                i = k;
+                continue;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 fn parse_what_if(question: &str) -> Option<(String, f64)> {
@@ -224,15 +345,15 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
     None
 }
 
-fn parse_what_if_target(question: &str) -> Option<String> {
-    // "what happens to D4" / "effect on Sheet1!D4"
-    for tok in question.split_whitespace() {
-        let clean = tok.trim_matches(|c: char| !(c.is_alphanumeric() || c == '!'));
-        if clean.contains('!') && parse_cell_ref(clean).is_some() {
-            return Some(clean.to_string());
-        }
-    }
-    None
+fn parse_what_if_target(question: &str, override_cell: &str) -> Option<String> {
+    // "what happens to Sheet1!D4": the first qualified ref that is
+    // NOT the override itself. (The bench's own phrasing names the
+    // override first, so the naive first-token pick targets the
+    // wrong cell.)
+    let override_ref = parse_cell_ref(override_cell);
+    qualified_refs(question)
+        .into_iter()
+        .find(|cell| parse_cell_ref(cell) != override_ref)
 }
 
 #[cfg(test)]
@@ -324,6 +445,20 @@ mod tests {
         assert_eq!(
             parse_what_if("what if B2 is 10"),
             Some(("B2".to_string(), 10.0))
+        );
+        // The bench phrasing names the override first; the target
+        // must be the OTHER qualified ref, never the override.
+        assert_eq!(
+            parse_what_if_target(
+                "What if Sheet1!B2 becomes 12? What happens to Sheet1!D2?",
+                "Sheet1!B2"
+            ),
+            Some("Sheet1!D2".to_string())
+        );
+        // Quoted sheet names survive ref extraction.
+        assert_eq!(
+            qualified_refs("what is 'My Sheet'!B2 worth?"),
+            vec!["'My Sheet'!B2".to_string()]
         );
         // Sheet-qualified overrides parse too.
         assert_eq!(

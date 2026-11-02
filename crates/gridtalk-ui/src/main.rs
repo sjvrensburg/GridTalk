@@ -44,6 +44,9 @@ pub struct UiPrefs {
     pub first_run_done: bool,
     #[serde(default)]
     pub config_path: String,
+    /// Active adapter name ("" = none).
+    #[serde(default)]
+    pub active_adapter: String,
 }
 
 /// GridTalk's config directory: `$GRIDTALK_CONFIG_DIR` when set,
@@ -64,6 +67,19 @@ pub fn config_dir() -> std::path::PathBuf {
     }
 }
 
+/// Adapters root, mirroring gridtalk-app's resolution:
+/// GRIDTALK_CONFIG's parent first, else the platform config dir.
+pub fn adapters_root() -> std::path::PathBuf {
+    if let Ok(cfg) = std::env::var("GRIDTALK_CONFIG") {
+        if let Some(parent) = std::path::PathBuf::from(&cfg).parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("adapters");
+            }
+        }
+    }
+    config_dir().join("adapters")
+}
+
 impl UiPrefs {
     pub fn path() -> std::path::PathBuf {
         config_dir().join("ui-state.json")
@@ -71,8 +87,32 @@ impl UiPrefs {
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("gridtalk-ui: warning: bad ui-state.json ({e}); using defaults");
-                UiPrefs::default()
+                // Salvage valid keys instead of discarding every
+                // preference over one bad value.
+                eprintln!("gridtalk-ui: warning: bad ui-state.json ({e}); salvaging valid keys");
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                let mut prefs = UiPrefs::default();
+                if let Some(map) = value.get("mode_by_workbook") {
+                    if let Ok(m) = serde_json::from_value(map.clone()) {
+                        prefs.mode_by_workbook = m;
+                    }
+                }
+                prefs.first_run_done = value
+                    .get("first_run_done")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                prefs.config_path = value
+                    .get("config_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                prefs.active_adapter = value
+                    .get("active_adapter")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                prefs
             }),
             Err(_) => UiPrefs::default(),
         }
@@ -90,7 +130,10 @@ impl UiPrefs {
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(&p, text) {
+                // Atomic: write temp, then rename over the target.
+                let tmp = p.with_extension("json.tmp");
+                let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &p));
+                if let Err(e) = result {
                     eprintln!("gridtalk-ui: warning: cannot save {}: {e}", p.display());
                 }
             }
@@ -157,6 +200,10 @@ pub struct GridTalkApp {
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
     frame_revision: u64,
+    show_adapters: bool,
+    adapter_cache: Vec<(String, String)>,
+    adapter_card_cache: String,
+    active_adapter: String,
     layout_size: (f32, f32),
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
@@ -175,6 +222,18 @@ impl Default for GridTalkApp {
         } else {
             std::env::var("GRIDTALK_CONFIG").unwrap_or_default()
         };
+        let saved_adapter = prefs.active_adapter.clone();
+        // A deleted/renamed adapter must not stay silently active.
+        let saved_adapter = if !saved_adapter.is_empty()
+            && !adapters_root().join(&saved_adapter).is_dir()
+        {
+            eprintln!(
+                "gridtalk-ui: warning: active adapter {saved_adapter:?} no longer exists; clearing it"
+            );
+            String::new()
+        } else {
+            saved_adapter
+        };
         GridTalkApp {
             inc: None,
             graph: Graph::default(),
@@ -190,6 +249,10 @@ impl Default for GridTalkApp {
             status: "Open a workbook (File > Open, or pass a path as argv[1]).".into(),
             show_settings: false,
             config_path,
+            show_adapters: false,
+            adapter_cache: Vec::new(),
+            adapter_card_cache: String::new(),
+            active_adapter: saved_adapter,
             current_path: None,
             saved_revision: 0,
             selected_sheet: 0,
@@ -402,6 +465,142 @@ impl GridTalkApp {
         self.layout_revision = u64::MAX; // force fresh layout for the new graph
     }
 
+    /// Load the active adapter for chat, mirroring the app
+    /// crate's prompt assembly: rules, trigger-matched skills,
+    /// then the per-workbook sidecar last.
+    fn active_adapter_prompt(&self, question: &str) -> (String, usize) {
+        if self.active_adapter.is_empty() {
+            return (String::new(), 3);
+        }
+        let dir = adapters_root().join(&self.active_adapter);
+        let knobs = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
+        let get = |key: &str| {
+            knobs.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == key {
+                    let v = v.trim();
+                    let v = v
+                        .strip_prefix('"')
+                        .and_then(|q| q.split('"').next())
+                        .unwrap_or(v);
+                    let v = v.split(" #").next().unwrap_or(v);
+                    Some(v.trim().to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let version: u32 = get("version").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let top_k: usize = get("top_k").and_then(|v| v.parse().ok()).unwrap_or(3);
+        let rules_dir = if version > 0 && dir.join(format!("v{version}")).is_dir() {
+            dir.join(format!("v{version}"))
+        } else {
+            dir.clone()
+        };
+        let mut text = String::new();
+        let rules = std::fs::read_to_string(rules_dir.join("ADAPTER.md")).unwrap_or_default();
+        if !rules.trim().is_empty() {
+            text.push_str(&format!(
+                "\n\nAdapter rules (learned for this workbook shape):\n{}",
+                rules.trim()
+            ));
+        }
+        // Skills: a `Triggers:` line in the first three lines
+        // scopes the skill (word-boundary match); none = always.
+        let q_padded = format!(" {} ", question.to_lowercase());
+        if let Ok(entries) = std::fs::read_dir(rules_dir.join("skills")) {
+            let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut triggers: Vec<String> = Vec::new();
+                let mut has_header = false;
+                for line in body.lines().take(3) {
+                    if let Some(rest) = line
+                        .trim()
+                        .strip_prefix("Triggers:")
+                        .or_else(|| line.trim().strip_prefix("triggers:"))
+                    {
+                        has_header = true;
+                        triggers = rest
+                            .split(',')
+                            .map(|t| t.trim().to_lowercase())
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                    }
+                }
+                let applies = !has_header
+                    || triggers
+                        .iter()
+                        .any(|t| q_padded.contains(&format!(" {t} ")));
+                if applies {
+                    text.push_str(&format!("\n\nSkill:\n{}", body.trim()));
+                }
+            }
+        }
+        // Per-workbook sidecar applies last.
+        if let Some(path) = &self.current_path {
+            let sidecar = std::path::PathBuf::from(format!("{}.gridtalk.md", path.display()));
+            if let Ok(notes) = std::fs::read_to_string(&sidecar) {
+                if !notes.trim().is_empty() {
+                    text.push_str(&format!(
+                        "\n\nWorkbook notes (from the .gridtalk.md sidecar):\n{}",
+                        notes.trim()
+                    ));
+                }
+            }
+        }
+        (text, top_k.clamp(1, 25))
+    }
+
+    /// Refresh the adapter picker cache (filesystem reads happen
+    /// on open/selection change, never per frame).
+    fn refresh_adapter_cache(&mut self) {
+        let root = adapters_root();
+        let mut names: Vec<String> = std::fs::read_dir(&root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        self.adapter_cache = names
+            .iter()
+            .map(|name| {
+                let knobs = std::fs::read_to_string(root.join(name).join("adapter.toml"))
+                    .unwrap_or_default();
+                let version = knobs
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.trim().split_once('=')?;
+                        if k.trim() == "version" {
+                            let v = v.trim().trim_matches('"');
+                            let v = v.split(" #").next().unwrap_or(v).trim();
+                            Some(v.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "0".into());
+                (name.clone(), version)
+            })
+            .collect();
+        self.adapter_card_cache = if self.active_adapter.is_empty() {
+            String::new()
+        } else {
+            std::fs::read_to_string(root.join(&self.active_adapter).join("CARD.md"))
+                .unwrap_or_else(|_| "(no eval record yet)".into())
+        };
+    }
+
     fn ask(&mut self) {
         let question = self.chat_input.trim().to_string();
         if question.is_empty() || self.chat_busy {
@@ -413,7 +612,8 @@ impl GridTalkApp {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
-        let hits = index.search(&question, 3);
+        let (adapter_prompt, adapter_top_k) = self.active_adapter_prompt(&question);
+        let hits = index.search(&question, adapter_top_k);
         if hits.is_empty() {
             self.push_chat(
                 "gridtalk",
@@ -453,7 +653,9 @@ impl GridTalkApp {
             };
             let backend = backend_from_config(&cfg.inference);
             let req = ChatRequest {
-                system: "You answer questions about a spreadsheet using only the cited context. Always cite the range.".into(),
+                system: format!(
+                    "You answer questions about a spreadsheet using only the cited context. Always cite the range.{adapter_prompt}"
+                ),
                 user: format!("Question: {question}\n\nContext:\n{context}"),
                 max_tokens: 512,
             };
@@ -636,15 +838,34 @@ impl eframe::App for GridTalkApp {
             if inc.pending_edits() == 0 && !self.edit_buffers.is_empty() {
                 let snapshot = inc.snapshot();
                 self.edit_buffers.retain(|(sheet_idx, r, c), buffer| {
+                    // Drop buffers whose *parsed value* equals the
+                    // stored cell ("99.0" for 99), not only exact
+                    // text matches.
                     let current = snapshot
                         .sheets
                         .get(*sheet_idx)
-                        .map(|s| cell_input_text(&s.get(*r, *c)))
-                        .unwrap_or_default();
-                    &current != buffer
+                        .map(|s| s.get(*r, *c))
+                        .unwrap_or(gridtalk_graph::CellValue::Empty);
+                    parse_cell_input(buffer) != current
                 });
             }
         }
+        // Bound the edit-buffer map: scrolled-to cells insert an
+        // entry each, so prune value-equal entries when it grows.
+        if self.edit_buffers.len() > 1024 {
+            if let Some(inc) = &self.inc {
+                let snapshot = inc.snapshot().clone();
+                self.edit_buffers.retain(|(sheet_idx, r, c), buffer| {
+                    let current = snapshot
+                        .sheets
+                        .get(*sheet_idx)
+                        .map(|s| s.get(*r, *c))
+                        .unwrap_or(gridtalk_graph::CellValue::Empty);
+                    parse_cell_input(buffer) != current
+                });
+            }
+        }
+
         // Cache only the displayed sheet, refreshed when the
         // revision or selected sheet changes — never a whole-workbook
         // clone per frame.
@@ -729,6 +950,17 @@ impl eframe::App for GridTalkApp {
                 ui.separator();
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
+                }
+                let adapter_label = if self.active_adapter.is_empty() {
+                    "Adapter: none".to_string()
+                } else {
+                    format!("Adapter: {}", self.active_adapter)
+                };
+                if ui.button(adapter_label).clicked() {
+                    self.show_adapters = !self.show_adapters;
+                    if self.show_adapters {
+                        self.refresh_adapter_cache();
+                    }
                 }
                 ui.label(egui::RichText::new(&self.status).small())
                     .on_hover_text(&self.status);
@@ -822,6 +1054,48 @@ impl eframe::App for GridTalkApp {
                         )
                     }
                 }
+            }
+        }
+
+        if self.show_adapters {
+            let root = adapters_root();
+            let mut chosen: Option<String> = None;
+            let active = self.active_adapter.clone();
+            let cache = self.adapter_cache.clone();
+            let card = self.adapter_card_cache.clone();
+            let mut open = self.show_adapters;
+            egui::Window::new("Adapters")
+                .open(&mut open)
+                .show(&ctx, |ui| {
+                    ui.label(format!("Adapters in {}", root.display()));
+                    if ui.selectable_label(active.is_empty(), "(none)").clicked() {
+                        chosen = Some(String::new());
+                    }
+                    for (name, version) in &cache {
+                        if ui
+                            .selectable_label(active == *name, format!("{name} (v{version})"))
+                            .clicked()
+                        {
+                            chosen = Some(name.clone());
+                        }
+                    }
+                    if !active.is_empty() {
+                        ui.separator();
+                        ui.label("CARD.md:");
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.label(&card);
+                            });
+                    }
+                    ui.label("Optimise from the CLI: gridtalk optimise <workbook>");
+                });
+            self.show_adapters = open;
+            if let Some(name) = chosen {
+                self.active_adapter = name;
+                self.prefs.active_adapter = self.active_adapter.clone();
+                self.prefs.save();
+                self.refresh_adapter_cache();
             }
         }
 
@@ -987,14 +1261,28 @@ impl GridTalkApp {
                                     .edit_buffers
                                     .entry(key)
                                     .or_insert_with(|| cell_input_text(&cell));
-                                let resp = ui.add_sized(
-                                    [col_w, row_height],
+                                let editor =
                                     egui::TextEdit::singleline(buffer).text_color(if is_selected {
                                         egui::Color32::YELLOW
                                     } else {
                                         egui::Color32::LIGHT_GRAY
-                                    }),
-                                );
+                                    });
+                                let resp = if is_selected {
+                                    // A filled background so an
+                                    // empty selected cell is visible.
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(col_w, row_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        egui::Color32::from_rgb(74, 62, 0),
+                                    );
+                                    ui.put(rect, editor)
+                                } else {
+                                    ui.add_sized([col_w, row_height], editor)
+                                };
                                 if resp.clicked() {
                                     clicked_cell = Some((sheet_name.clone(), r, c));
                                 }
@@ -1084,6 +1372,12 @@ impl GridTalkApp {
         let origin = rect.min;
         for e in &self.graph.edges {
             if let (Some(a), Some(b)) = (self.positions.get(&e.from), self.positions.get(&e.to)) {
+                // Cull edges with both ends off the viewport.
+                let pa = egui::pos2(origin.x + a.x, origin.y + a.y);
+                let pb = egui::pos2(origin.x + b.x, origin.y + b.y);
+                if !rect.contains(pa) && !rect.contains(pb) {
+                    continue;
+                }
                 painter.line_segment(
                     [
                         egui::pos2(origin.x + a.x, origin.y + a.y),
@@ -1130,6 +1424,10 @@ impl GridTalkApp {
                     NodeKind::Column => egui::Color32::GRAY,
                 };
                 painter.circle_filled(centre, if highlighted { 10.0 } else { 7.0 }, colour);
+                if !rect.expand(70.0).contains(centre) {
+                    // Off-viewport: no widget this frame.
+                    continue;
+                }
                 let node_rect = egui::Rect::from_center_size(centre, egui::vec2(120.0, 18.0));
                 let label = if n.label.len() > 16 {
                     format!("{}…", n.label.chars().take(16).collect::<String>())
