@@ -17,19 +17,30 @@ jobs:
         with:
           # gridtalk-graph path-depends on the vendored Gridcraft crates.
           submodules: true
+      - name: Cache Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/vulkan-sdk
+          key: vulkan-sdk-1.4.341.0-linux-x86_64
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           # Full LunarG SDK: apt fragments miss SPIRV-Headers, which
-          # ggml-vulkan's shader generator requires.
-          curl -sL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
-          mkdir -p "$HOME/vulkan-sdk"
-          tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          # ggml-vulkan's shader generator requires. The tarball is
+          # verified against a pinned SHA-256 (and --fail stops an
+          # HTTP error page being saved as the tarball).
+          SDK_DIR="$HOME/vulkan-sdk/x86_64"
+          if [ ! -x "$SDK_DIR/bin/glslc" ]; then
+            curl -fL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/1.4.341.0/linux/vulkansdk-linux-x86_64-1.4.341.0.tar.xz
+            echo "ed66477d587a5587dc3601b1c2cdcc1fab5529c505f53a00171876cecd9b4fbe  /tmp/vulkan-sdk.tar.xz" | sha256sum -c -
+            mkdir -p "$HOME/vulkan-sdk"
+            tar -xJf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk" --strip-components=1
+          fi
           # Tarball layout after --strip-components=1 is
           # $HOME/vulkan-sdk/x86_64 (setup-env.sh in the SDK
           # computes the same: <root>/$(uname -m)).
-          SDK_DIR="$HOME/vulkan-sdk/x86_64"
           test -x "$SDK_DIR/bin/glslc"
           test -f "$SDK_DIR/include/vulkan/vulkan.h"
           test -f "$SDK_DIR/lib/libvulkan.so"
@@ -41,7 +52,7 @@ jobs:
           ls "$SDK_DIR/bin/glslc" "$SDK_DIR/share/cmake/SPIRV-Headers"
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows'
-        uses: jakoch/install-vulkan-sdk-action@v1
+        uses: jakoch/install-vulkan-sdk-action@d17de7e2f5e50efb5d2123efed18497d3c58c533 # v1
         with:
           vulkan_version: 1.4.341.0
           install_runtime: true
@@ -54,7 +65,7 @@ jobs:
           # MSBuild's vcvars batch breaks in the vulkan-shaders-gen
           # subproject on GitHub runners ("cannot find batch label
           # VCEnd"); Ninja avoids that path entirely.
-          choco install ninja -y
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --version 1.12.1 }
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Get-ChildItem "$env:VULKAN_SDK" | Select-Object -First 5

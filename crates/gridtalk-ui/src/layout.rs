@@ -17,11 +17,28 @@ pub struct Pos {
 /// (workbook centre, sheets inner ring, regions/columns outer),
 /// then repel/attract iterations settle them. Pure function of the
 /// graph, so it is unit-testable without a display.
+#[allow(dead_code)] // kept as the uncancellable convenience wrapper
 pub fn compute_layout(
     graph: &Graph,
     width: f32,
     height: f32,
     iterations: usize,
+) -> BTreeMap<usize, Pos> {
+    compute_layout_cancellable(
+        graph,
+        width,
+        height,
+        iterations,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+pub fn compute_layout_cancellable(
+    graph: &Graph,
+    width: f32,
+    height: f32,
+    iterations: usize,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> BTreeMap<usize, Pos> {
     let cx = width / 2.0;
     let cy = height / 2.0;
@@ -44,6 +61,9 @@ pub fn compute_layout(
     }
     let ids: Vec<usize> = graph.nodes.iter().map(|n| n.id).collect();
     for _ in 0..iterations {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         // Repulsion between every pair (graphs here are lifted and small).
         let mut force: BTreeMap<usize, (f32, f32)> =
             ids.iter().map(|id| (*id, (0.0, 0.0))).collect();
@@ -77,8 +97,11 @@ pub fn compute_layout(
         for id in &ids {
             let (fx, fy) = force[id];
             let p = pos.get_mut(id).unwrap();
-            p.x = (p.x + fx.clamp(-12.0, 12.0)).clamp(18.0, width - 18.0);
-            p.y = (p.y + fy.clamp(-12.0, 12.0)).clamp(18.0, height - 18.0);
+            // Never invert the clamp range on a tiny pane.
+            let max_x = (width - 18.0).max(18.0);
+            let max_y = (height - 18.0).max(18.0);
+            p.x = (p.x + fx.clamp(-12.0, 12.0)).clamp(18.0, max_x);
+            p.y = (p.y + fy.clamp(-12.0, 12.0)).clamp(18.0, max_y);
         }
     }
     pos
@@ -88,21 +111,61 @@ pub fn compute_layout(
 pub struct LayoutWorker {
     pub revision: u64,
     pub rx: Receiver<(u64, BTreeMap<usize, Pos>)>,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub fn spawn_layout(graph: Graph, revision: u64, width: f32, height: f32) -> LayoutWorker {
+impl LayoutWorker {
+    pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub fn spawn_layout(
+    graph: Graph,
+    revision: u64,
+    width: f32,
+    height: f32,
+    ctx: Option<egui::Context>,
+) -> LayoutWorker {
     let (tx, rx): (Sender<(u64, BTreeMap<usize, Pos>)>, _) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
     std::thread::spawn(move || {
-        let positions = compute_layout(&graph, width, height, 140);
+        // Fewer iterations for large graphs: repulsion is O(n^2).
+        let iterations = match graph.nodes.len() {
+            0..=150 => 140,
+            151..=400 => 60,
+            _ => 25,
+        };
+        let positions =
+            compute_layout_cancellable(&graph, width, height, iterations, &worker_cancel);
         let _ = tx.send((revision, positions));
+        // Wake the frame loop so the finished layout is collected
+        // even when the window is otherwise idle.
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
     });
-    LayoutWorker { revision, rx }
+    LayoutWorker {
+        revision,
+        rx,
+        cancel,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
+
+    #[test]
+    fn layout_tiny_pane_never_panics() {
+        let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
+        let (g, _) = build_graph(&wb);
+        let pos = compute_layout(&g, 20.0, 10.0, 5);
+        assert_eq!(pos.len(), g.nodes.len());
+    }
 
     #[test]
     fn layout_covers_every_node_inside_bounds() {

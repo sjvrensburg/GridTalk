@@ -168,17 +168,50 @@ pub fn parse_gguf(bytes: &[u8]) -> Result<GgufInfo, ModelError> {
 /// falls back to a full read if the header itself is larger.
 pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
     use std::io::Read as _;
+    // Grow the header window incrementally up to a 64 MiB cap; a
+    // truncated or oversized header errors without ever reading a
+    // multi-GB tensor payload into RAM.
+    const HEADER_CAP: u64 = 64 * 1024 * 1024;
     let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    (&mut file).take(16 * 1024 * 1024).read_to_end(&mut buf)?;
-    match parse_gguf(&buf) {
-        Ok(info) => Ok(info),
-        Err(ModelError::Truncated(_)) => {
-            let bytes = std::fs::read(path)?;
-            parse_gguf(&bytes)
+    let mut window: u64 = 16 * 1024 * 1024;
+    loop {
+        buf.clear();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        (&mut file).take(window).read_to_end(&mut buf)?;
+        match parse_gguf(&buf) {
+            Err(ModelError::Truncated(_))
+                if (buf.len() as u64) >= window && window < HEADER_CAP =>
+            {
+                window = (window * 2).min(HEADER_CAP);
+            }
+            other => return other,
         }
-        Err(e) => Err(e),
     }
+}
+
+use std::io::Seek as _;
+
+/// Unique temp file in the cache dir (O_EXCL via create_new, so a
+/// pre-planted symlink at a predictable name is never followed).
+fn unique_tmp(dir: &Path, name: &str) -> Result<PathBuf, ModelError> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..16 {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = dir.join(format!(".{name}.{}-{n}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ModelError::Http(
+        "could not create a unique temp file".into(),
+    ))
 }
 
 pub fn model_cache_dir() -> PathBuf {
@@ -217,9 +250,12 @@ impl ModelManager {
         if let Ok(rd) = std::fs::read_dir(&self.dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                if p.extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+                {
                     let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    let info = std::fs::read(&p).ok().and_then(|b| parse_gguf(&b).ok());
+                    let info = parse_gguf_file(&p).ok();
                     out.push(ModelEntry {
                         name: p
                             .file_name()
@@ -270,9 +306,23 @@ impl ModelManager {
             .into_owned();
         let name = Self::checked_name(&file_name)?;
         let dest = self.dir.join(&name);
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        std::fs::copy(src, &tmp)?;
-        let bytes = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let tmp = unique_tmp(&self.dir, &name)?;
+        let copy_result = (|| -> Result<u64, ModelError> {
+            let mut from = std::fs::File::open(src)?;
+            let mut to = std::fs::File::create(&tmp)?;
+            let n = std::io::copy(&mut from, &mut to)?;
+            // Re-validate the copied bytes, not just the source
+            // (the source may have changed during the copy).
+            parse_gguf_file(&tmp)?;
+            Ok(n)
+        })();
+        let bytes = match copy_result {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
         std::fs::rename(&tmp, &dest)?;
         Ok(ModelEntry {
             name,
@@ -294,6 +344,11 @@ impl ModelManager {
     /// renamed into place only after its header validates.
     /// https is refused until a TLS transport lands.
     pub fn download_http(&self, url: &str, name: &str) -> Result<ModelEntry, ModelError> {
+        if url.contains(['\r', '\n', ' ']) {
+            return Err(ModelError::Http(
+                "url contains whitespace/control characters".into(),
+            ));
+        }
         if url.starts_with("https://") {
             return Err(ModelError::Http(
                 "https model URLs need a TLS transport or local proxy; none configured".into(),
@@ -335,21 +390,65 @@ impl ModelManager {
             }
         }
         let head_text = String::from_utf8_lossy(&head).into_owned();
-        if !head_text.contains(" 200") {
+        let status: u32 = head_text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        if status != 200 {
             return Err(ModelError::Http(format!(
                 "unexpected status: {}",
                 head_text.lines().next().unwrap_or("")
             )));
         }
+        if head_text
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            return Err(ModelError::Http(
+                "chunked download responses are not supported; use a mirror that sends Content-Length".into(),
+            ));
+        }
         std::fs::create_dir_all(&self.dir)?;
         let name = Self::checked_name(name)?;
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        let mut out = std::fs::File::create(&tmp)?;
-        let copied = std::io::copy(&mut stream, &mut out)?;
-        drop(out);
-        let info = parse_gguf_file(&tmp).map_err(|e| {
+        let tmp = unique_tmp(&self.dir, &name)?;
+        // Stream with a hard size cap (64 GiB) and a total deadline
+        // (2 h); the temp file is deleted on any breach.
+        const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2 * 60 * 60);
+        let copied = (|| -> Result<u64, ModelError> {
+            // unique_tmp already created the file (O_EXCL).
+            let mut out = std::fs::OpenOptions::new().write(true).open(&tmp)?;
+            let mut limited = (&mut stream).take(MAX_DOWNLOAD_BYTES + 1);
+            let mut buf = [0u8; 64 * 1024];
+            let mut total: u64 = 0;
+            loop {
+                let n = limited.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(ModelError::Http(
+                        "download exceeded the 2-hour deadline".into(),
+                    ));
+                }
+                out.write_all(&buf[..n])?;
+                total += n as u64;
+                if total > MAX_DOWNLOAD_BYTES {
+                    return Err(ModelError::Http("download exceeds the 64 GiB cap".into()));
+                }
+            }
+            Ok(total)
+        })();
+        let copied = match copied {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        let info = parse_gguf_file(&tmp).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-            e
         })?;
         let dest = self.dir.join(&name);
         std::fs::rename(&tmp, &dest)?;

@@ -1,4 +1,6 @@
-# GridTalk settings. Copy to ~/.config/gridtalk/config.toml
+# GridTalk settings. Copy to the GridTalk config directory:
+# Linux ~/.config/gridtalk/config.toml, Windows %APPDATA%\gridtalk\config.toml
+# (or point GRIDTALK_CONFIG / GRIDTALK_CONFIG_DIR at your own location).
 # The API key itself is never stored here — only the NAME of the
 # environment variable that holds it.
 

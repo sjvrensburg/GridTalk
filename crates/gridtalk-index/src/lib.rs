@@ -1,8 +1,9 @@
-//! Lexical index over workbook regions. The production target is
-//! tantivy + local embeddings (ExcelGRAG eg-index); this crate keeps
-//! the same public shape (index regions, hybrid search, cited hits)
-//! with a dependency-light inverted index so the pipeline is testable
-//! before the heavier engines are wired in.
+//! Lexical index over workbook regions. This crate keeps the
+//! hybrid-search public shape (index regions, hybrid search, cited
+//! hits) with a dependency-light linear-scan index: documents are
+//! lifted regions (tens to hundreds), not cells, so a scan is the
+//! intentional trade-off until region counts justify posting lists.
+//! A tantivy-backed index remains a possible future swap.
 
 pub mod embed;
 
@@ -27,7 +28,7 @@ pub struct Hit {
 
 #[derive(Debug, Default)]
 pub struct Index {
-    docs: Vec<(RangeRef, String, BTreeMap<String, usize>)>,
+    docs: Vec<(RangeRef, String, BTreeMap<String, usize>, String)>,
     df: BTreeMap<String, usize>,
     /// Regions skipped because their sheet was absent (diagnostic).
     pub dropped_regions: usize,
@@ -53,14 +54,17 @@ impl Index {
         for region in &graph.regions {
             if let Some(sheet) = sheets.get(region.range.sheet.as_str()) {
                 let passage = render_passage(sheet, region);
+                // Index the body only: the "Range Sheet1!A1:B2" header
+                // is citation boilerplate, not content.
+                let body: String = passage.lines().skip(1).collect::<Vec<_>>().join("\n");
                 let mut tf: BTreeMap<String, usize> = BTreeMap::new();
-                for t in tokenize(&passage) {
+                for t in tokenize(&body) {
                     *tf.entry(t).or_default() += 1;
                 }
                 for t in tf.keys() {
                     *idx.df.entry(t.clone()).or_default() += 1;
                 }
-                idx.docs.push((region.range.clone(), passage, tf));
+                idx.docs.push((region.range.clone(), passage, tf, body));
             } else {
                 idx.dropped_regions += 1;
             }
@@ -76,20 +80,14 @@ impl Index {
         let mut hits: Vec<Hit> = self
             .docs
             .iter()
-            .filter_map(|(range, passage, tf)| {
-                let mut score = 0.0;
-                let mut matched = Vec::new();
-                for t in &terms {
-                    if let Some(&count) = tf.get(t) {
-                        let df = *self.df.get(t).unwrap_or(&1) as f64;
-                        score += (1.0 + (count as f64).ln()) * (1.0 + (n / (1.0 + df)).ln());
-                        matched.push(t.clone());
-                    }
-                }
-                let doc_len: usize = tf.values().sum();
-                if doc_len > 0 {
-                    score /= 1.0 + (doc_len as f64).ln() * 0.1;
-                }
+            .filter_map(|(range, passage, tf, _)| {
+                let (score, matched) = self.score_doc(tf, &terms, n);
+                let _ = &matched;
+                let matched: Vec<String> = terms
+                    .iter()
+                    .filter(|t| tf.contains_key(*t))
+                    .cloned()
+                    .collect();
                 if score > 0.0 {
                     Some(Hit {
                         range: range.clone(),
@@ -120,14 +118,8 @@ impl Index {
             .docs
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, _, tf))| {
-                let mut score = 0.0;
-                for t in &terms {
-                    if let Some(&count) = tf.get(t) {
-                        let df = *self.df.get(t).unwrap_or(&1) as f64;
-                        score += (1.0 + (count as f64).ln()) * (1.0 + (n / (1.0 + df)).ln());
-                    }
-                }
+            .filter_map(|(i, (_, _, tf, _))| {
+                let (score, _) = self.score_doc(tf, &terms, n);
                 if score > 0.0 {
                     Some((i, score))
                 } else {
@@ -143,8 +135,53 @@ impl Index {
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
+    /// Shared TF-IDF scoring (with length normalisation) used by
+    /// both `search` and `ranking` so they cannot drift apart.
+    fn score_doc(
+        &self,
+        tf: &BTreeMap<String, usize>,
+        terms: &[String],
+        n: f64,
+    ) -> (f64, Vec<String>) {
+        let mut score = 0.0;
+        let mut matched = Vec::new();
+        for t in terms {
+            if let Some(&count) = tf.get(t) {
+                let df = *self.df.get(t).unwrap_or(&1) as f64;
+                score += (1.0 + (count as f64).ln()) * (1.0 + (n / (1.0 + df)).ln());
+                matched.push(t.clone());
+            }
+        }
+        let doc_len: usize = tf.values().sum();
+        if doc_len > 0 {
+            score /= 1.0 + (doc_len as f64).ln() * 0.1;
+        }
+        if score > 0.0 {
+            (score, matched)
+        } else {
+            (0.0, Vec::new())
+        }
+    }
+
     pub fn doc(&self, i: usize) -> Option<(&RangeRef, &str)> {
-        self.docs.get(i).map(|(r, p, _)| (r, p.as_str()))
+        self.docs.get(i).map(|(r, p, _, _)| (r, p.as_str()))
+    }
+
+    /// The indexed body text (passage without the Range header).
+    pub fn doc_body(&self, i: usize) -> Option<&str> {
+        self.docs.get(i).map(|(_, _, _, b)| b.as_str())
+    }
+
+    /// Query terms present in doc `i`, from the stored tf map.
+    pub fn matched_terms(&self, i: usize, terms: &[String]) -> Vec<String> {
+        match self.docs.get(i) {
+            Some((_, _, tf, _)) => terms
+                .iter()
+                .filter(|t| tf.contains_key(*t))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn doc_count(&self) -> usize {
@@ -167,7 +204,7 @@ impl HybridIndex {
         let lexical = Index::build(wb, graph);
         let model = NGramEmbedding::default();
         let texts: Vec<String> = (0..lexical.doc_count())
-            .map(|i| lexical.doc(i).unwrap().1.to_string())
+            .map(|i| lexical.doc_body(i).unwrap().to_string())
             .collect();
         let vector = VectorIndex::build(&texts, &model);
         HybridIndex {
@@ -178,6 +215,17 @@ impl HybridIndex {
         }
     }
 
+    /// Incremental refresh after an edit: lexical docs are rebuilt
+    /// (cheap token counts), but unchanged region bodies reuse their
+    /// stored embedding vectors.
+    pub fn update(&mut self, wb: &WorkbookSnapshot, graph: &Graph) {
+        self.lexical = Index::build(wb, graph);
+        let texts: Vec<String> = (0..self.lexical.doc_count())
+            .map(|i| self.lexical.doc_body(i).unwrap().to_string())
+            .collect();
+        self.vector.rebuild(&texts, &self.model);
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
         let lexical_ranking = self.lexical.ranking(query);
         let vector_ranking: Vec<usize> = self
@@ -186,17 +234,16 @@ impl HybridIndex {
             .into_iter()
             .map(|h| h.doc)
             .collect();
-        let fused = reciprocal_rank_fusion(&[lexical_ranking.clone(), vector_ranking], 60, limit);
+        // Relevance floor: lexical ranking only contains docs with a
+        // positive TF-IDF score and vector ranking only docs above
+        // the cosine threshold, so a fused hit always cleared one.
+        let fused = reciprocal_rank_fusion(&[lexical_ranking, vector_ranking], 60, limit);
         let terms = dedup_terms(tokenize(query));
         fused
             .into_iter()
             .filter_map(|(doc, score)| {
                 self.lexical.doc(doc).map(|(range, passage)| {
-                    let lexically_matched: Vec<String> = terms
-                        .iter()
-                        .filter(|term| embed::tokenize(passage).iter().any(|tok| tok == *term))
-                        .cloned()
-                        .collect();
+                    let lexically_matched = self.lexical.matched_terms(doc, &terms);
                     Hit {
                         range: range.clone(),
                         score,
@@ -251,6 +298,18 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].vector_only);
         assert!(hits[0].matched_terms.is_empty());
+    }
+
+    #[test]
+    fn hybrid_unrelated_query_returns_nothing() {
+        let wb = parse_delimited("d", "Sheet1", "Item,Qty\nApples,2\n", ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        assert!(hybrid
+            .search("zebra xylophone quantum banana", 5)
+            .is_empty());
+        // "range" (the passage header word) must not match every doc.
+        assert!(hybrid.search("range", 5).is_empty());
     }
 
     #[test]
