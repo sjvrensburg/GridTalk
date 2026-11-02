@@ -237,11 +237,11 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
             // metadata (hand-written skills may lead with a title
             // or blank line; docs/adapters.md promises this).
             let mut found_header = false;
-            for (idx, line) in text.lines().enumerate() {
-                // Only the FIRST Triggers line in the window is
-                // metadata; later ones are body (commit_version
-                // writes metadata first, so bodies round-trip).
-                let header = idx < 3 && !found_header;
+            for line in text.lines() {
+                // The FIRST Triggers line anywhere in the file is
+                // metadata (docs: a Triggers line scopes the skill);
+                // later ones are body.
+                let header = !found_header;
                 let parsed = if header {
                     line.trim()
                         .strip_prefix("Triggers:")
@@ -342,6 +342,7 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
                 .flatten()
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| valid_adapter_name(n) && !n.starts_with('.') && n != "__invalid__")
                 .collect()
         })
         .unwrap_or_default();
@@ -407,7 +408,11 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    let next = adapter.version.max(on_disk_max) + 1;
+    let next = adapter
+        .version
+        .max(on_disk_max)
+        .checked_add(1)
+        .ok_or_else(|| "adapter version overflow".to_string())?;
     let vdir = dir.join(format!("v{next}"));
     if vdir.exists() {
         return Err(format!("adapter version v{next} already exists"));
@@ -434,6 +439,12 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
             // leading dots and traversal are not.
             if !valid_adapter_name(&skill.name) || skill.name.starts_with('.') {
                 return Err(format!("invalid skill name {:?}", skill.name));
+            }
+            // "(always)" is the reserved always-apply marker.
+            if skill.triggers.len() == 1 && skill.triggers[0] == "(always)" {
+                return Err(
+                    "trigger '(always)' is reserved; use empty triggers for always-apply".into(),
+                );
             }
             let mut text = String::new();
             if skill.triggers.iter().any(|t| t == "\u{1}never") {
@@ -496,10 +507,20 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
             ));
         }
     }
+    // The root pointer must carry the TARGET version's knobs, not
+    // the outgoing version's (partial per-version tomls inherit
+    // root values, so stale knobs here would resurrect them).
     let mut pointer = if target == 0 {
         Adapter::empty(name)
     } else {
-        current.clone()
+        load_from_dir(
+            &dir.join(format!("v{target}")),
+            name,
+            target,
+            Adapter::empty(name).top_k,
+            Adapter::empty(name).max_steps,
+            false,
+        )
     };
     pointer.version = target;
     write_atomic(&dir.join("adapter.toml"), &knob_text(&pointer))?;

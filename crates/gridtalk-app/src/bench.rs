@@ -108,7 +108,10 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                             for q in formula_refs_qualified(expr) {
                                 let osheet_name =
                                     q.sheet.clone().unwrap_or_else(|| sheet.name.clone());
-                                let Some(osheet) = wb.sheets.iter().find(|s| s.name == osheet_name)
+                                let Some(osheet) = wb
+                                    .sheets
+                                    .iter()
+                                    .find(|s| s.name.eq_ignore_ascii_case(&osheet_name))
                                 else {
                                     continue;
                                 };
@@ -291,8 +294,8 @@ fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // was a false positive).
     citations.iter().any(|cited| {
         contains_bounded(answer, cited)
-            && crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
-                sheet == esheet && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
+            && crate::tools::parse_range_uncapped(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
+                sheet.eq_ignore_ascii_case(&esheet) && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
             })
     })
 }

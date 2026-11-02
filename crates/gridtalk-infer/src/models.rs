@@ -271,6 +271,14 @@ fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelErr
         .div_ceil(alignment)
         .checked_mul(alignment)
         .ok_or_else(|| ModelError::NotGguf("GGUF data offset overflow".into()))?;
+    // A data_start within one alignment quantum of EOF is the
+    // usual header padding; far beyond EOF (e.g. a 2^40 alignment)
+    // is bogus even with zero tensors.
+    if data_start > file_len && data_start - file_len >= alignment.max(1) {
+        return Err(ModelError::Truncated(
+            "GGUF data start lies beyond the end of the file".into(),
+        ));
+    }
     if tensor_count > 0 && file_len <= data_start {
         return Err(ModelError::Truncated(
             "GGUF declares tensors but has no tensor payload".into(),

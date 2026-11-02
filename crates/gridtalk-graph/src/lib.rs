@@ -1044,7 +1044,11 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             problems.push(format!("duplicate node id {}", n.id));
         }
         if let Some(r) = &n.range {
-            match wb.sheets.iter().find(|s| s.name == r.sheet) {
+            match wb
+                .sheets
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&r.sheet))
+            {
                 None => problems.push(format!("node {} range on unknown sheet {}", n.id, r.sheet)),
                 Some(s) => {
                     if r.r0 > r.r1 || r.c0 > r.c1 {
@@ -1074,7 +1078,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                 .find(|n| n.id == e.to)
                 .and_then(|n| n.range.as_ref());
             if let (Some(pa), Some(ch)) = (parent, child) {
-                if pa.sheet == ch.sheet
+                if pa.sheet.eq_ignore_ascii_case(&ch.sheet)
                     && !(pa.r0 <= ch.r0 && pa.c0 <= ch.c0 && pa.r1 >= ch.r1 && pa.c1 >= ch.c1)
                 {
                     problems.push(format!(
@@ -1143,7 +1147,11 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                             // extractor's job; this check covers
                             // same-sheet refs only.
                             if tok.contains('!')
-                                && tok.rsplit('!').nth(1).unwrap_or("") != sheet.name
+                                && !tok
+                                    .rsplit('!')
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .eq_ignore_ascii_case(&sheet.name)
                             {
                                 continue;
                             }

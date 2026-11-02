@@ -233,6 +233,7 @@ fn read_http_response(
     let mut last_progress_at = std::time::Instant::now();
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
+    let mut term_search_from = 0usize;
     loop {
         if std::time::Instant::now() > deadline {
             return Err(InferError::Http(
@@ -278,6 +279,10 @@ fn read_http_response(
                 if header_end.is_none() {
                     if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                         header_end = Some(pos + 4);
+                        // The stall window measures from the last
+                        // arrival, not from connect.
+                        last_progress_at = std::time::Instant::now();
+                        last_progress = raw.len();
                         let head = String::from_utf8_lossy(&raw[..pos]);
                         content_length = head.lines().find_map(|l| {
                             let (name, value) = l.split_once(':')?;
@@ -297,8 +302,14 @@ fn read_http_response(
                 // Chunked bodies: the terminal 0-chunk completes the
                 // response in-loop; do not wait for EOF/stall.
                 if let Some(he) = header_end {
-                    if content_length.is_none() && raw[he..].windows(5).any(|w| w == b"0\r\n\r\n") {
-                        break;
+                    if content_length.is_none() {
+                        // Scan only new bytes plus a 4-byte overlap
+                        // (the terminator can straddle reads).
+                        let from = term_search_from.max(he);
+                        if raw[from..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                            break;
+                        }
+                        term_search_from = raw.len().saturating_sub(4).max(he);
                     }
                 }
             }

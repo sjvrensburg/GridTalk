@@ -84,7 +84,16 @@ impl Index {
             let ordinal_ok = derived_regions
                 .get(sheet_idx)
                 .and_then(|rs| rs.get(local_ordinal))
-                .is_some_and(|derived| derived.range == region.range);
+                .is_some_and(|derived| {
+                    let d = &derived.range;
+                    (d.r0, d.c0, d.r1, d.c1)
+                        == (
+                            region.range.r0,
+                            region.range.c0,
+                            region.range.r1,
+                            region.range.c1,
+                        )
+                });
             let assigned = if ordinal_ok {
                 sheet_of_region(region_idx)
                     .filter(|sheet| sheet.name.eq_ignore_ascii_case(&region.range.sheet))

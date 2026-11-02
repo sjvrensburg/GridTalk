@@ -353,10 +353,13 @@ pub struct GridTalkApp {
 impl Default for GridTalkApp {
     fn default() -> Self {
         let mut prefs = UiPrefs::load();
-        let config_path = if !prefs.config_path.is_empty() {
-            prefs.config_path.clone()
-        } else {
-            std::env::var("GRIDTALK_CONFIG").unwrap_or_default()
+        // GRIDTALK_CONFIG beats the persisted prefs value (the CLI
+        // checks the env first; a wizard-saved path must not
+        // silently shadow it).
+        let config_path = match std::env::var("GRIDTALK_CONFIG") {
+            Ok(p) if !p.is_empty() => p,
+            _ if !prefs.config_path.is_empty() => prefs.config_path.clone(),
+            _ => String::new(),
         };
         let saved_adapter = prefs.active_adapter.clone();
         // A deleted/renamed adapter must not stay silently active,
@@ -579,7 +582,14 @@ impl GridTalkApp {
                 self.chat_rx = None;
                 self.chat_busy = false;
                 self.chat_started = None;
-                self.status = format!("Opened {}", path.display());
+                // rebuild() may have recorded invariant violations
+                // and dropped the index; do not paper over it.
+                if self.status.contains("invariant") {
+                    let prior = self.status.clone();
+                    self.status = format!("Opened {} — but {prior}", path.display());
+                } else {
+                    self.status = format!("Opened {}", path.display());
+                }
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
@@ -735,7 +745,8 @@ impl GridTalkApp {
                 }
                 let skill_body = body_lines.join("\n");
                 let applies = !triggers.iter().any(|t| t == "\u{1}never")
-                    && (!has_header
+                    && (triggers.is_empty()
+                        || !has_header
                         || triggers.iter().any(|t| {
                             let tw: Vec<&str> = t
                                 .split(|c: char| !c.is_alphanumeric())
@@ -1873,6 +1884,16 @@ mod tests {
         app.save();
         assert!(app.status.contains("sheets"), "status: {}", app.status);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cell_input_parsing_matches_ingest_extended() {
+        use gridtalk_graph::CellValue;
+        assert_eq!(parse_cell_input("true"), CellValue::Bool(true));
+        assert_eq!(parse_cell_input("FALSE"), CellValue::Bool(false));
+        assert!(matches!(parse_cell_input("NaN"), CellValue::Text(_)));
+        assert!(matches!(parse_cell_input("inf"), CellValue::Text(_)));
+        assert!(matches!(parse_cell_input("-infinity"), CellValue::Text(_)));
     }
 
     #[test]

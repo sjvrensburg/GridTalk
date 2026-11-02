@@ -716,6 +716,31 @@ pub fn eval_many(sheet: &SheetSnapshot, coords: &[(usize, usize)]) -> Vec<Result
         .collect()
 }
 
+/// Evaluate several cells of one named sheet with a shared memo
+/// (cross-sheet precedents resolve through the workbook).
+pub fn eval_many_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    sheet_name: &str,
+    coords: &[(usize, usize)],
+) -> Vec<Result<f64, EvalError>> {
+    let Some(idx) = wb
+        .sheets
+        .iter()
+        .position(|s| s.name.eq_ignore_ascii_case(sheet_name))
+    else {
+        return coords
+            .iter()
+            .map(|_| Err(EvalError::Ref(format!("no sheet named {sheet_name}"))))
+            .collect();
+    };
+    let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
+    let mut state = EvalState::default();
+    coords
+        .iter()
+        .map(|(r, c)| eval_cell_inner(&sheets, idx, *r, *c, &mut state, 0))
+        .collect()
+}
+
 /// Workbook what-if: the override and target may live on different
 /// sheets (formulas may reference across sheets). Returns
 /// (before, after) for the target cell.

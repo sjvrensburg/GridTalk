@@ -293,8 +293,11 @@ impl LlamaCppBackend {
             // Incremental decode: only new bytes are validated.
             // A genuinely invalid sequence becomes U+FFFD and is
             // skipped; only an incomplete trailing sequence waits.
-            {
+            loop {
                 let pending = &text_bytes[decoded_len..];
+                if pending.is_empty() {
+                    break;
+                }
                 match std::str::from_utf8(pending) {
                     Ok(t) => {
                         decoded.push_str(t);
@@ -305,10 +308,17 @@ impl LlamaCppBackend {
                         if valid > 0 {
                             decoded.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or(""));
                             decoded_len += valid;
+                            continue;
                         }
-                        if let Some(bad) = e.error_len() {
-                            decoded.push('\u{FFFD}');
-                            decoded_len += bad;
+                        match e.error_len() {
+                            // Invalid sequence: replace and move on.
+                            Some(bad) => {
+                                decoded.push('\u{FFFD}');
+                                decoded_len += bad;
+                            }
+                            // Incomplete trailing sequence: wait
+                            // for the next token's bytes.
+                            None => break,
                         }
                     }
                 }
@@ -379,6 +389,11 @@ impl LlamaCppBackend {
                 .map_err(|e| InferError::EngineUnavailable(format!("decode: {e}")))?;
         }
 
+        // Drain any held-back incomplete trailing bytes as
+        // replacement characters before the final flush.
+        if decoded_len < text_bytes.len() {
+            decoded.push_str(&String::from_utf8_lossy(&text_bytes[decoded_len..]));
+        }
         // Flush anything held back (a trailing "<|..." fragment
         // that never completed, or text after the last emit).
         if decoded.len() > emitted_len {

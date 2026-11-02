@@ -320,32 +320,37 @@ pub fn qualified_refs(question: &str) -> Vec<String> {
     out
 }
 
+/// Shared value scan for all what-if branches: the first
+/// parseable number within `window` tokens that is either
+/// immediate or introduced by is/becomes/equals/to/set/at/=.
+fn value_after(tokens: &[&str], window: usize) -> Option<f64> {
+    for (j, next) in tokens.iter().take(window).enumerate() {
+        let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
+        if let Ok(v) = n.parse::<f64>() {
+            let introduced = j == 0
+                || tokens[..j].iter().rev().take(3).any(|t| {
+                    matches!(
+                        t.trim_matches(|c: char| !c.is_alphanumeric()),
+                        "is" | "becomes" | "equals" | "to" | "set" | "at"
+                    ) || t.contains('=')
+                });
+            if introduced {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn parse_what_if(question: &str) -> Option<(String, f64)> {
     // Quoted-sheet form first via the quote-aware parser:
     // split_whitespace would shred 'My Sheet'!B2 into two tokens.
     for qref in qualified_refs(question) {
         if parse_cell_ref(&qref).is_some() {
             if let Some(pos) = question.find(&qref) {
-                // Accept a number only as the immediate value or
-                // after an introducer (is/becomes/=/to/set): scanning
-                // blindly invents overrides from unrelated numbers
-                // later in the question.
                 let tail: Vec<&str> = question[pos + qref.len()..].split_whitespace().collect();
-                for (j, next) in tail.iter().take(12).enumerate() {
-                    let n =
-                        next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-                    if let Ok(v) = n.parse::<f64>() {
-                        let introduced = j == 0
-                            || tail[..j].iter().rev().take(3).any(|t| {
-                                matches!(
-                                    t.trim_matches(|c: char| !c.is_alphanumeric()),
-                                    "is" | "becomes" | "equals" | "to" | "set" | "at"
-                                ) || t.contains('=')
-                            });
-                        if introduced {
-                            return Some((qref, v));
-                        }
-                    }
+                if let Some(v) = value_after(&tail, 12) {
+                    return Some((qref, v));
                 }
             }
         }
@@ -358,22 +363,8 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
         let clean =
             tok.trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
         if clean.contains('!') && parse_cell_ref(clean).is_some() {
-            for (j, next) in tokens.iter().skip(i + 1).take(4).enumerate() {
-                let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-                if let Ok(v) = n.parse::<f64>() {
-                    // Same introducer guard as the quoted path:
-                    // immediate value, or after is/becomes/=/to/set.
-                    let introduced = j == 0
-                        || tokens[..i + 1 + j].iter().rev().take(3).any(|t| {
-                            matches!(
-                                t.trim_matches(|c: char| !c.is_alphanumeric()),
-                                "is" | "becomes" | "equals" | "to" | "set" | "at"
-                            ) || t.contains('=')
-                        });
-                    if introduced {
-                        return Some((clean.to_string(), v));
-                    }
-                }
+            if let Some(v) = value_after(&tokens[i + 1..], 12) {
+                return Some((clean.to_string(), v));
             }
         }
     }
@@ -398,11 +389,8 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
                 .all(|c| c.is_ascii_digit())
             && !clean[byte_at(letters)..].is_empty();
         if is_ref {
-            for next in tokens.iter().skip(i + 1).take(2) {
-                let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-                if let Ok(v) = n.parse::<f64>() {
-                    return Some((clean.to_string(), v));
-                }
+            if let Some(v) = value_after(&tokens[i + 1..], 12) {
+                return Some((clean.to_string(), v));
             }
         }
     }

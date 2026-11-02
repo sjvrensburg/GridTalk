@@ -3,7 +3,7 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_cell_in_workbook, eval_many, what_if_in_workbook};
+use gridtalk_graph::eval::{eval_many_in_workbook, what_if_in_workbook};
 use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
@@ -154,6 +154,12 @@ impl<'a> Tools<'a> {
                 // Accept caller spellings (sheet1!a1:b2, $A$1) by
                 // canonicalising through the range parser first.
                 let canonical = parse_range_uncapped(range).map(|(sheet, r0, c0, r1, c1)| {
+                    // Use the workbook's own sheet spelling so the
+                    // exact finds below match node ranges.
+                    let sheet = self
+                        .sheet(&sheet)
+                        .map(|sh| sh.name.clone())
+                        .unwrap_or(sheet);
                     gridtalk_graph::RangeRef {
                         sheet,
                         r0,
@@ -282,14 +288,9 @@ impl<'a> Tools<'a> {
                             .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
                             .filter(|(r, c)| matches!(sheet.get(*r, *c), CellValue::Formula { .. }))
                             .collect();
-                        // Workbook-aware evaluation: cross-sheet
-                        // formulas must resolve their other sheet,
-                        // which the single-sheet eval_many cannot.
-                        let _ = eval_many;
-                        let evaluated: Vec<Result<f64, gridtalk_graph::eval::EvalError>> = coords
-                            .iter()
-                            .map(|(r, c)| eval_cell_in_workbook(self.wb, &sheet.name, *r, *c))
-                            .collect();
+                        // Workbook-aware evaluation with one shared
+                        // memo (not a fresh EvalState per cell).
+                        let evaluated = eval_many_in_workbook(self.wb, &sheet.name, &coords);
                         let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
                         let mut lines = Vec::new();

@@ -5,7 +5,7 @@ Hermit's contract (hermit/task.py):
     run(task: dict, adapter: Path | None) -> RunOutput
     score(task: dict, output: RunOutput) -> JudgeResult | dict
 
-`run` drives the GridTalk JSON CLI (`gridtalk investigate`) for
+`run` drives the GridTalk text CLI (`gridtalk investigate`) for
 one bench task; `score` is a deterministic judge mirroring
 `gridtalk bench`'s final-number rule — no LLM anywhere.
 
@@ -67,14 +67,22 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
             wall_s=wall,
             extra={"error": proc.stderr.strip()[-500:], "returncode": proc.returncode},
         )
-    # Anchor to the CLI's real marker line (main.rs prints
-    # "\n--- answer (backend) ---"), not the first "--- answer" anywhere.
+    # Anchor to the first answer marker AFTER the CLI citations
+    # line: trail text (which quotes the question) can forge an
+    # earlier marker, and the model can repeat one later.
     text = proc.stdout
     marker = "\n--- answer ("
-    answer = text.rsplit(marker, 1)[-1] if marker in text else text
-    answer = answer.split(") ---\n", 1)[-1].strip()
+    cit_pos = text.find("\ncitations:")
+    if cit_pos < 0:
+        cit_pos = text.find("citations:")
+    marker_pos = text.find(marker, cit_pos if cit_pos >= 0 else 0)
+    pre_marker = text[:marker_pos] if marker_pos >= 0 else text
+    if marker_pos >= 0:
+        answer = text[marker_pos + len(marker):].split(") ---\n", 1)[-1].strip()
+    else:
+        answer = text
     citations_text = "\n".join(
-        line for line in text.splitlines() if line.strip().startswith("citations:")
+        line for line in pre_marker.splitlines() if line.strip().startswith("citations:")
     )
     return RunOutput(
         output=answer,
@@ -151,7 +159,10 @@ def _parse_cell(ref: str):
     col = 0
     for ch in m.group(1).upper():
         col = col * 26 + (ord(ch) - 64)
-    return sheet, int(m.group(2)), col
+    row = int(m.group(2))
+    if row < 1:
+        return None
+    return sheet, row, col
 
 
 def _split_citations(text: str) -> list[str]:
@@ -204,6 +215,46 @@ def _contains_bounded(answer: str, needle: str) -> bool:
         start = pos + 1
 
 
+def _parse_cited_range(c: str):
+    """Parse 'Sheet!A1[:B2]' / "'A:B'!A1:B2" / Sheet!A1:Sheet!B2
+    into ((sheet,row,col),(sheet2|None,row,col)) like parse_range."""
+    text = c.strip()
+    # Split off a quoted sheet prefix first (it may contain ':').
+    sheet = None
+    rest = text
+    if text.startswith("'"):
+        i = 1
+        name = ""
+        while i < len(text):
+            if text[i] == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    name += "'"
+                    i += 2
+                    continue
+                i += 1
+                break
+            name += text[i]
+            i += 1
+        if i < len(text) and text[i] == "!":
+            sheet = name
+            rest = text[i + 1:]
+            lo_s, _, hi_s = rest.partition(":")
+            lo = _parse_cell(lo_s)
+            hi = _parse_cell(hi_s or lo_s)
+            if lo is None or hi is None:
+                return None, None
+            return (sheet, lo[1], lo[2]), hi
+        return None, None
+    lo_full, _, hi_full = text.partition(":")
+    lo = _parse_cell(lo_full)
+    hi = _parse_cell(hi_full or lo_full)
+    if lo is None or hi is None:
+        return None, None
+    if hi[0] is not None and lo[0] is not None and hi[0].casefold() != lo[0].casefold():
+        return None, None
+    return lo, hi
+
+
 def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     """Bench citation semantics: the expected citation CELL must fall
     inside a structured cited range (the CLI's `citations:` line or a
@@ -226,15 +277,13 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
         if not c or "!" not in c or not _contains_bounded(answer or "", c):
             continue
         # Mirror tools::parse_range: Sheet!Lo[:End], where the end
-        # may repeat the sheet qualifier (Sheet1!A1:Sheet1!B2).
-        lo_full, _, hi_full = c.partition(":")
-        lo, hi = _parse_cell(lo_full), _parse_cell(hi_full or lo_full)
-        sheet = lo[0] if lo else None
-        if hi is not None and hi[0] is not None and hi[0] != sheet:
-            continue
+        # may repeat the sheet qualifier (Sheet1!A1:Sheet1!B2) and
+        # the sheet may be quoted (and contain ':').
+        lo, hi = _parse_cited_range(c)
         if lo is None or hi is None:
             continue
-        if sheet != esheet:
+        sheet = lo[0]
+        if sheet is None or sheet.casefold() != esheet.casefold():
             continue
         # parse_range rejects reversed ranges and >10000 cells.
         if hi[1] < lo[1] or hi[2] < lo[2]:

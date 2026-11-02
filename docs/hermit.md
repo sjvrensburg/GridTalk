@@ -16,7 +16,7 @@ score(task: dict, output: RunOutput) -> JudgeResult | dict
 ```
 
 [`scripts/hermit/gridtalk_task.py`](../scripts/hermit/gridtalk_task.py)
-implements both over the JSON CLI:
+implements both over the text CLI (scraping its printed markers):
 
 - `run` shells out to `gridtalk investigate <workbook>
   [--adapter <name>] <question>` (`GRIDTALK_BIN` /

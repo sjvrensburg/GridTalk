@@ -130,6 +130,10 @@ jobs:
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
           Get-ChildItem "$env:VULKAN_SDK" | Select-Object -First 5
+      - name: Set $ORIGIN rpath (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN' >> "$GITHUB_ENV"
       - name: Build release binaries
         run: cargo build --locked --release -p gridtalk-app -p gridtalk-ui
       - name: Package (unix)

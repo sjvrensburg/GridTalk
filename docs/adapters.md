@@ -11,8 +11,12 @@ local agent on a workbook shape *without retraining the model*.
   ADAPTER.md     learned rules (plain markdown, human-reviewable)
   adapter.toml   version pointer + knobs: top_k, max_steps, ref_context
   CARD.md        eval record appended every optimise round
-  skills/*.md    optional skills; a `Triggers: a, b` line scopes
-                 a skill to matching questions (no line = always)
+  skills/*.md    optional skills; the first `Triggers: a, b` line
+                 scopes a skill to matching questions (no line =
+                 always). Reserved forms: an empty `Triggers:` line
+                 means never auto-apply; `Triggers: (always)` is the
+                 explicit always-apply marker — a literal `(always)`
+                 trigger word is reserved and rejected at commit.
   v1/ v2/ …      committed versions; adapter.toml picks the active one
 ```
 

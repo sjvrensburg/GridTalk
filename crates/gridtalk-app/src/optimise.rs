@@ -194,8 +194,21 @@ pub fn optimise_round(
         Ok((acc, report.results))
     };
 
-    let (baseline_train_opt, baseline_results) = score(Some(current), "train", &mut cache)?;
-    let (baseline_dev_opt, _) = score(Some(current), "dev", &mut cache)?;
+    // Every round lands in CARD.md, including scoring failures.
+    let score_or_card = |result: Result<(Option<f64>, Vec<TaskResult>), String>| match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            card_best_effort(
+                root,
+                &current.name,
+                &format!("\n## Round {round}: SCORE FAILED\n\n- error: {e}\n"),
+            );
+            Err(e)
+        }
+    };
+    let (baseline_train_opt, baseline_results) =
+        score_or_card(score(Some(current), "train", &mut cache))?;
+    let (baseline_dev_opt, _) = score_or_card(score(Some(current), "dev", &mut cache))?;
     // An empty split is no evidence: the dev gate would be
     // vacuous. Skip the round and say so in the CARD.
     if baseline_train_opt.is_none() || baseline_dev_opt.is_none() {
@@ -223,7 +236,7 @@ pub fn optimise_round(
     // Score candidates on train, best first.
     let mut scored: Vec<(Candidate, f64)> = Vec::new();
     for cand in candidates {
-        let (train_acc, _) = score(Some(&cand.adapter), "train", &mut cache)?;
+        let (train_acc, _) = score_or_card(score(Some(&cand.adapter), "train", &mut cache))?;
         scored.push((cand, train_acc.unwrap_or(0.0)));
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -238,7 +251,7 @@ pub fn optimise_round(
         if *train_acc <= baseline_train + 1e-9 {
             break;
         }
-        let (dev_acc, _) = score(Some(&cand.adapter), "dev", &mut cache)?;
+        let (dev_acc, _) = score_or_card(score(Some(&cand.adapter), "dev", &mut cache))?;
         let dev_acc = dev_acc.unwrap_or(0.0);
         if let Some(row) = tried.iter_mut().find(|(l, _, _, _)| *l == cand.label) {
             row.2 = dev_acc;
