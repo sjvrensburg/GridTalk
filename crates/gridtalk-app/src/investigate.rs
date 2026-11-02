@@ -4,9 +4,9 @@
 //! the final answer carries its citations. Tools:
 //! `search`, `expand`, `cells`, `formulas`, `what_if`.
 
-use gridtalk_graph::eval::{eval_cell, what_if};
-use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
-use gridtalk_index::HybridIndex;
+pub use crate::tools::parse_cell_ref;
+use crate::tools::{parse_range, Tools};
+use gridtalk_graph::CellValue;
 use gridtalk_infer::{ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,211 +23,6 @@ pub struct Investigation {
     pub answer: String,
     pub trail: Vec<TrailStep>,
     pub citations: Vec<String>,
-}
-
-pub struct Tools<'a> {
-    pub wb: &'a WorkbookSnapshot,
-    pub graph: &'a Graph,
-    pub hybrid: &'a HybridIndex,
-}
-
-impl<'a> Tools<'a> {
-    pub fn sheet_for(&self, name: &str) -> Option<&gridtalk_graph::SheetSnapshot> {
-        self.sheet(name)
-    }
-
-    fn sheet(&self, name: &str) -> Option<&gridtalk_graph::SheetSnapshot> {
-        self.wb.sheets.iter().find(|s| s.name == name)
-    }
-
-    /// Execute one tool by name. Args are `key=value` pairs separated
-    /// by `;` (e.g. `q=provision`, `range=Sheet1!A1:D4`,
-    /// `cell=B2;value=10;target=D4`).
-    pub fn execute(&self, tool: &str, args: &str) -> String {
-        let arg = |key: &str| -> Option<String> {
-            args.split(';').find_map(|kv| {
-                let (k, v) = kv.split_once('=')?;
-                if k.trim() == key {
-                    Some(v.trim().to_string())
-                } else {
-                    None
-                }
-            })
-        };
-        match tool {
-            "search" => {
-                let q = args
-                    .strip_prefix("q=")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| arg("q").unwrap_or_default());
-                let hits = self.hybrid.search(&q, 3);
-                if hits.is_empty() {
-                    format!("no regions matched \"{q}\"")
-                } else {
-                    hits.iter()
-                        .map(|h| format!("[{}] score {:.3}", h.range.a1(), h.score))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            }
-            "expand" => {
-                let range = arg("range").unwrap_or_default();
-                let node = self
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter(|n| {
-                        matches!(
-                            n.kind,
-                            gridtalk_graph::NodeKind::Region | gridtalk_graph::NodeKind::Column
-                        )
-                    })
-                    .find(|n| n.range.as_ref().map(|r| r.a1()) == Some(range.clone()))
-                    .or_else(|| {
-                        self.graph
-                            .nodes
-                            .iter()
-                            .find(|n| n.range.as_ref().map(|r| r.a1()) == Some(range.clone()))
-                    });
-                match node {
-                    Some(n) => {
-                        let mut out = vec![format!("node {} ({})", n.id, n.label)];
-                        for e in &self.graph.edges {
-                            if e.from == n.id {
-                                if let Some(t) = self.graph.nodes.iter().find(|x| x.id == e.to) {
-                                    out.push(format!(" -{}-> {}", e.kind, t.label));
-                                }
-                            }
-                            if e.to == n.id {
-                                if let Some(t) = self.graph.nodes.iter().find(|x| x.id == e.from) {
-                                    out.push(format!(" <-{}- {}", e.kind, t.label));
-                                }
-                            }
-                        }
-                        out.join("\n")
-                    }
-                    None => format!("no graph node for range {range}"),
-                }
-            }
-            "cells" => {
-                let range = arg("range").unwrap_or_default();
-                match parse_range(&range) {
-                    Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
-                        Some(sheet) => {
-                            let mut out = format!("Range {range}\n");
-                            for r in r0..=r1 {
-                                let cells: Vec<String> =
-                                    (c0..=c1).map(|c| sheet.get(r, c).display()).collect();
-                                out.push_str(&cells.join(" | "));
-                                out.push('\n');
-                            }
-                            out
-                        }
-                        None => format!("no sheet named {sheet_name}"),
-                    },
-                    None => format!("cannot parse range {range}"),
-                }
-            }
-            "formulas" => {
-                let range = arg("range").unwrap_or_default();
-                match parse_range(&range) {
-                    Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
-                        Some(sheet) => {
-                            let mut out = Vec::new();
-                            for r in r0..=r1 {
-                                for c in c0..=c1 {
-                                    if let CellValue::Formula { expr, .. } = sheet.get(r, c) {
-                                        let value = eval_cell(sheet, r, c)
-                                            .map(|v| v.to_string())
-                                            .unwrap_or_else(|e| format!("error: {e}"));
-                                        out.push(format!(
-                                            "{}{} = {expr} -> {value}",
-                                            gridtalk_graph::col_name(c),
-                                            r + 1
-                                        ));
-                                    }
-                                }
-                            }
-                            if out.is_empty() {
-                                "no formulas in range".into()
-                            } else {
-                                out.join("\n")
-                            }
-                        }
-                        None => format!("no sheet named {sheet_name}"),
-                    },
-                    None => format!("cannot parse range {range}"),
-                }
-            }
-            "what_if" => {
-                let (Some(cell), Some(value), Some(target)) = (
-                    arg("cell"),
-                    arg("value").and_then(|v| v.parse::<f64>().ok()),
-                    arg("target"),
-                ) else {
-                    return "usage: cell=B2;value=10;target=Sheet1!D4".into();
-                };
-                let Some((sheet_name, tr, tc)) = parse_cell_ref(&target) else {
-                    return format!("cannot parse target {target}");
-                };
-                // The override cell is on the same sheet as the target.
-                let Some((_, orow, ocol)) = parse_cell_ref(&format!("{sheet_name}!{cell}")) else {
-                    return format!("cannot parse cell {cell}");
-                };
-                match self.sheet(&sheet_name) {
-                    Some(sheet) => match what_if(sheet, (orow, ocol), value, (tr, tc)) {
-                        Ok((before, after)) => {
-                            format!("what-if {cell}={value}: {target} changes {before} -> {after}")
-                        }
-                        Err(e) => format!("what-if failed: {e}"),
-                    },
-                    None => format!("no sheet named {sheet_name}"),
-                }
-            }
-            other => {
-                format!("unknown tool {other}; available: search, expand, cells, formulas, what_if")
-            }
-        }
-    }
-}
-
-/// `Sheet1!A1:D4` -> (sheet, r0, c0, r1, c1), 0-based inclusive.
-pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
-    let (sheet, rest) = a1.split_once('!')?;
-    if let Some((a, b)) = rest.split_once(':') {
-        let (_, r0, c0) = parse_cell_ref(&format!("{sheet}!{a}"))?;
-        let (_, r1, c1) = parse_cell_ref(&format!("{sheet}!{b}"))?;
-        if r1 < r0 || c1 < c0 {
-            return None; // reversed range
-        }
-        Some((sheet.to_string(), r0, c0, r1, c1))
-    } else {
-        let (_, r, c) = parse_cell_ref(a1)?;
-        Some((sheet.to_string(), r, c, r, c))
-    }
-}
-
-/// `Sheet1!B2` -> (sheet, row, col), 0-based.
-pub fn parse_cell_ref(a1: &str) -> Option<(String, usize, usize)> {
-    let (sheet, cell) = a1.split_once('!')?;
-    let cell_owned = cell.replace('$', "");
-    let cell = cell_owned.as_str();
-    let split = cell.find(|c: char| c.is_ascii_digit())?;
-    let (letters, digits) = cell.split_at(split);
-    let row: usize = digits.parse().ok()?;
-    if row == 0 || letters.is_empty() {
-        return None;
-    }
-    let mut col = 0usize;
-    for ch in letters.to_ascii_uppercase().chars() {
-        if !ch.is_ascii_alphabetic() {
-            return None;
-        }
-        col = col
-            .checked_mul(26)?
-            .checked_add(ch as usize - 'A' as usize + 1)?;
-    }
-    Some((sheet.to_string(), row - 1, col - 1))
 }
 
 /// Run an investigation. The deterministic planner always performs
@@ -378,7 +173,7 @@ fn parse_what_if_target(question: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gridtalk_graph::{build_graph, parse_delimited};
+    use gridtalk_graph::{build_graph, parse_delimited, Graph, WorkbookSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::EchoBackend;
 

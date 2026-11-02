@@ -4,6 +4,8 @@
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
 mod investigate;
+mod mcp;
+mod tools;
 
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
 use gridtalk_index::{HybridIndex, Index};
@@ -63,6 +65,8 @@ const COMMANDS: &[&str] = &[
     "graph",
     "view",
     "spike",
+    "tools",
+    "mcp",
     "generate",
     "models",
     "open-in-gridcraft",
@@ -210,7 +214,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(format!("graph invariants violated: {violations:?}"));
             }
             let hybrid = HybridIndex::build(&wb, &graph);
-            let tools = investigate::Tools {
+            let tools = tools::Tools {
                 wb: &wb,
                 graph: &graph,
                 hybrid: &hybrid,
@@ -281,6 +285,55 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        "mcp" => {
+            // MCP server over stdio for external agent harnesses.
+            // --allow-write is accepted for forward compatibility;
+            // there are no write tools yet either way (what_if is
+            // simulation-only), so it currently changes nothing.
+            mcp::serve_stdio()
+        }
+        "tools" => {
+            // gridtalk tools list
+            // gridtalk tools call <file> '<json ToolRequest>'
+            match args.get(2).map(|s| s.as_str()) {
+                Some("list") => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&tools::ToolRequest::schemas()).unwrap()
+                    );
+                    Ok(())
+                }
+                Some("call") => {
+                    let file = args
+                        .get(3)
+                        .ok_or("usage: gridtalk tools call <file> '<json>'")?;
+                    let json = args
+                        .get(4)
+                        .ok_or("usage: gridtalk tools call <file> '<json>'")?;
+                    let wb = load_workbook(file)?;
+                    let (graph, _) = build_graph(&wb);
+                    let hybrid = HybridIndex::build(&wb, &graph);
+                    let toolset = tools::Tools {
+                        wb: &wb,
+                        graph: &graph,
+                        hybrid: &hybrid,
+                    };
+                    let req: tools::ToolRequest = serde_json::from_str(json)
+                        .map_err(|e| format!("invalid tool request JSON: {e}"))?;
+                    let result = toolset.call(&req);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+                    );
+                    if result.ok {
+                        Ok(())
+                    } else {
+                        Err(result.text)
+                    }
+                }
+                _ => Err("usage: gridtalk tools list | gridtalk tools call <file> '<json>'".into()),
+            }
+        }
         "spike" => {
             let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
             let report = gridtalk_infer::probe::probe_model(std::path::Path::new(file));
@@ -336,7 +389,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

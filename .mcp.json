@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gridtalk": {
+      "command": "gridtalk",
+      "args": ["mcp"]
+    }
+  }
+}

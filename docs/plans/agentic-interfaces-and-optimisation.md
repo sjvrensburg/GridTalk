@@ -1,6 +1,6 @@
 # Future development: agentic interfaces + self-optimisation
 
-Status: investigation, not started. Companion to `docs/plan.md`.
+Status: Phases A+B implemented on branch `feat/agentic-mcp` (typed tool core, `gridtalk tools call --json`, MCP server over stdio with session/mtime invalidation, harness recipes in `docs/mcp.md`). Phases C-E remain future work. Companion to `docs/plan.md`.
 Main CI at time of writing: run 41423800953 (post-merge) — check
 `gh run list --branch main` for the terminal result.
 
