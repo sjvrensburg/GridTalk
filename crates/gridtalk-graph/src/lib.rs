@@ -59,6 +59,15 @@ impl SheetSnapshot {
             .cloned()
             .unwrap_or(CellValue::Empty)
     }
+    /// Borrowed cell access (no clone) for hot scans.
+    pub fn get_ref(&self, row: usize, col: usize) -> &CellValue {
+        static EMPTY: CellValue = CellValue::Empty;
+        self.cells
+            .get(row)
+            .and_then(|r| r.get(col))
+            .unwrap_or(&EMPTY)
+    }
+
     pub fn max_col(&self) -> usize {
         self.cells.iter().map(|r| r.len()).max().unwrap_or(0)
     }
@@ -187,15 +196,16 @@ pub fn specificity_index(g: &Graph) -> Vec<usize> {
         .collect();
     // Node ids are sequential, so areas can be precomputed once by id
     // instead of rescanning `g.nodes` for every key comparison.
-    let mut areas = vec![usize::MAX; g.nodes.len()];
+    // Saturating u128 math: hand-built/inverted ranges cannot panic.
+    let mut areas = vec![u128::MAX; g.nodes.len()];
     for n in &g.nodes {
         if let Some(r) = &n.range {
             if n.id < areas.len() {
-                areas[n.id] = (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1);
+                areas[n.id] = range_area(r);
             }
         }
     }
-    idx.sort_by_key(|id| areas.get(*id).copied().unwrap_or(usize::MAX));
+    idx.sort_by_key(|id| areas.get(*id).copied().unwrap_or(u128::MAX));
     idx
 }
 
@@ -217,6 +227,11 @@ pub fn node_for_cell_in(
     })
 }
 
+/// Range area with saturating arithmetic (inverted ranges = 0).
+pub fn range_area(r: &RangeRef) -> u128 {
+    (r.r1.saturating_sub(r.r0) as u128 + 1) * (r.c1.saturating_sub(r.c0) as u128 + 1)
+}
+
 impl Graph {
     pub fn node_for_cell(&self, sheet: &str, row: usize, col: usize) -> Option<&Node> {
         // Most specific (Region/Column) node containing the cell wins.
@@ -229,12 +244,7 @@ impl Graph {
                     .map(|r| r.sheet == sheet && r.contains(row, col))
                     .unwrap_or(false)
             })
-            .min_by_key(|n| {
-                n.range
-                    .as_ref()
-                    .map(|r| (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1))
-                    .unwrap_or(usize::MAX)
-            })
+            .min_by_key(|n| n.range.as_ref().map(range_area).unwrap_or(u128::MAX))
     }
 }
 
@@ -280,6 +290,13 @@ pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError
         .to_string();
     match ext.as_str() {
         "csv" | "tsv" => {
+            const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
+            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if len > MAX_DELIMITED_BYTES {
+                return Err(IngestError::Parse(format!(
+                    "delimited file is {len} bytes, over the {MAX_DELIMITED_BYTES}-byte ingestion cap"
+                )));
+            }
             let text = std::fs::read_to_string(path)?;
             let delim = if ext == "tsv" { '\t' } else { ',' };
             parse_delimited_strict(&name, "Sheet1", &text, delim)
@@ -502,6 +519,10 @@ fn split_delimited_stream(text: &str, delim: char) -> Result<Vec<Vec<String>>, I
             } else {
                 cur.push(ch);
             }
+        } else if just_closed && (ch == ' ' || ch == '\t') {
+            // Optional padding between a closing quote and the
+            // delimiter/newline is common in real-world CSV.
+            continue;
         } else if just_closed && ch != delim && ch != '\n' && ch != '\r' {
             return Err(IngestError::Parse(format!(
                 "unexpected character {ch:?} after closing quote"
@@ -679,6 +700,12 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                 start = j + 1;
             }
         }
+        // A ref-shaped sub-token inside a longer identifier
+        // (Sales2024) is not a reference.
+        if sheet.is_none() && i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            i += 1;
+            continue;
+        }
         let at = if sheet.is_some() { start } else { i };
         if let Some((r0, c0, next)) = parse_a1_at(&chars, at) {
             // A ref-shaped token immediately followed by '(' is a
@@ -687,9 +714,36 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                 i = next;
                 continue;
             }
-            // Range?
+            // Range? The end may carry its own sheet qualifier
+            // (Sheet2!A1:Sheet2!B2); strip it before parsing.
             if next < chars.len() && chars[next] == ':' {
-                if let Some((r1, c1, end)) = parse_a1_at(&chars, next + 1) {
+                let end_at = {
+                    let mut j = next + 1;
+                    // Skip Name! or 'Quoted Name'! after the colon.
+                    if j < chars.len() && chars[j] == '\'' {
+                        j += 1;
+                        while j < chars.len() && chars[j] != '\'' {
+                            j += 1;
+                        }
+                        if j + 1 < chars.len() && chars[j + 1] == '!' {
+                            j += 2;
+                        } else {
+                            j = next + 1;
+                        }
+                    } else {
+                        let mut k = j;
+                        while k < chars.len()
+                            && (chars[k].is_alphanumeric() || chars[k] == '_' || chars[k] == '.')
+                        {
+                            k += 1;
+                        }
+                        if k < chars.len() && chars[k] == '!' && k > j {
+                            j = k + 1;
+                        }
+                    }
+                    j
+                };
+                if let Some((r1, c1, end)) = parse_a1_at(&chars, end_at) {
                     let (lo_r, hi_r) = (r0.min(r1), r0.max(r1));
                     let (lo_c, hi_c) = (c0.min(c1), c0.max(c1));
                     // Cap expansion; huge ranges are represented by corners + interior sampling is wrong,
@@ -754,7 +808,7 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
     let mut regions = Vec::new();
     for r in 0..rows {
         for c in 0..cols {
-            if visited[r][c] || sheet.get(r, c).is_empty() {
+            if visited[r][c] || sheet.get_ref(r, c).is_empty() {
                 continue;
             }
             let (mut r0, mut r1, mut c0, mut c1) = (r, r, c, c);
@@ -771,7 +825,11 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
                     (cr, cc.wrapping_sub(1)),
                     (cr, cc + 1),
                 ] {
-                    if nr < rows && nc < cols && !visited[nr][nc] && !sheet.get(nr, nc).is_empty() {
+                    if nr < rows
+                        && nc < cols
+                        && !visited[nr][nc]
+                        && !sheet.get_ref(nr, nc).is_empty()
+                    {
                         visited[nr][nc] = true;
                         stack.push((nr, nc));
                     }
@@ -779,12 +837,17 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
             }
             // Only component cells stay visited: a disconnected cell
             // inside this bounding box must seed its own region.
-            let first_all_text =
-                (c0..=c1).all(|cc| matches!(sheet.get(r0, cc), CellValue::Text(_)));
+            // Header row: text cells (empties tolerated) and no
+            // numbers/formulas in the row itself.
+            let first_all_text = (c0..=c1)
+                .any(|cc| matches!(sheet.get_ref(r0, cc), CellValue::Text(_)))
+                && (c0..=c1).all(|cc| {
+                    matches!(sheet.get_ref(r0, cc), CellValue::Text(_) | CellValue::Empty)
+                });
             let below_has_typed = r1 > r0
                 && (c0..=c1).any(|cc| {
                     matches!(
-                        sheet.get(r0 + 1, cc),
+                        sheet.get_ref(r0 + 1, cc),
                         CellValue::Number(_) | CellValue::Bool(_) | CellValue::Formula { .. }
                     )
                 });
@@ -794,7 +857,9 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
                 None
             };
             let headers = if header_row.is_some() {
-                (c0..=c1).map(|cc| sheet.get(r0, cc).display()).collect()
+                (c0..=c1)
+                    .map(|cc| sheet.get_ref(r0, cc).display())
+                    .collect()
             } else {
                 (c0..=c1).map(col_name).collect()
             };
@@ -906,6 +971,16 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
     (g, violations)
 }
 
+fn col_from_letters(letters: &str) -> Option<usize> {
+    let mut col = 0usize;
+    for ch in letters.to_ascii_uppercase().chars() {
+        col = col
+            .checked_mul(26)?
+            .checked_add(ch as usize - 'A' as usize + 1)?;
+    }
+    Some(col - 1)
+}
+
 /// Every lifted depends_on edge must be re-derivable from raw formulas,
 /// and vice versa. Mirrors ExcelGRAG's lifted-edge invariant test.
 pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
@@ -985,6 +1060,70 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                 }
             }
         }
+    }
+    // Independent cross-check with a second, deliberately simple
+    // tokeniser, so a systematic miss in formula_refs_qualified
+    // cannot hide by re-deriving the same wrong expected set.
+    let mut independent = std::collections::BTreeSet::new();
+    for sheet in &wb.sheets {
+        for (r, row) in sheet.cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if let CellValue::Formula { expr, .. } = cell {
+                    if let Some(src) = node_for_cell_in(g, &specificity, &sheet.name, r, c) {
+                        for tok in expr.split(|ch: char| {
+                            !(ch.is_alphanumeric() || matches!(ch, '$' | '!' | '\'' | ':' | '.'))
+                        }) {
+                            let tok = tok.trim_matches('\'');
+                            // Cross-sheet refs are the primary
+                            // extractor's job; this check covers
+                            // same-sheet refs only.
+                            if tok.contains('!')
+                                && tok.rsplit('!').nth(1).unwrap_or("") != sheet.name
+                            {
+                                continue;
+                            }
+                            let cellpart = tok.rsplit('!').next().unwrap_or(tok);
+                            for part in cellpart.split(':') {
+                                let part = part.replace('$', "");
+                                let split = part.find(|ch: char| ch.is_ascii_digit());
+                                if let Some(sp) = split {
+                                    let (letters, digits) = part.split_at(sp);
+                                    if !letters.is_empty()
+                                        && letters.len() <= 3
+                                        && letters.chars().all(|ch| ch.is_ascii_alphabetic())
+                                        && !digits.is_empty()
+                                        && digits.chars().all(|ch| ch.is_ascii_digit())
+                                    {
+                                        if let (Ok(row1), Some(col)) =
+                                            (digits.parse::<usize>(), col_from_letters(letters))
+                                        {
+                                            if row1 >= 1 {
+                                                if let Some(t) = node_for_cell_in(
+                                                    g,
+                                                    &specificity,
+                                                    &sheet.name,
+                                                    row1 - 1,
+                                                    col,
+                                                ) {
+                                                    if src != t {
+                                                        independent.insert((src, t));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for e in independent.difference(&lifted) {
+        problems.push(format!(
+            "missing lifted edge {e:?} (independent extraction)"
+        ));
     }
     for e in expected.difference(&lifted) {
         problems.push(format!("missing lifted edge {e:?}"));
@@ -1081,6 +1220,27 @@ impl IncrementalSnapshot {
     pub fn flush(&mut self) -> usize {
         let edits = std::mem::take(&mut self.pending);
         let mut applied = 0usize;
+        let mut dropped_ranges: Vec<RangeRef> = Vec::new();
+        for edit in &edits {
+            if edit.row > 10_000
+                || edit.col > 1_000
+                || !self.snapshot.sheets.iter().any(|s| s.name == edit.sheet)
+            {
+                dropped_ranges.push(RangeRef {
+                    sheet: edit.sheet.clone(),
+                    r0: edit.row,
+                    c0: edit.col,
+                    r1: edit.row,
+                    c1: edit.col,
+                });
+            }
+        }
+        // Dropped edits changed nothing: unpublish their dirty ranges.
+        for dropped in &dropped_ranges {
+            if let Some(pos) = self.dirty.iter().position(|d| d == dropped) {
+                self.dirty.remove(pos);
+            }
+        }
         for edit in edits {
             if edit.row > 10_000 || edit.col > 1_000 {
                 self.dropped += 1;
@@ -1309,6 +1469,30 @@ mod tests {
         );
         assert_eq!(inc.flush(), 0);
         assert_eq!(inc.dropped_edits(), 1);
+    }
+
+    #[test]
+    fn graph_regressions_round3() {
+        // No phantom refs inside long identifiers.
+        assert!(formula_refs_qualified("Sales2024*2").is_empty());
+        // Doubly-qualified ranges expand fully.
+        let q = formula_refs_qualified("Sheet2!A1:Sheet2!B2");
+        assert_eq!(q.len(), 4);
+        // Space after a closing quote is tolerated.
+        assert!(parse_delimited_strict("d", "S", "A,B\n\"x\" ,2\n", ',').is_ok());
+        // Dropped edits unpublish their dirty ranges.
+        let mut inc = IncrementalSnapshot::new(sample());
+        inc.record_edit(
+            CellEdit {
+                sheet: "Nope".into(),
+                row: 0,
+                col: 0,
+                value: CellValue::Number(1.0),
+            },
+            std::time::Instant::now(),
+        );
+        assert_eq!(inc.flush(), 0);
+        assert!(inc.take_dirty_ranges().is_empty());
     }
 
     #[test]

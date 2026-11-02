@@ -67,8 +67,17 @@ pub fn compute_layout_cancellable(
         // Repulsion between every pair (graphs here are lifted and small).
         let mut force: BTreeMap<usize, (f32, f32)> =
             ids.iter().map(|id| (*id, (0.0, 0.0))).collect();
+        let mut pair_count = 0usize;
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
+                pair_count += 1;
+                // Poll cancellation inside the O(n^2) loop too, so
+                // huge graphs stop promptly, not after a full sweep.
+                if pair_count.is_multiple_of(4096)
+                    && cancel.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return pos;
+                }
                 let (a, b) = (pos[&ids[i]], pos[&ids[j]]);
                 let (dx, dy) = (a.x - b.x, a.y - b.y);
                 let d2 = (dx * dx + dy * dy).max(25.0);

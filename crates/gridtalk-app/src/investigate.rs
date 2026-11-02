@@ -56,11 +56,24 @@ pub fn investigate(
     }
 
     // Citations come from the structured hits, never scraped from
-    // display text.
+    // display text. The search step reuses this one search (it is
+    // recorded in the trail, not re-executed).
     let hits = tools.hybrid.search(question, 3);
     let citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
-    let search_result = run("search", &format!("q={question}"), &mut trail);
+    let search_result = if hits.is_empty() {
+        format!("no regions matched \"{question}\"")
+    } else {
+        hits.iter()
+            .map(|h| format!("[{}] score {:.3}", h.range.a1(), h.score))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    trail.push(TrailStep {
+        tool: "search".into(),
+        args: format!("q={question}"),
+        result: search_result.clone(),
+    });
 
     let mut context = format!("search results:\n{search_result}");
     if let Some(range) = &top_range {
@@ -87,34 +100,50 @@ pub fn investigate(
                     // Target: an explicit Sheet!Cell in the question,
                     // else the first formula cell in the top region,
                     // else the region's last cell.
-                    let target = parse_what_if_target(question).unwrap_or_else(|| {
-                        if let Some((_, r0, c0, r1, c1)) = parse_range(range) {
-                            if let Some(sheet_obj) = tools.sheet_for(&sheet) {
-                                for r in r0..=r1 {
-                                    for c in c0..=c1 {
-                                        if matches!(sheet_obj.get(r, c), CellValue::Formula { .. })
-                                        {
-                                            return format!(
-                                                "{}!{}{}",
-                                                sheet,
-                                                gridtalk_graph::col_name(c),
-                                                r + 1
-                                            );
-                                        }
+                    // Fallback target: the first formula cell in
+                    // the region that actually *depends on* the
+                    // override — never an unaffected cell.
+                    let override_coord = if cell.contains('!') {
+                        parse_cell_ref(&cell)
+                    } else {
+                        parse_cell_ref(&format!("{sheet}!{cell}"))
+                    };
+                    let dependent_target = || -> Option<String> {
+                        let (_, orow, ocol) = override_coord.clone()?;
+                        let (_, r0, c0, r1, c1) = parse_range(range)?;
+                        let sheet_obj = tools.sheet_for(&sheet)?;
+                        for r in r0..=r1 {
+                            for c in c0..=c1 {
+                                if let CellValue::Formula { expr, .. } = sheet_obj.get(r, c) {
+                                    let refs = gridtalk_graph::formula_refs(&expr);
+                                    if refs.contains(&(orow, ocol)) {
+                                        return Some(format!(
+                                            "{}!{}{}",
+                                            sheet,
+                                            gridtalk_graph::col_name(c),
+                                            r + 1
+                                        ));
                                     }
                                 }
                             }
-                            format!("{}!{}{}", sheet, gridtalk_graph::col_name(c1), r1 + 1)
-                        } else {
-                            format!("{sheet}!A1")
                         }
-                    });
-                    let result = run(
-                        "what_if",
-                        &format!("cell={cell};value={value};target={target}"),
-                        &mut trail,
-                    );
-                    context.push_str(&format!("\n\nwhat-if:\n{result}"));
+                        None
+                    };
+                    match parse_what_if_target(question).or_else(dependent_target) {
+                        Some(target) => {
+                            let result = run(
+                                "what_if",
+                                &format!("cell={cell};value={value};target={target}"),
+                                &mut trail,
+                            );
+                            context.push_str(&format!("\n\nwhat-if:\n{result}"));
+                        }
+                        None => {
+                            context.push_str(
+                                "\n\nwhat-if: no formula in the top region depends on the override cell, so no what-if was run.",
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -147,8 +176,22 @@ pub fn investigate(
 }
 
 fn parse_what_if(question: &str) -> Option<(String, f64)> {
-    // "... B2 is 10 ..." / "... B2 = 10.5 ..."
+    // "... B2 is 10 ..." / "... B2 = 10.5 ..." / "... Sheet1!B2 ..."
     let tokens: Vec<&str> = question.split_whitespace().collect();
+    // Sheet-qualified form first (Sheet1!B2 / 'My Sheet'!B2): the
+    // token carries '!' and parses as a full cell reference.
+    for (i, tok) in tokens.iter().enumerate() {
+        let clean =
+            tok.trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
+        if clean.contains('!') && parse_cell_ref(clean).is_some() {
+            for next in tokens.iter().skip(i + 1).take(3) {
+                let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
+                if let Ok(v) = n.parse::<f64>() {
+                    return Some((clean.to_string(), v));
+                }
+            }
+        }
+    }
     for (i, tok) in tokens.iter().enumerate() {
         let clean = tok.trim_matches(|c: char| !c.is_alphanumeric());
         // Byte index of the first non-letter, from char_indices —
@@ -281,6 +324,11 @@ mod tests {
         assert_eq!(
             parse_what_if("what if B2 is 10"),
             Some(("B2".to_string(), 10.0))
+        );
+        // Sheet-qualified overrides parse too.
+        assert_eq!(
+            parse_what_if("What if Sheet1!B2 becomes 12? What happens to Sheet1!D2?"),
+            Some(("Sheet1!B2".to_string(), 12.0))
         );
     }
 }

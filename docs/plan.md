@@ -47,7 +47,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] `ViewState` two-way sync state machine (node→range, cell→node) with tests
 - [x] Terminal dual-view rendering (`gridtalk view`)
 - [x] egui graph pane: force layout computed in a worker thread, cached per revision, click-to-select nodes
-- [x] Split / Graph-full / Grid-full modes persisted per workbook (`~/.config/gridtalk/ui-state.json`)
+- [x] Split / Graph-full / Grid-full modes persisted per workbook (platform config dir: `~/.config/gridtalk/ui-state.json` on Linux, `%APPDATA%\gridtalk\ui-state.json` on Windows)
 - [x] Settings window (config path, verbatim-send notice)
 - [x] First-run wizard (privacy posture → backend/model → ready; writes `config.toml`, persisted `first_run_done`)
 - [x] Installers: tag-triggered release workflow (Linux/Windows archives attached to the GitHub Release; macOS is not a target, decision 0004) + `scripts/install.sh`; release workflow is exercised on the first `v*` tag

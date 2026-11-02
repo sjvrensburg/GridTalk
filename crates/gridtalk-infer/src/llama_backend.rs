@@ -48,7 +48,21 @@ impl Default for LlamaCppBackend {
 /// llama.cpp contexts on one model are not safe to share anyway.
 struct CachedState {
     backend: LlamaBackend,
-    model: Option<(PathBuf, LlamaModel)>,
+    /// A replaced file at the same path must reload, not serve
+    /// stale weights.
+    model: Option<CachedModel>,
+}
+
+struct CachedModel {
+    path: PathBuf,
+    stamp: Option<(std::time::SystemTime, u64)>,
+    model: LlamaModel,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
 }
 
 fn cached_state() -> &'static std::sync::Mutex<Option<CachedState>> {
@@ -81,10 +95,15 @@ impl LlamaCppBackend {
                 tokens_per_sec: 0.0,
             });
         }
+        // Recover from a poisoned lock by dropping the cached
+        // state (a fresh backend/model load follows) instead of
+        // failing every request for the process lifetime.
+        let mut guard = cached_state().lock().unwrap_or_else(|poisoned| {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            guard
+        });
         let load_started = Instant::now();
-        let mut guard = cached_state()
-            .lock()
-            .map_err(|_| InferError::EngineUnavailable("model cache poisoned".into()))?;
         if guard.is_none() {
             let backend = LlamaBackend::init().map_err(|e| {
                 InferError::EngineUnavailable(format!("llama.cpp backend init failed: {e}"))
@@ -95,10 +114,11 @@ impl LlamaCppBackend {
             });
         }
         let state = guard.as_mut().unwrap();
+        let stamp = file_stamp(&self.model_path);
         let needs_load = state
             .model
             .as_ref()
-            .is_none_or(|(path, _)| path != &self.model_path);
+            .is_none_or(|cached| cached.path != self.model_path || cached.stamp != stamp);
         if needs_load {
             let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
             let loaded =
@@ -109,10 +129,14 @@ impl LlamaCppBackend {
                             self.model_path.display()
                         ))
                     })?;
-            state.model = Some((self.model_path.clone(), loaded));
+            state.model = Some(CachedModel {
+                path: self.model_path.clone(),
+                stamp,
+                model: loaded,
+            });
         }
         let backend = &state.backend;
-        let model = &state.model.as_ref().unwrap().1;
+        let model = &state.model.as_ref().unwrap().model;
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
 
         // Prompt via the model's own chat template when it has one.
@@ -171,6 +195,9 @@ impl LlamaCppBackend {
         // logits requested only for the final prompt token.
         let gen_started = Instant::now();
         for chunk_start in (0..prompt_tokens.len()).step_by(512) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(InferError::Cancelled);
+            }
             let chunk = &prompt_tokens[chunk_start..(chunk_start + 512).min(prompt_tokens.len())];
             let mut batch = LlamaBatch::new(chunk.len(), 1);
             for (j, token) in chunk.iter().enumerate() {
@@ -183,6 +210,9 @@ impl LlamaCppBackend {
                 .map_err(|e| InferError::EngineUnavailable(format!("prefill decode: {e}")))?;
         }
 
+        // Decode timing starts after prefill so tokens_per_sec
+        // reflects generation, not prompt processing.
+        let decode_started = Instant::now();
         let mut first_token_ms: Option<f64> = None;
         let mut generated = 0usize;
         let mut text_bytes: Vec<u8> = Vec::new();
@@ -196,7 +226,7 @@ impl LlamaCppBackend {
             let token = sampler.sample(&ctx, -1);
             sampler.accept(token);
             if first_token_ms.is_none() {
-                first_token_ms = Some(gen_started.elapsed().as_secs_f64() * 1000.0);
+                first_token_ms = Some(decode_started.elapsed().as_secs_f64() * 1000.0);
             }
             // Stop on EOG, and on end-of-turn (<|im_end|> etc.) which
             // some GGUFs do not register as EOG.
@@ -210,6 +240,7 @@ impl LlamaCppBackend {
             let cumulative = String::from_utf8_lossy(&text_bytes).into_owned();
             // Any "<|...|>" special in the *text* is a stop marker
             // (possibly split across pieces, e.g. "<|im_end|").
+            let mut stop_marker = false;
             for marker in ["<|im_end|>", "<|end_of_text|>", "<|endoftext|>"] {
                 if let Some(at) = cumulative.find(marker) {
                     text_bytes.truncate(at);
@@ -217,15 +248,19 @@ impl LlamaCppBackend {
                         if let Some(delta) = text.strip_prefix(emitted.as_str()) {
                             if !delta.is_empty() {
                                 on_token(delta);
+                                emitted = text.to_string();
                             }
                         }
                     }
-                    generated += 1;
+                    stop_marker = true;
                     break;
                 }
             }
             let _ = &cumulative;
             generated += 1;
+            if stop_marker {
+                break;
+            }
             // Emit only complete UTF-8 so far (pieces can split a
             // multi-byte character across tokens), and hold back a
             // trailing "<|..." fragment that may complete into a
@@ -258,8 +293,20 @@ impl LlamaCppBackend {
                 .map_err(|e| InferError::EngineUnavailable(format!("decode: {e}")))?;
         }
 
+        // Flush anything held back (a trailing "<|..." fragment
+        // that never completed, or text after the last emit).
+        {
+            let text = String::from_utf8_lossy(&text_bytes).into_owned();
+            if let Some(delta) = text.strip_prefix(emitted.as_str()) {
+                if !delta.is_empty() {
+                    on_token(delta);
+                }
+            }
+        }
+
         let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let gen_ms = gen_started.elapsed().as_secs_f64() * 1000.0;
+        let gen_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let _ = gen_started;
         Ok(GenerationStats {
             prompt_tokens: prompt_tokens.len(),
             generated_tokens: generated,

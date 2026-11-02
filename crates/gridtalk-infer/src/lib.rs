@@ -231,7 +231,25 @@ fn read_http_response(
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                stalls = 0;
+                // Poll cancellation on EVERY read, and count a
+                // stall budget that only resets on meaningful
+                // progress toward a complete response — a slow
+                // drip must not defeat either.
+                if let Some(c) = cancel {
+                    if c.load(Ordering::Relaxed) {
+                        return Err(InferError::Cancelled);
+                    }
+                }
+                if raw.is_empty() && n < 1024 {
+                    stalls += 1;
+                    if stalls > 30 {
+                        return Err(InferError::Http(
+                            "endpoint is slow-dripping the response".into(),
+                        ));
+                    }
+                } else {
+                    stalls = 0;
+                }
                 raw.extend_from_slice(&buf[..n]);
                 if raw.len() > 16 * 1024 * 1024 {
                     return Err(InferError::Http("response exceeds 16 MiB cap".into()));
@@ -272,9 +290,14 @@ fn read_http_response(
         let loc = head
             .lines()
             .find_map(|l| {
-                l.to_ascii_lowercase()
-                    .strip_prefix("location:")
-                    .map(|v| v.trim().to_string())
+                // Match the header name case-insensitively but keep
+                // the value's original case.
+                let (name, value) = l.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("location") {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
             })
             .unwrap_or_default();
         return Err(InferError::Http(format!(

@@ -3,6 +3,7 @@
 //! the grid<->graph two-way sync state machine that the egui front
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
+mod bench;
 mod investigate;
 mod mcp;
 mod tools;
@@ -61,6 +62,7 @@ fn main() {
 
 const COMMANDS: &[&str] = &[
     "ask",
+    "bench",
     "investigate",
     "graph",
     "view",
@@ -134,10 +136,13 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "graph" => {
             let file = args.get(2).ok_or("usage: gridtalk graph <file.csv>")?;
+            if args.len() > 3 {
+                return Err("usage: gridtalk graph <file.csv> (no extra arguments)".into());
+            }
             let wb = load_workbook(file)?;
             let (graph, violations) = build_graph(&wb);
             if !violations.is_empty() {
-                eprintln!("warning: graph invariants violated: {violations:?}");
+                return Err(format!("graph invariants violated: {violations:?}"));
             }
             for n in &graph.nodes {
                 let kind = match n.kind {
@@ -156,13 +161,16 @@ fn run(args: &[String]) -> Result<(), String> {
         "view" => {
             // Terminal rendering of the dual view: grid left, graph right.
             let file = args.get(2).ok_or("usage: gridtalk view <file.csv>")?;
+            if args.len() > 3 {
+                return Err("usage: gridtalk view <file.csv> (no extra arguments)".into());
+            }
             let wb = load_workbook(file)?;
             if wb.sheets.is_empty() {
                 return Err("workbook has no sheets".into());
             }
             let (graph, violations) = build_graph(&wb);
             if !violations.is_empty() {
-                eprintln!("warning: graph invariants violated: {violations:?}");
+                return Err(format!("graph invariants violated: {violations:?}"));
             }
             let mut state = ViewState::default();
             if let Some(sheet) = wb.sheets.first() {
@@ -199,6 +207,164 @@ fn run(args: &[String]) -> Result<(), String> {
                 state.highlighted_node
             );
             Ok(())
+        }
+        "bench" => {
+            // gridtalk bench generate <file> [--out tasks.json] [--max 100]
+            // gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]
+            // Strict flag parsing: unknown flags, duplicates and
+            // missing values are usage errors, never silent defaults.
+            let mut flags: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            {
+                let known = ["--out", "--max", "--tasks", "--split", "--card"];
+                let mut i = 4;
+                while i < args.len() {
+                    let name = &args[i];
+                    if !known.contains(&name.as_str()) {
+                        return Err(format!(
+                            "unknown bench flag {name}; expected one of {known:?} with a value"
+                        ));
+                    }
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("bench flag {name} needs a value"))?;
+                    if flags.insert(name.clone(), value.clone()).is_some() {
+                        return Err(format!("duplicate bench flag {name}"));
+                    }
+                    i += 2;
+                }
+            }
+            let flag = |name: &str| -> Option<String> { flags.get(name).cloned() };
+            match args.get(2).map(|s| s.as_str()) {
+                Some("generate") => {
+                    let file = args.get(3).ok_or(
+                        "usage: gridtalk bench generate <file> [--out tasks.json] [--max 100]",
+                    )?;
+                    let max: usize = match flag("--max") {
+                        Some(v) => {
+                            v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                                format!("--max must be a positive integer, got {v:?}")
+                            })?
+                        }
+                        None => 100,
+                    };
+                    let wb = load_workbook(file)?;
+                    let (_, violations) = build_graph(&wb);
+                    if !violations.is_empty() {
+                        return Err(format!("graph invariants violated: {violations:?}"));
+                    }
+                    let gen = bench::generate_tasks_ex(&wb, max);
+                    let tasks = gen.tasks;
+                    if gen.skipped_formulas > 0 {
+                        eprintln!(
+                            "note: {} formula cells skipped (erroring/non-finite)",
+                            gen.skipped_formulas
+                        );
+                    }
+                    let json = serde_json::to_string_pretty(&tasks).map_err(|e| e.to_string())?;
+                    match flag("--out") {
+                        Some(out) => {
+                            std::fs::write(&out, &json).map_err(|e| e.to_string())?;
+                            eprintln!(
+                                "wrote {} tasks ({} train / {} dev) to {out}",
+                                tasks.len(),
+                                tasks.iter().filter(|t| t.split == "train").count(),
+                                tasks.iter().filter(|t| t.split == "dev").count()
+                            );
+                        }
+                        None => println!("{json}"),
+                    }
+                    Ok(())
+                }
+                Some("run") => {
+                    let file = args
+                        .get(3)
+                        .ok_or("usage: gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]")?;
+                    let wb = load_workbook(file)?;
+                    let (graph, violations) = build_graph(&wb);
+                    if !violations.is_empty() {
+                        return Err(format!("graph invariants violated: {violations:?}"));
+                    }
+                    let hybrid = HybridIndex::build(&wb, &graph);
+                    let toolset = tools::Tools {
+                        wb: &wb,
+                        graph: &graph,
+                        hybrid: &hybrid,
+                    };
+                    let mut skipped_formulas = 0usize;
+                    let tasks: Vec<bench::BenchTask> = match flag("--tasks") {
+                        Some(path) => {
+                            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                            serde_json::from_str(&text)
+                                .map_err(|e| format!("invalid tasks file {path}: {e}"))?
+                        }
+                        None => {
+                            let gen = bench::generate_tasks_ex(&wb, 100);
+                            skipped_formulas = gen.skipped_formulas;
+                            gen.tasks
+                        }
+                    };
+                    {
+                        // Tasks files are trusted local input, but
+                        // nonsense should be loud, not silent.
+                        let mut seen = std::collections::BTreeSet::new();
+                        for t in &tasks {
+                            if !matches!(t.split.as_str(), "train" | "dev") {
+                                eprintln!(
+                                    "gridtalk: warning: task {} has unknown split {:?}",
+                                    t.id, t.split
+                                );
+                            }
+                            if !matches!(
+                                t.kind.as_str(),
+                                "cell_value" | "formula_result" | "what_if"
+                            ) {
+                                eprintln!(
+                                    "gridtalk: warning: task {} has unknown kind {:?}",
+                                    t.id, t.kind
+                                );
+                            }
+                            if !seen.insert(t.id.clone()) {
+                                eprintln!("gridtalk: warning: duplicate task id {}", t.id);
+                            }
+                        }
+                    }
+                    if flag("--split").is_none() {
+                        eprintln!(
+                            "gridtalk: note: scoring all splits (dev included); use --split train to exclude dev"
+                        );
+                    }
+                    let split = flag("--split").unwrap_or_else(|| "all".into());
+                    if !matches!(split.as_str(), "train" | "dev" | "all") {
+                        return Err(format!("unknown split {split}; expected train, dev or all"));
+                    }
+                    let cfg = config_from_env();
+                    let backend = backend_from_config(&cfg.inference);
+                    warn_if_external(&cfg);
+                    let report = bench::run_bench(&tasks, &toolset, backend.as_ref(), &split, 8)
+                        .map_err(|e| format!("bench run failed: {e}"))?;
+                    let card =
+                        bench::render_card_with_skipped(&report, tasks.len(), skipped_formulas);
+                    match flag("--card") {
+                        Some(path) => {
+                            std::fs::write(&path, &card).map_err(|e| e.to_string())?;
+                            match report.accuracy("all") {
+                                Some(acc) => println!(
+                                    "bench: {} tasks, accuracy {:.1}% -> {path}",
+                                    report.results.len(),
+                                    acc * 100.0
+                                ),
+                                None => println!("bench: no tasks scored for this split -> {path}"),
+                            }
+                        }
+                        None => println!("{card}"),
+                    }
+                    Ok(())
+                }
+                _ => {
+                    Err("usage: gridtalk bench generate <file> | gridtalk bench run <file>".into())
+                }
+            }
         }
         "investigate" => {
             let file = args
@@ -305,6 +471,9 @@ fn run(args: &[String]) -> Result<(), String> {
             // gridtalk tools call <file> '<json ToolRequest>'
             match args.get(2).map(|s| s.as_str()) {
                 Some("list") => {
+                    if args.len() > 3 {
+                        return Err("usage: gridtalk tools list (no extra arguments)".into());
+                    }
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&tools::ToolRequest::schemas()).unwrap()
@@ -332,6 +501,8 @@ fn run(args: &[String]) -> Result<(), String> {
                     let req: tools::ToolRequest = serde_json::from_str(json)
                         .map_err(|e| format!("invalid tool request JSON: {e}"))?;
                     let result = toolset.call(&req);
+                    // Print the result exactly once; a failed call
+                    // exits 1 without duplicating the error text.
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
@@ -339,7 +510,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     if result.ok {
                         Ok(())
                     } else {
-                        Err(result.text)
+                        std::process::exit(1);
                     }
                 }
                 _ => Err("usage: gridtalk tools list | gridtalk tools call <file> '<json>'".into()),
@@ -408,7 +579,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

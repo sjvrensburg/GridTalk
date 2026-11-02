@@ -157,6 +157,7 @@ pub struct GridTalkApp {
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
     frame_revision: u64,
+    layout_size: (f32, f32),
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
@@ -196,6 +197,7 @@ impl Default for GridTalkApp {
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
             frame_revision: u64::MAX,
+            layout_size: (0.0, 0.0),
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
@@ -257,7 +259,13 @@ fn write_wizard_config(
                     }
                 }
             }
-            in_inference = trimmed == "[inference]";
+            in_inference = trimmed.split('#').next().map(|h| {
+                h.trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim()
+            }) == Some("inference")
+                && trimmed.starts_with('[');
             seen_section |= in_inference;
         }
         if in_inference {
@@ -291,8 +299,12 @@ fn validate_wizard(backend: &str, model_path: &str, base_url: &str) -> Result<()
             if model_path.is_empty() {
                 return Err("choose a local .gguf model file first".into());
             }
-            if !std::path::Path::new(model_path).exists() {
+            let path = std::path::Path::new(model_path);
+            if !path.is_file() {
                 return Err(format!("model file does not exist: {model_path}"));
+            }
+            if !model_path.to_ascii_lowercase().ends_with(".gguf") {
+                return Err(format!("model file must be a .gguf file: {model_path}"));
             }
             Ok(())
         }
@@ -463,8 +475,20 @@ impl GridTalkApp {
     }
 
     fn save_as(&mut self, path: &std::path::Path) {
-        if self.save_to(path, false) {
-            self.current_path = Some(path.to_path_buf());
+        // If the chosen name has no usable extension, default to
+        // .xlsx rather than failing in save_to.
+        let path = if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("xlsx") | Some("csv") | Some("tsv")
+        ) {
+            path.to_path_buf()
+        } else if path.extension().is_none() {
+            path.with_extension("xlsx")
+        } else {
+            path.to_path_buf()
+        };
+        if self.save_to(&path, false) {
+            self.current_path = Some(path);
         }
     }
 
@@ -556,7 +580,12 @@ fn snapshot_to_delimited(snapshot: &gridtalk_graph::WorkbookSnapshot, delim: cha
 impl eframe::App for GridTalkApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
-        // Closing with unsaved edits needs a second, deliberate close.
+        // Closing with unsaved edits needs a second, deliberate
+        // close. The guard re-arms whenever the workbook is clean
+        // again (saved/opened), so it works more than once.
+        if !self.dirty() {
+            self.close_armed = false;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.close_armed {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_armed = true;
@@ -725,8 +754,19 @@ impl eframe::App for GridTalkApp {
                             ui.heading("Choose inference");
                             ui.radio_value(&mut self.wizard_backend, "local".to_string(), "Local GGUF model (private)");
                             if self.wizard_backend == "local" {
-                                ui.label("Model .gguf path (tokenizer.json must sit beside it):");
-                                ui.text_edit_singleline(&mut self.wizard_model_path);
+                                ui.label("Model .gguf path:");
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(&mut self.wizard_model_path);
+                                    if ui.button("Browse…").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("GGUF model", &["gguf"])
+                                            .pick_file()
+                                        {
+                                            self.wizard_model_path =
+                                                path.display().to_string();
+                                        }
+                                    }
+                                });
                                 ui.label("Import models with: gridtalk models import <file.gguf>");
                             }
                             ui.radio_value(&mut self.wizard_backend, "openai-compatible".to_string(), "OpenAI-compatible endpoint");
@@ -876,21 +916,44 @@ impl GridTalkApp {
             // so users can append data instead of being fenced in.
             let display_rows = sheet.cells.len() + 3;
             let row_height = 22.0;
-            // Header + rows live inside the same horizontally
-            // scrolling area so column letters stay aligned.
+            // Header + rows live inside the same scrolling area so
+            // column letters stay aligned. Both axes are
+            // virtualised: only the visible row/column window is
+            // built, with spacers preserving the scroll extent.
+            let col_w = 90.0f32;
+            let total_w = 34.0 + display_cols as f32 * col_w;
+            let total_h = (display_rows + 1) as f32 * row_height;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
-                .show_rows(ui, row_height, display_rows + 1, |ui, row_range| {
-                    for r_plus in row_range {
+                .show_viewport(ui, |ui, viewport| {
+                    ui.set_min_size(egui::vec2(total_w, total_h));
+                    let first = ((viewport.min.y / row_height).floor().max(0.0) as usize)
+                        .min(display_rows + 1);
+                    let last = ((viewport.max.y / row_height).ceil().max(0.0) as usize)
+                        .min(display_rows + 1);
+                    let c_first = (((viewport.min.x - 34.0).max(0.0) / col_w).floor() as usize)
+                        .min(display_cols);
+                    let c_last = (((viewport.max.x - 34.0).max(0.0) / col_w).ceil() as usize + 1)
+                        .min(display_cols);
+                    if first > 0 {
+                        ui.add_space(first as f32 * row_height);
+                    }
+                    for r_plus in first..last {
                         if r_plus == 0 {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [34.0, row_height],
                                     egui::Label::new(egui::RichText::new("").strong()),
                                 );
-                                for c in 0..display_cols {
+                                if c_first > 0 {
+                                    ui.allocate_space(egui::vec2(
+                                        c_first as f32 * col_w,
+                                        row_height,
+                                    ));
+                                }
+                                for c in c_first..c_last {
                                     ui.add_sized(
-                                        [90.0, row_height],
+                                        [col_w, row_height],
                                         egui::Label::new(
                                             egui::RichText::new(gridtalk_graph::col_name(c))
                                                 .strong(),
@@ -908,7 +971,10 @@ impl GridTalkApp {
                                     egui::RichText::new(format!("{}", r + 1)).strong(),
                                 ),
                             );
-                            for c in 0..display_cols {
+                            if c_first > 0 {
+                                ui.allocate_space(egui::vec2(c_first as f32 * col_w, row_height));
+                            }
+                            for c in c_first..c_last {
                                 let cell = sheet.get(r, c);
                                 let is_selected = selected
                                     .as_ref()
@@ -922,7 +988,7 @@ impl GridTalkApp {
                                     .entry(key)
                                     .or_insert_with(|| cell_input_text(&cell));
                                 let resp = ui.add_sized(
-                                    [90.0, row_height],
+                                    [col_w, row_height],
                                     egui::TextEdit::singleline(buffer).text_color(if is_selected {
                                         egui::Color32::YELLOW
                                     } else {
@@ -942,6 +1008,10 @@ impl GridTalkApp {
                                 }
                             }
                         });
+                    }
+                    let remaining = display_rows + 1 - last;
+                    if remaining > 0 {
+                        ui.add_space(remaining as f32 * row_height);
                     }
                 });
         }
@@ -994,7 +1064,14 @@ impl GridTalkApp {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         // (Re)spawn layout whenever the graph changed (rebuild
         // clears positions) or on first paint.
-        if self.positions.len() != self.graph.nodes.len() && self.layout_worker.is_none() {
+        // Respawn when the graph changed OR the pane was resized
+        // (positions are absolute to the spawn-time rect).
+        let size_changed = (self.layout_size.0 - rect.width()).abs() > 1.0
+            || (self.layout_size.1 - rect.height()).abs() > 1.0;
+        if (self.positions.len() != self.graph.nodes.len() || size_changed)
+            && self.layout_worker.is_none()
+        {
+            self.layout_size = (rect.width(), rect.height());
             self.layout_worker = Some(spawn_layout(
                 self.graph.clone(),
                 self.graph_version,
@@ -1055,7 +1132,7 @@ impl GridTalkApp {
                 painter.circle_filled(centre, if highlighted { 10.0 } else { 7.0 }, colour);
                 let node_rect = egui::Rect::from_center_size(centre, egui::vec2(120.0, 18.0));
                 let label = if n.label.len() > 16 {
-                    format!("{}…", &n.label[..16])
+                    format!("{}…", n.label.chars().take(16).collect::<String>())
                 } else {
                     n.label.clone()
                 };
