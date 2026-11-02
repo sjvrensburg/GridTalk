@@ -34,14 +34,22 @@ struct OpenWorkbook {
 impl OpenWorkbook {
     fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64, i64)> {
         std::fs::metadata(path).ok().and_then(|m| {
-            // ctime catches same-mtime/same-length replacements
-            // (e.g. a file swapped by rename) the pair would alias.
+            // A change stamp catches same-mtime/same-length
+            // replacements the pair would alias: ctime+nsec on
+            // Unix, the NTFS file index on Windows.
             #[cfg(unix)]
             let ctime = {
                 use std::os::unix::fs::MetadataExt as _;
                 m.ctime()
+                    .wrapping_mul(1_000_000_000)
+                    .wrapping_add(m.ctime_nsec())
             };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            let ctime = {
+                use std::os::windows::fs::MetadataExt as _;
+                m.file_index().map(|i| i as i64).unwrap_or(0)
+            };
+            #[cfg(not(any(unix, windows)))]
             let ctime = 0i64;
             m.modified().ok().map(|t| (t, m.len(), ctime))
         })

@@ -588,8 +588,12 @@ fn run(args: &[String]) -> Result<(), String> {
                         if adapter_name.is_some() {
                             return Err("duplicate --adapter flag".into());
                         }
-                        adapter_name =
-                            Some(args.get(i + 1).ok_or("--adapter needs a value")?.clone());
+                        adapter_name = Some(
+                            args.get(i + 1)
+                                .filter(|v| !v.starts_with("--"))
+                                .ok_or("--adapter needs a value")?
+                                .clone(),
+                        );
                         i += 2;
                     } else {
                         in_flags = false;
@@ -916,7 +920,43 @@ fn load_workbook(file: &str) -> Result<WorkbookSnapshot, String> {
 fn config_from_env() -> Config {
     match std::env::var("GRIDTALK_CONFIG") {
         Ok(p) => Config::load(std::path::Path::new(&p)),
-        Err(_) => Config::default(),
+        Err(_) => {
+            // Discover the platform default the docs promise:
+            // <config dir>/gridtalk/config.toml (GRIDTALK_CONFIG_DIR
+            // honoured via the UI's shared resolution).
+            let dir = match std::env::var("GRIDTALK_CONFIG_DIR") {
+                Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+                _ => gridtalk_app_config_dir(),
+            };
+            let path = dir.join("config.toml");
+            if path.exists() {
+                Config::load(&path)
+            } else {
+                Config::default()
+            }
+        }
+    }
+}
+
+fn gridtalk_app_config_dir() -> std::path::PathBuf {
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        if !appdata.is_empty() {
+            return std::path::PathBuf::from(appdata).join("gridtalk");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return std::path::PathBuf::from(xdg).join("gridtalk");
+        }
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.is_empty() {
+            return std::path::PathBuf::from(appdata).join("gridtalk");
+        }
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => std::path::PathBuf::from(home).join(".config/gridtalk"),
+        _ => std::path::PathBuf::from(".config/gridtalk"),
     }
 }
 

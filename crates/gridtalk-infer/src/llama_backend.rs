@@ -271,6 +271,10 @@ impl LlamaCppBackend {
         // token (the whole-buffer rescan was O(n^2)).
         let mut cumulative = String::new();
         let mut scanned_len = 0usize;
+        // Incrementally decoded output for emission: only new bytes
+        // are UTF-8-validated per token, never the whole buffer.
+        let mut decoded = String::new();
+        let mut decoded_len = 0usize;
         let mut n_cur = prompt_tokens.len() as i32;
 
         while generated < req.max_tokens {
@@ -292,7 +296,10 @@ impl LlamaCppBackend {
             // Stop markers can be split across BPE pieces, so scan
             // the cumulative text (new piece + tail window only).
             cumulative.push_str(&String::from_utf8_lossy(&piece));
-            let scan_from = scanned_len.saturating_sub(32).min(cumulative.len());
+            let mut scan_from = scanned_len.saturating_sub(32).min(cumulative.len());
+            while scan_from > 0 && !cumulative.is_char_boundary(scan_from) {
+                scan_from -= 1;
+            }
             let scan_window = &cumulative[scan_from..];
             // Any "<|...|>" special in the *text* is a stop marker
             // (possibly split across pieces, e.g. "<|im_end|").
@@ -333,23 +340,39 @@ impl LlamaCppBackend {
             // Emit only complete UTF-8 so far (pieces can split a
             // multi-byte character across tokens), and hold back a
             // trailing "<|..." fragment that may complete into a
-            // stop marker on the next token.
-            if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                let safe_end = match text.rfind('<') {
+            // stop marker on the next token. Validation is
+            // incremental: only bytes appended since the last token.
+            {
+                let pending = &text_bytes[decoded_len..];
+                match std::str::from_utf8(pending) {
+                    Ok(t) => {
+                        decoded.push_str(t);
+                        decoded_len = text_bytes.len();
+                    }
+                    Err(e) => {
+                        let valid = e.valid_up_to();
+                        if valid > 0 {
+                            decoded.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or(""));
+                            decoded_len += valid;
+                        }
+                    }
+                }
+                let unemitted = &decoded[emitted.len()..];
+                let safe_end = match unemitted.rfind('<') {
                     Some(at)
-                        if text[at..].chars().all(|c| {
+                        if unemitted[at..].chars().all(|c| {
                             c == '<' || c == '|' || c.is_ascii_alphanumeric() || c == '_'
                         }) =>
                     {
-                        at
+                        emitted.len() + at
                     }
-                    _ => text.len(),
+                    _ => decoded.len(),
                 };
-                let safe = &text[..safe_end];
-                if let Some(delta) = safe.strip_prefix(emitted.as_str()) {
+                if safe_end > emitted.len() {
+                    let delta = &decoded[emitted.len()..safe_end];
                     if !delta.is_empty() {
                         on_token(delta);
-                        emitted = safe.to_string();
+                        emitted = decoded[..safe_end].to_string();
                     }
                 }
             }

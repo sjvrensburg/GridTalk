@@ -60,18 +60,22 @@ impl Index {
             .iter()
             .map(|sh| gridtalk_graph::detect_regions(sh).len())
             .collect();
+        // Prefix sums: region idx -> sheet in O(log sheets).
+        let mut prefix: Vec<usize> = Vec::with_capacity(region_counts.len() + 1);
+        prefix.push(0);
+        for count in &region_counts {
+            prefix.push(prefix.last().unwrap() + count);
+        }
         let sheet_of_region = |idx: usize| -> Option<&gridtalk_graph::SheetSnapshot> {
-            let mut acc = 0;
-            for (i, count) in region_counts.iter().enumerate() {
-                if idx < acc + count {
-                    return wb.sheets.get(i);
-                }
-                acc += count;
-            }
-            None
+            let sheet_idx = prefix.partition_point(|end| *end <= idx).saturating_sub(1);
+            wb.sheets.get(sheet_idx)
         };
         for (region_idx, region) in graph.regions.iter().enumerate() {
-            if let Some(sheet) = sheet_of_region(region_idx) {
+            // A stale/mismatched graph must not render one sheet's
+            // cells under another sheet's citation range.
+            let assigned = sheet_of_region(region_idx)
+                .filter(|sheet| sheet.name.eq_ignore_ascii_case(&region.range.sheet));
+            if let Some(sheet) = assigned {
                 let passage = render_passage(sheet, region);
                 // Index the body only: the "Range Sheet1!A1:B2" header
                 // is citation boilerplate, not content.

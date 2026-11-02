@@ -189,8 +189,9 @@ fn ggml_type_layout(ty: u32) -> Option<(u64, u64)> {
         34 => (256, 54),  // TQ1_0
         35 => (256, 66),  // TQ2_0
         39 => (32, 17),   // MXFP4
-        41 => (32, 6),    // Q1_0
-        42 => (32, 10),   // Q2_0
+        40 => (64, 36),   // NVFP4
+        41 => (128, 18),  // Q1_0
+        42 => (64, 18),   // Q2_0
         _ => return None,
     })
 }
@@ -244,16 +245,28 @@ fn parse_gguf_with_len(bytes: &[u8], file_len: u64) -> Result<GgufInfo, ModelErr
         let offset = r.u64()?;
         // Unknown (newer) GGML types: extent cannot be verified
         // here; llama.cpp remains the authority for those.
-        let size =
-            ggml_type_layout(ty).map(|(block, per_block)| elements.div_ceil(block) * per_block);
+        let size = match ggml_type_layout(ty) {
+            Some((block, per_block)) => Some(
+                elements
+                    .div_ceil(block)
+                    .checked_mul(per_block)
+                    .ok_or_else(|| ModelError::NotGguf(format!("tensor {name} size overflow")))?,
+            ),
+            None => None,
+        };
         tensor_extents.push((name, offset, size.unwrap_or(0)));
     }
+    // GGUF requires a power-of-two alignment; bound it so hostile
+    // metadata cannot overflow the data_start computation.
     let alignment: u64 = metadata
         .get("general.alignment")
         .and_then(|v| v.parse().ok())
-        .filter(|a: &u64| *a > 0)
+        .filter(|a: &u64| a.is_power_of_two() && *a <= 4096)
         .unwrap_or(32);
-    let data_start = (r.pos as u64).div_ceil(alignment) * alignment;
+    let data_start = (r.pos as u64)
+        .div_ceil(alignment)
+        .checked_mul(alignment)
+        .ok_or_else(|| ModelError::NotGguf("GGUF data offset overflow".into()))?;
     if tensor_count > 0 && file_len <= data_start {
         return Err(ModelError::Truncated(
             "GGUF declares tensors but has no tensor payload".into(),
@@ -738,6 +751,34 @@ mod tests {
         // Type 24 is I8: 256 elements need 256 bytes.
         assert!(parse_gguf(&build(24, 66)).is_err());
         assert!(parse_gguf(&build(24, 256)).is_ok());
+    }
+
+    #[test]
+    fn gguf_q1_q2_nvfp4_layouts() {
+        // Q1_0: 128 elems/18-byte blocks; Q2_0: 64/18; NVFP4: 64/36.
+        let build = |ty: u32, elems: u64, payload: usize| -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"GGUF");
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(b"w");
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&elems.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            let aligned = (b.len() as u64).div_ceil(32) * 32;
+            b.resize(aligned as usize, 0);
+            b.extend_from_slice(&vec![0u8; payload]);
+            b
+        };
+        assert!(parse_gguf(&build(41, 128, 17)).is_err());
+        assert!(parse_gguf(&build(41, 128, 18)).is_ok());
+        assert!(parse_gguf(&build(42, 64, 17)).is_err());
+        assert!(parse_gguf(&build(42, 64, 18)).is_ok());
+        assert!(parse_gguf(&build(40, 64, 35)).is_err());
+        assert!(parse_gguf(&build(40, 64, 36)).is_ok());
     }
 
     #[test]

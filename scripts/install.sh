@@ -22,14 +22,17 @@ cd "$REPO_ROOT"
 DIR="${GRIDTALK_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$DIR"
 for bin in gridtalk gridtalk-ui; do
-  if [ -e "$DIR/$bin" ] && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
+  if { [ -e "$DIR/$bin" ] || [ -L "$DIR/$bin" ]; } && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
     echo "refusing to overwrite existing $DIR/$bin (set GRIDTALK_FORCE=1 to replace)" >&2
     exit 1
   fi
 done
 cargo build --locked --release -p gridtalk-app -p gridtalk-ui
-# Install atomically: stage BOTH binaries beside their targets
-# first, then rename both, so a failure cannot leave a mixed pair.
+# Install near-atomically: stage BOTH binaries beside their targets
+# first, recheck both, then rename both. A residual race remains
+# between the recheck and the second rename (a file appearing in
+# that window can still leave a mixed pair); the window is small
+# and this is a single-user local install.
 trap 'rm -f "$DIR/.gridtalk.tmp-$$" "$DIR/.gridtalk-ui.tmp-$$"' EXIT
 for bin in gridtalk gridtalk-ui; do
   cp "target/release/$bin" "$DIR/.$bin.tmp-$$"
@@ -38,7 +41,7 @@ done
 # Recheck BOTH targets before the first rename, so a binary that
 # appeared during the build cannot leave a mixed pair installed.
 for bin in gridtalk gridtalk-ui; do
-  if [ -e "$DIR/$bin" ] && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
+  if { [ -e "$DIR/$bin" ] || [ -L "$DIR/$bin" ]; } && [ "${GRIDTALK_FORCE:-}" != "1" ]; then
     echo "refusing to overwrite existing $DIR/$bin (set GRIDTALK_FORCE=1 to replace)" >&2
     exit 1
   fi

@@ -234,8 +234,12 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
             // A Triggers line in the first three lines is
             // metadata (hand-written skills may lead with a title
             // or blank line; docs/adapters.md promises this).
+            let mut found_header = false;
             for (idx, line) in text.lines().enumerate() {
-                let header = idx < 3;
+                // Only the FIRST Triggers line in the window is
+                // metadata; later ones are body (commit_version
+                // writes metadata first, so bodies round-trip).
+                let header = idx < 3 && !found_header;
                 let parsed = if header {
                     line.trim()
                         .strip_prefix("Triggers:")
@@ -244,6 +248,7 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
                     None
                 };
                 if let Some(rest) = parsed {
+                    found_header = true;
                     let parsed: Vec<String> = rest
                         .split(',')
                         .map(|t| t.trim().to_lowercase())
@@ -407,10 +412,13 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
     let mut committed = adapter.clone();
     committed.version = next;
     let write_result = (|| -> Result<(), String> {
-        std::fs::write(vdir_tmp.join("ADAPTER.md"), &committed.rules).map_err(|e| e.to_string())?;
-        std::fs::write(vdir_tmp.join("adapter.toml"), knob_text(&committed))
-            .map_err(|e| e.to_string())?;
+        write_atomic(&vdir_tmp.join("ADAPTER.md"), &committed.rules)?;
+        write_atomic(&vdir_tmp.join("adapter.toml"), &knob_text(&committed))?;
+        let mut seen_skills: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for skill in &committed.skills {
+            if !seen_skills.insert(skill.name.as_str()) {
+                return Err(format!("duplicate skill name {:?}", skill.name));
+            }
             // Interior dots are fine (`my.skill` -> my.skill.md,
             // which load_skills reads back verbatim); separators,
             // leading dots and traversal are not.
@@ -422,11 +430,10 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
                 text.push_str(&format!("Triggers: {}\n", skill.triggers.join(", ")));
             }
             text.push_str(&skill.body);
-            std::fs::write(
-                vdir_tmp.join("skills").join(format!("{}.md", skill.name)),
-                text,
-            )
-            .map_err(|e| e.to_string())?;
+            write_atomic(
+                &vdir_tmp.join("skills").join(format!("{}.md", skill.name)),
+                &text,
+            )?;
         }
         std::fs::rename(&vdir_tmp, &vdir).map_err(|e| e.to_string())
     })();
@@ -439,7 +446,13 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
     // The root adapter.toml is the version POINTER (load_adapter
     // reads it), so its failure is a failed commit: propagate.
     // Only the ADAPTER.md convenience copy is best-effort.
-    write_atomic(&dir.join("adapter.toml"), &knob_text(&committed))?;
+    // If the pointer write fails, remove the just-renamed vN:
+    // an orphan would be skipped by the next commit and targeted
+    // by a later rollback as if it were live history.
+    if let Err(e) = write_atomic(&dir.join("adapter.toml"), &knob_text(&committed)) {
+        let _ = std::fs::remove_dir_all(&vdir);
+        return Err(e);
+    }
     if let Err(e) = write_atomic(&dir.join("ADAPTER.md"), &committed.rules) {
         eprintln!("gridtalk: warning: committed v{next} but root ADAPTER.md update failed: {e}");
     }
@@ -458,11 +471,7 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
         let vdir = dir.join(format!("v{target}"));
         let toml_ok =
             std::fs::read_to_string(vdir.join("adapter.toml")).is_ok_and(|t| !t.trim().is_empty());
-        if !vdir.is_dir()
-            || !toml_ok
-            || !vdir.join("ADAPTER.md").is_file()
-            || !vdir.join("skills").is_dir()
-        {
+        if !vdir.is_dir() || !toml_ok || !vdir.join("ADAPTER.md").is_file() {
             return Err(format!(
                 "adapter {name} cannot roll back: v{target} is missing or incomplete on disk"
             ));

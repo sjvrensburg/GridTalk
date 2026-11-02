@@ -723,18 +723,19 @@ impl GridTalkApp {
                     }
                 }
                 let skill_body = body_lines.join("\n");
-                let applies = !has_header
-                    || triggers.iter().any(|t| {
-                        let tw: Vec<&str> = t
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|w| !w.is_empty())
-                            .collect();
-                        !tw.is_empty()
-                            && tw.len() <= q_words.len()
-                            && q_words
-                                .windows(tw.len())
-                                .any(|w| w.iter().map(|s| s.as_str()).collect::<Vec<_>>() == tw)
-                    });
+                let applies = !triggers.iter().any(|t| t == "\u{1}never")
+                    && (!has_header
+                        || triggers.iter().any(|t| {
+                            let tw: Vec<&str> = t
+                                .split(|c: char| !c.is_alphanumeric())
+                                .filter(|w| !w.is_empty())
+                                .collect();
+                            !tw.is_empty()
+                                && tw.len() <= q_words.len()
+                                && q_words
+                                    .windows(tw.len())
+                                    .any(|w| w.iter().map(|s| s.as_str()).collect::<Vec<_>>() == tw)
+                        }));
                 if applies && !skill_body.trim().is_empty() {
                     let skill_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("skill");
                     text.push_str(&format!("\n\nSkill: {}\n{}", skill_name, skill_body.trim()));
@@ -1650,16 +1651,18 @@ impl GridTalkApp {
                 )
             });
             if (next || prev) && !self.graph.nodes.is_empty() {
-                let cur = self
+                let len = self.graph.nodes.len();
+                let current = self
                     .sync
                     .highlighted_node
-                    .and_then(|id| self.graph.nodes.iter().position(|n| n.id == id))
-                    .unwrap_or(0);
-                let len = self.graph.nodes.len();
-                let idx = if next {
-                    (cur + 1) % len
-                } else {
-                    (cur + len - 1) % len
+                    .and_then(|id| self.graph.nodes.iter().position(|n| n.id == id));
+                // From nothing highlighted: Right lands on the
+                // FIRST node, Left on the last (not index 1 / len-2).
+                let idx = match (current, next) {
+                    (None, true) => 0,
+                    (None, false) => len - 1,
+                    (Some(cur), true) => (cur + 1) % len,
+                    (Some(cur), false) => (cur + len - 1) % len,
                 };
                 clicked_node = Some(self.graph.nodes[idx].id);
             }

@@ -73,7 +73,14 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
     marker = "\n--- answer ("
     answer = text.rsplit(marker, 1)[-1] if marker in text else text
     answer = answer.split(") ---\n", 1)[-1].strip()
-    return RunOutput(output=answer, wall_s=wall, extra={"stdout_tail": text[-500:], "stdout": text})
+    citations_text = "\n".join(
+        line for line in text.splitlines() if line.strip().startswith("citations:")
+    )
+    return RunOutput(
+        output=answer,
+        wall_s=wall,
+        extra={"stdout_tail": text[-500:], "stdout": citations_text},
+    )
 
 
 def _extract_numbers(text: str) -> list[float]:
@@ -147,6 +154,56 @@ def _parse_cell(ref: str):
     return sheet, int(m.group(2)), col
 
 
+def _split_citations(text: str) -> list[str]:
+    """Split a citations list on commas, respecting single-quoted
+    sheet names (with '' escapes) that may contain commas."""
+    out, cur, i = [], "", 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            cur += ch
+            i += 1
+            while i < len(text):
+                cur += text[i]
+                if text[i] == "'":
+                    if i + 1 < len(text) and text[i + 1] == "'":
+                        cur += "'"
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == ",":
+            out.append(cur)
+            cur = ""
+            i += 1
+            continue
+        cur += ch
+        i += 1
+    out.append(cur)
+    return out
+
+
+def _contains_bounded(answer: str, needle: str) -> bool:
+    """Mirror bench.rs contains_bounded: needle must not be flanked
+    by alphanumeric / ! / : / . / $ characters."""
+    def boundary(ch: str | None) -> bool:
+        return ch is None or not (ch.isalnum() or ch in "!.:$")
+
+    start = 0
+    while True:
+        pos = answer.find(needle, start)
+        if pos < 0:
+            return False
+        end = pos + len(needle)
+        before = answer[pos - 1] if pos > 0 else None
+        after = answer[end] if end < len(answer) else None
+        if boundary(before) and boundary(after):
+            return True
+        start = pos + 1
+
+
 def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     """Bench citation semantics: the expected citation CELL must fall
     inside a structured cited range (the CLI's `citations:` line or a
@@ -160,11 +217,11 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     cited: list[str] = []
     for line in str((extra or {}).get("stdout", "")).splitlines():
         if line.strip().startswith("citations:"):
-            cited += [c.strip() for c in line.split(":", 1)[1].split(",")]
+            cited += [c.strip() for c in _split_citations(line.split(":", 1)[1])]
     for c in cited:
-        # The SAME cited range must appear in the answer and
-        # contain the expected cell (bench.rs citation_hit).
-        if not c or c not in (answer or ""):
+        # The SAME cited range must appear in the answer (as a
+        # standalone reference) and contain the expected cell.
+        if not c or "!" not in c or not _contains_bounded(answer or "", c):
             continue
         rng = c.rpartition("!")[2] if "!" in c else c
         sheet = c.rpartition("!")[0].strip("'") or None if "!" in c else None
@@ -181,6 +238,12 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
 
 def score(task: dict, output: RunOutput) -> JudgeResult:
     raw = task.get("expected")
+    if isinstance(raw, bool):
+        return JudgeResult(
+            score=0.0,
+            feedback=f"task {task.get('id', '?')}: bool expected value is not numeric",
+            extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
+        )
     try:
         expected = float(raw)
     except (TypeError, ValueError, OverflowError):

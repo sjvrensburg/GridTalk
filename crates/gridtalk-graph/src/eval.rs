@@ -49,7 +49,7 @@ pub fn eval_cell_in_workbook(
     let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
     let idx = sheets
         .iter()
-        .position(|s| s.name == sheet_name)
+        .position(|s| s.name.eq_ignore_ascii_case(sheet_name))
         .ok_or_else(|| EvalError::Ref(format!("unknown sheet {sheet_name}")))?;
     let mut state = EvalState::default();
     eval_cell_inner(&sheets, idx, row, col, &mut state, 0)
@@ -457,7 +457,10 @@ impl<'a> Parser<'a> {
         if self.chars.get(i) != Some(&'!') {
             return None;
         }
-        let idx = self.sheets.iter().position(|s| s.name == name)?;
+        let idx = self
+            .sheets
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&name))?;
         Some((idx, i + 1))
     }
 
@@ -504,14 +507,16 @@ impl<'a> Parser<'a> {
         Ok((format!("{letters}{digits}"), row1 - 1, col - 1))
     }
 
-    fn parse_ref_token(&mut self) -> Result<(usize, usize, usize), EvalError> {
+    fn parse_ref_token(&mut self) -> Result<(usize, usize, usize, bool), EvalError> {
         self.skip_ws();
         let mut target = self.sheet_idx;
+        let mut qualified = false;
         if matches!(self.peek(), Some('\''))
             || matches!(self.peek(), Some(c) if c.is_ascii_alphabetic())
         {
             if let Some((idx, next)) = self.try_sheet_qualifier() {
                 target = idx;
+                qualified = true;
                 self.pos = next;
             }
         }
@@ -521,7 +526,7 @@ impl<'a> Parser<'a> {
         }
         let letters: String = self.chars[start..self.pos].iter().collect();
         let (_, row, col) = self.finish_ref(&letters)?;
-        Ok((target, row, col))
+        Ok((target, row, col, qualified))
     }
 
     /// Push one scalar argument, except that a lone reference to an
@@ -529,7 +534,7 @@ impl<'a> Parser<'a> {
     /// empty cell is 0, AVERAGE ignores it) — matching range args.
     fn push_scalar(&mut self, values: &mut Vec<f64>) -> Result<(), EvalError> {
         let save = self.pos;
-        if let Ok((t, r, c)) = self.parse_ref_token() {
+        if let Ok((t, r, c, _)) = self.parse_ref_token() {
             self.skip_ws();
             let overridden = self
                 .state
@@ -563,20 +568,23 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let save = self.pos;
             // Try range A1:B9 first.
-            if let Ok((t0, r0, c0)) = self.parse_ref_token() {
+            if let Ok((t0, r0, c0, _)) = self.parse_ref_token() {
                 self.skip_ws();
                 if self.peek() == Some(':') {
                     self.bump();
-                    let (t1, r1, c1) = self.parse_ref_token()?;
+                    let (t1, r1, c1, end_qualified) = self.parse_ref_token()?;
                     let area = (r0.max(r1) - r0.min(r1) + 1) * (c0.max(c1) - c0.min(c1) + 1);
                     if area > 100_000 {
                         return Err(EvalError::Parse(format!(
                             "range of {area} cells exceeds the 100000-cell evaluation cap"
                         )));
                     }
-                    if t1 != t0 {
+                    // An unqualified range end inherits the start
+                    // sheet (Sheet2!A1:B2); only an explicitly
+                    // different end sheet is an error.
+                    if t1 != t0 && end_qualified {
                         return Err(EvalError::Parse(
-                            "range ends on a different sheet than it starts;                              qualify only the start (Sheet2!A1:B2)"
+                            "range ends on a different sheet than it starts; qualify only the start (Sheet2!A1:B2)"
                                 .into(),
                         ));
                     }
@@ -680,7 +688,7 @@ pub fn eval_cell_with_override(
     let find = |name: &str| {
         sheets
             .iter()
-            .position(|s| s.name == name)
+            .position(|s| s.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| EvalError::Ref(format!("unknown sheet {name}")))
     };
     let mut state = EvalState {
@@ -726,7 +734,7 @@ pub fn what_if_in_workbook(
                 "what-if coordinates beyond the evaluation grid on {sheet}"
             )));
         }
-        if !wb.sheets.iter().any(|s| s.name == sheet) {
+        if !wb.sheets.iter().any(|s| s.name.eq_ignore_ascii_case(sheet)) {
             return Err(EvalError::Ref(format!("unknown sheet {sheet}")));
         }
     }
@@ -911,6 +919,14 @@ mod tests {
         let wb = parse_delimited("d", "S", "A,B,C\n,=COUNT(A2),=AVERAGE(A2)\n", ',');
         assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 0.0);
         assert!(eval_cell(&wb.sheets[0], 1, 2).is_err());
+        // Start-only qualified ranges inherit the start sheet,
+        // and sheet qualifiers resolve case-insensitively.
+        let mut wb2 = parse_delimited("d", "Sheet1", "A\n=SUM(sheet2!A1:A2)\n", ',');
+        wb2.sheets.push(crate::SheetSnapshot {
+            name: "Sheet2".into(),
+            cells: vec![vec![CellValue::Number(3.0)], vec![CellValue::Number(4.0)]],
+        });
+        assert_eq!(eval_cell_in_workbook(&wb2, "Sheet1", 1, 0).unwrap(), 7.0);
         // Doubly-qualified range ends are a typed error.
         let mut wb = parse_delimited("d", "Sheet1", "A\n=SUM(Sheet2!A1:Sheet1!B1)\n", ',');
         wb.sheets.push(crate::SheetSnapshot {

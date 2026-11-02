@@ -725,7 +725,7 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
         if let Some((r0, c0, next)) = parse_a1_at(&chars, at) {
             // A ref-shaped token immediately followed by '(' is a
             // function name (LOG10(...)), not a cell reference.
-            if sheet.is_none() && next < chars.len() && chars[next] == '(' {
+            if next < chars.len() && chars[next] == '(' {
                 i = next;
                 continue;
             }
