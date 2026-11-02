@@ -9,7 +9,7 @@
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
 use gridtalk_graph::eval::{eval_cell_in_workbook, what_if_in_workbook};
-use gridtalk_graph::{formula_refs_qualified, CellValue, WorkbookSnapshot};
+use gridtalk_graph::{formula_refs_qualified, sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
 
@@ -103,16 +103,40 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                 ));
                             }
                             // One what-if task per formula: walk
-                            // numeric precedents until one produces
-                            // a non-trivial, finite outcome.
+                            // deduplicated numeric precedents (range
+                            // expansion repeats cells) with a bounded
+                            // number of what-if attempts.
+                            let mut seen_prects: std::collections::BTreeSet<(usize, usize, usize)> =
+                                std::collections::BTreeSet::new();
+                            let mut attempts = 0usize;
                             for q in formula_refs_qualified(expr) {
+                                if attempts >= 64 {
+                                    break;
+                                }
+                                let sheet_idx_of = wb
+                                    .sheets
+                                    .iter()
+                                    .position(|s| {
+                                        sheet_name_eq(
+                                            &s.name,
+                                            q.sheet.as_deref().unwrap_or(&sheet.name),
+                                        )
+                                    })
+                                    .unwrap_or(usize::MAX);
+                                if !seen_prects.insert((sheet_idx_of, q.row, q.col)) {
+                                    continue;
+                                }
                                 let osheet_name =
                                     q.sheet.clone().unwrap_or_else(|| sheet.name.clone());
-                                let Some(osheet) = wb.sheets.iter().find(|s| s.name == osheet_name)
+                                let Some(osheet) = wb
+                                    .sheets
+                                    .iter()
+                                    .find(|s| sheet_name_eq(&s.name, &osheet_name))
                                 else {
                                     continue;
                                 };
                                 if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
+                                    attempts += 1;
                                     let new_value = orig + 10.0;
                                     if let Ok((before, after)) = what_if_in_workbook(
                                         wb,
@@ -122,7 +146,10 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                     ) {
                                         // Trivial tasks (outcome
                                         // unchanged) teach nothing.
-                                        if after.is_finite() && (after - before).abs() > 1e-9 {
+                                        // `v` is the pre-computed before
+                                        // value for this formula.
+                                        let _ = before;
+                                        if after.is_finite() && (after - v).abs() > 1e-9 {
                                             drafts.push((
                                                 "what_if".into(),
                                                 format!(
@@ -193,22 +220,30 @@ pub fn extract_numbers(text: &str) -> Vec<f64> {
             Some(stripped) => (stripped, true),
             None => (t, false),
         };
-        let normalized = if core.contains(',') {
+        let normalized = if core.contains(',') && core.contains('.') {
+            // Both separators: the last one is the decimal point
+            // (1.200,50 European or 1,200.50 Anglo).
+            if core.rfind(',') > core.rfind('.') {
+                core.replace('.', "").replace(',', ".")
+            } else {
+                core.replace(',', "")
+            }
+        } else if core.contains(',') {
             // Thousands groups: every group after the first is
-            // exactly 3 digits (the last may carry a ".dec" tail,
-            // e.g. 1,200.50). Otherwise the comma is decimal.
+            // exactly 3 digits, otherwise a single comma is decimal.
+            // Multiple non-thousands commas (1,200,50) are ambiguous
+            // and skipped, not mangled into 1.20050.
             let groups: Vec<&str> = core.split(',').collect();
             let thousands = groups.len() > 1
-                && groups[1..].iter().all(|g| {
-                    let int_part = g.split('.').next().unwrap_or("");
-                    int_part.len() == 3 && int_part.chars().all(|c| c.is_ascii_digit())
-                });
+                && groups[1..]
+                    .iter()
+                    .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()));
             if thousands {
                 core.replace(',', "")
-            } else if let Some((head, tail)) = core.split_once(',') {
-                format!("{head}.{}", tail.replace(',', ""))
+            } else if groups.len() == 2 {
+                format!("{}.{}", groups[0], groups[1])
             } else {
-                core.to_string()
+                continue;
             }
         } else {
             core.to_string()
@@ -251,25 +286,55 @@ pub struct TaskResult {
 /// Citation precision is scored on structured citations only: a
 /// cited *range* counts when it contains the expected cell. An
 /// answer merely restating the question's citation does not.
+/// `answer` mentions `needle` as a standalone reference, not as a
+/// substring of a longer ref (Sheet1!A1 inside Sheet1!A10:B20).
+pub(crate) fn contains_bounded(answer: &str, needle: &str) -> bool {
+    // ASCII case-insensitive (offsets preserved; matches the
+    // case-insensitive sheet comparison in citation_hit).
+    let answer = &answer.to_ascii_lowercase();
+    let needle = &needle.to_ascii_lowercase();
+    let boundary = |c: char| !(c.is_alphanumeric() || matches!(c, '!' | ':' | '.' | '$'));
+    let first_char_len = needle.chars().next().map_or(1, |c| c.len_utf8());
+    let mut from = 0;
+    while let Some(pos) = answer[from..].find(needle.as_str()) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
+        // Sentence punctuation (`... Sheet1!D2.` / `Sheet1!D2: 6`)
+        // ends a reference; a '.'/':' that continues a longer ref
+        // (Sheet1!A1:B2) does not.
+        let mut tail = answer[end..].chars();
+        let after_ok = match tail.next() {
+            None => true,
+            Some(c) if boundary(c) => true,
+            Some('.') | Some(':') => tail.next().is_none_or(|n| n.is_whitespace()),
+            Some(_) => false,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + first_char_len;
+        if from >= answer.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // The cited range must also be *used* in the answer text —
     // retrieval alone does not count as citing.
-    let answer_cites =
-        citations.iter().any(|c| answer.contains(c.as_str())) || answer.contains(citation);
-    if !answer_cites {
-        return false;
-    }
-    let Some((_, er, ec)) = crate::tools::parse_cell_ref(citation) else {
+    let Some((esheet, er, ec)) = crate::tools::parse_cell_ref(citation) else {
         return false;
     };
+    // The SAME cited range must both appear in the answer and
+    // contain the expected cell (combining two different ranges
+    // was a false positive).
     citations.iter().any(|cited| {
-        crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
-            crate::tools::parse_cell_ref(citation).is_some_and(|(esheet, _, _)| sheet == esheet)
-                && er >= r0
-                && er <= r1
-                && ec >= c0
-                && ec <= c1
-        })
+        contains_bounded(answer, cited)
+            && crate::tools::parse_range_uncapped(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
+                sheet_name_eq(&sheet, &esheet) && er >= r0 && er <= r1 && ec >= c0 && ec <= c1
+            })
     })
 }
 
@@ -451,6 +516,20 @@ pub fn render_card_with_skipped(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bench_numbers_round5() {
+        assert_eq!(extract_numbers("total 1.200,50"), vec![1200.5]);
+        assert_eq!(extract_numbers("total 1,200.50"), vec![1200.5]);
+        assert!(extract_numbers("range 1,200,50 here").is_empty());
+        assert_eq!(extract_numbers("sci 1.2e3"), vec![1200.0]);
+        // A restated question ref is not a citation hit.
+        assert!(!citation_hit(
+            &["Sheet1!A1:B2".to_string()],
+            "Sheet1!D9",
+            "Sheet1!D9 is 5"
+        ));
+    }
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
     use gridtalk_index::HybridIndex;
@@ -519,6 +598,11 @@ mod tests {
             "Sheet1!D2",
             "The total is 6 [Sheet1!A1:D4]"
         ));
+        // A citation ending a sentence still counts; a prefix of a
+        // longer range does not.
+        assert!(contains_bounded("See Sheet1!A1:D4.", "Sheet1!A1:D4"));
+        assert!(contains_bounded("Sheet1!D2: 6", "Sheet1!D2"));
+        assert!(!contains_bounded("Sheet1!A1:B2", "Sheet1!A1"));
         // Retrieval hit without an answer citation does not count.
         assert!(!citation_hit(&citations, "Sheet1!D2", "The total is 6"));
         // Out-of-range citations do not count either.

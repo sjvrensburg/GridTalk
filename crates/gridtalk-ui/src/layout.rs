@@ -60,6 +60,18 @@ pub fn compute_layout_cancellable(
         );
     }
     let ids: Vec<usize> = graph.nodes.iter().map(|n| n.id).collect();
+    // Cap the O(n^2) repulsion at 500 nodes STRIDE-SAMPLED across
+    // all ids (not the first 500 in build order, which left every
+    // tail node repulsion-free). Non-sampled nodes are moved only
+    // by edge attraction and their seeded positions.
+    const MAX_REPEL_NODES: usize = 500;
+    let repel_ids: Vec<usize> = if ids.len() <= MAX_REPEL_NODES {
+        ids.clone()
+    } else {
+        (0..MAX_REPEL_NODES)
+            .map(|i| ids[i * ids.len() / MAX_REPEL_NODES])
+            .collect()
+    };
     for _ in 0..iterations {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -68,8 +80,8 @@ pub fn compute_layout_cancellable(
         let mut force: BTreeMap<usize, (f32, f32)> =
             ids.iter().map(|id| (*id, (0.0, 0.0))).collect();
         let mut pair_count = 0usize;
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
+        for i in 0..repel_ids.len() {
+            for j in (i + 1)..repel_ids.len() {
                 pair_count += 1;
                 // Poll cancellation inside the O(n^2) loop too, so
                 // huge graphs stop promptly, not after a full sweep.
@@ -78,15 +90,15 @@ pub fn compute_layout_cancellable(
                 {
                     return pos;
                 }
-                let (a, b) = (pos[&ids[i]], pos[&ids[j]]);
+                let (a, b) = (pos[&repel_ids[i]], pos[&repel_ids[j]]);
                 let (dx, dy) = (a.x - b.x, a.y - b.y);
                 let d2 = (dx * dx + dy * dy).max(25.0);
                 let f = 2600.0 / d2;
                 let (fx, fy) = (dx * f, dy * f);
-                let fa = force.get_mut(&ids[i]).unwrap();
+                let fa = force.get_mut(&repel_ids[i]).unwrap();
                 fa.0 += fx;
                 fa.1 += fy;
-                let fb = force.get_mut(&ids[j]).unwrap();
+                let fb = force.get_mut(&repel_ids[j]).unwrap();
                 fb.0 -= fx;
                 fb.1 -= fy;
             }

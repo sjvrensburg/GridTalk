@@ -25,17 +25,35 @@ struct OpenWorkbook {
     /// (mtime, len, content hash): stat first on every call;
     /// the file is only re-read/hashed when stat changed, and
     /// only reloaded when the hash also changed.
-    stamp: Option<(SystemTime, u64, u64)>,
+    stamp: Option<(SystemTime, u64, i64, u64)>,
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
 }
 
 impl OpenWorkbook {
-    fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64)> {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+    fn stat_of(path: &PathBuf) -> Option<(SystemTime, u64, i64)> {
+        std::fs::metadata(path).ok().and_then(|m| {
+            // A change stamp catches same-mtime/same-length
+            // replacements the pair would alias: ctime+nsec on
+            // Unix, the creation time on Windows (`file_index` is
+            // still unstable there).
+            #[cfg(unix)]
+            let ctime = {
+                use std::os::unix::fs::MetadataExt as _;
+                m.ctime()
+                    .wrapping_mul(1_000_000_000)
+                    .wrapping_add(m.ctime_nsec())
+            };
+            #[cfg(windows)]
+            let ctime = {
+                use std::os::windows::fs::MetadataExt as _;
+                m.creation_time() as i64
+            };
+            #[cfg(not(any(unix, windows)))]
+            let ctime = 0i64;
+            m.modified().ok().map(|t| (t, m.len(), ctime))
+        })
     }
 
     fn hash_of(path: &PathBuf) -> Option<u64> {
@@ -49,10 +67,10 @@ impl OpenWorkbook {
         Some(h)
     }
 
-    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, u64)> {
-        let (mtime, len) = Self::stat_of(path)?;
+    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64, i64, u64)> {
+        let (mtime, len, ctime) = Self::stat_of(path)?;
         let hash = Self::hash_of(path)?;
-        Some((mtime, len, hash))
+        Some((mtime, len, ctime, hash))
     }
 
     fn load(path: &PathBuf) -> Result<Self, String> {
@@ -76,16 +94,22 @@ impl OpenWorkbook {
         // Stat first (cheap): unchanged stat means no re-read at
         // all. Changed stat re-hashes; only a changed hash (real
         // content change) triggers the expensive reload.
-        let Some((mtime, len)) = Self::stat_of(&self.path) else {
-            return Ok(());
+        let Some((mtime, len, ctime)) = Self::stat_of(&self.path) else {
+            return Err(format!(
+                "workbook {} was deleted or became unreadable",
+                self.path.display()
+            ));
         };
-        if let Some((old_mtime, old_len, old_hash)) = self.stamp {
-            if (mtime, len) == (old_mtime, old_len) {
+        if let Some((old_mtime, old_len, old_ctime, old_hash)) = self.stamp {
+            // Windows has no change counter in std metadata, so
+            // (mtime, len, file_index) cannot detect an in-place
+            // same-length edit: always fall through to the hash.
+            if !cfg!(windows) && (mtime, len, ctime) == (old_mtime, old_len, old_ctime) {
                 return Ok(());
             }
             if Self::hash_of(&self.path) == Some(old_hash) {
                 // Content-preserving touch: refresh the stamp.
-                self.stamp = Some((mtime, len, old_hash));
+                self.stamp = Some((mtime, len, ctime, old_hash));
                 return Ok(());
             }
         }
@@ -143,7 +167,7 @@ fn tool_definitions() -> Value {
         {"name": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
         {"name": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
         {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only, never writes)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}, "required": ["workbook_id", "cell", "value", "target"]}},
-        {"name": "graph_overview", "description": "All graph nodes and edges for an open workbook", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
+        {"name": "graph_overview", "description": "Graph nodes and edges for an open workbook (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
     ])
 }
 
@@ -314,10 +338,12 @@ impl McpServer {
                             self.next_id
                         );
                         self.next_id += 1;
+                        let mut evicted: Vec<String> = Vec::new();
                         while self.workbooks.len() >= MAX_WORKBOOKS {
                             match self.order.pop_front() {
                                 Some(old) => {
                                     self.workbooks.remove(&old);
+                                    evicted.push(old);
                                 }
                                 None => break,
                             }
@@ -337,7 +363,7 @@ impl McpServer {
                             .collect();
                         self.workbooks.insert(id.clone(), open);
                         structured_result(
-                            json!({"workbook_id": id, "sheets": sheets, "regions": regions}),
+                            json!({"workbook_id": id, "sheets": sheets, "regions": regions, "evicted_workbook_ids": evicted}),
                             false,
                         )
                     }

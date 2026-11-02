@@ -5,7 +5,7 @@
 //! `search`, `expand`, `cells`, `formulas`, `what_if`.
 
 pub use crate::tools::parse_cell_ref;
-use crate::tools::{parse_range, Tools};
+use crate::tools::Tools;
 use gridtalk_graph::CellValue;
 use gridtalk_infer::{ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
@@ -75,7 +75,7 @@ pub fn investigate_with(
     // recorded in the trail, not re-executed).
     let top_k = adapter.map(|a| a.top_k).unwrap_or(3);
     let hits = tools.hybrid.search(question, top_k);
-    let citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
+    let mut citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
     let search_result = if hits.is_empty() {
         format!("no regions matched \"{question}\"")
@@ -101,6 +101,17 @@ pub fn investigate_with(
             if trail.len() < max_steps {
                 let cells = run("cells", &format!("range={clean}"), &mut trail);
                 context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
+            }
+            // Directly-read ref_context cells are citations too —
+            // but only when the named sheet actually exists (the
+            // tool calls above return error text for a bad sheet).
+            let sheet_ok = parse_cell_ref(&clean).is_some_and(|(sheet_name, r, c)| {
+                tools
+                    .sheet_for(&sheet_name)
+                    .is_some_and(|sh| r < sh.cells.len() && c < sh.max_col())
+            });
+            if sheet_ok && !citations.contains(&clean) {
+                citations.push(clean.clone());
             }
         }
     }
@@ -133,7 +144,7 @@ pub fn investigate_with(
                 );
             }
             if let Some(range) = top_range.as_ref().or(explicit_target.as_ref()) {
-                if let Some((sheet, _, _, _, _)) = parse_range(range) {
+                if let Some((sheet, _, _, _, _)) = crate::tools::parse_range_uncapped(range) {
                     // Target: an explicit Sheet!Cell in the question,
                     // else the first formula cell in the top region,
                     // else the region's last cell.
@@ -145,21 +156,41 @@ pub fn investigate_with(
                     } else {
                         parse_cell_ref(&format!("{sheet}!{cell}"))
                     };
+                    // Dependent = a formula whose value actually
+                    // CHANGES under the override (trial what-if):
+                    // captures transitive dependencies and needs no
+                    // range expansion. Bounded candidate count.
                     let dependent_target = || -> Option<String> {
-                        let (_, orow, ocol) = override_coord.clone()?;
-                        let (_, r0, c0, r1, c1) = parse_range(range)?;
+                        let (osheet, orow, ocol) = override_coord.clone()?;
+                        let (_, r0, c0, r1, c1) = crate::tools::parse_range_uncapped(range)?;
                         let sheet_obj = tools.sheet_for(&sheet)?;
+                        let mut tried = 0usize;
                         for r in r0..=r1 {
                             for c in c0..=c1 {
-                                if let CellValue::Formula { expr, .. } = sheet_obj.get(r, c) {
-                                    let refs = gridtalk_graph::formula_refs(&expr);
-                                    if refs.contains(&(orow, ocol)) {
-                                        return Some(format!(
-                                            "{}!{}{}",
-                                            sheet,
-                                            gridtalk_graph::col_name(c),
-                                            r + 1
-                                        ));
+                                if tried >= 200 {
+                                    return None;
+                                }
+                                if (sheet.as_str(), r, c) == (osheet.as_str(), orow, ocol) {
+                                    continue;
+                                }
+                                if let CellValue::Formula { .. } = sheet_obj.get(r, c) {
+                                    tried += 1;
+                                    if let Ok((before, after)) =
+                                        gridtalk_graph::eval::what_if_in_workbook(
+                                            tools.wb,
+                                            (&osheet, orow, ocol),
+                                            value,
+                                            (&sheet, r, c),
+                                        )
+                                    {
+                                        if (after - before).abs() > 1e-9 {
+                                            return Some(format!(
+                                                "{}!{}{}",
+                                                sheet,
+                                                gridtalk_graph::col_name(c),
+                                                r + 1
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -181,6 +212,10 @@ pub fn investigate_with(
                             );
                         }
                     }
+                } else {
+                    context.push_str(
+                        "\n\nwhat-if: skipped — the top region could not be parsed for target discovery.",
+                    );
                 }
             }
         }
@@ -220,7 +255,11 @@ pub fn investigate_with(
     }
     // Citation guarantee: the printed answer must cite a range we
     // actually retrieved.
-    if !citations.is_empty() && !citations.iter().any(|c| answer.contains(c)) {
+    if !citations.is_empty()
+        && !citations
+            .iter()
+            .any(|c| crate::bench::contains_bounded(&answer, c))
+    {
         answer.push_str(&format!("\n\nSources: {}", citations.join(", ")));
     }
 
@@ -296,7 +335,67 @@ pub fn qualified_refs(question: &str) -> Vec<String> {
     out
 }
 
+/// Shared value scan for all what-if branches: the first
+/// parseable number within `window` tokens that is either
+/// immediate or introduced by is/becomes/equals/to/set/at/=.
+fn value_after(tokens: &[&str], window: usize) -> Option<f64> {
+    fn is_cell_ref_like(word: &str) -> bool {
+        let cell = word.rsplit('!').next().unwrap_or(word).replace('$', "");
+        let letters = cell.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+        (1..=3).contains(&letters)
+            && letters < cell.len()
+            && cell[letters..].chars().all(|c| c.is_ascii_digit())
+            && !cell[letters..].is_empty()
+    }
+    for (j, next) in tokens.iter().take(window).enumerate() {
+        // A subsequent cell ref (the target) ends the value scan:
+        // its trailing digits are not the override value.
+        let word = next
+            .trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
+        if is_cell_ref_like(word) {
+            return None;
+        }
+        // Letter-starting tokens are never values.
+        if next
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic())
+        {
+            continue;
+        }
+        let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
+        if let Ok(v) = n.parse::<f64>() {
+            let introduced = j == 0
+                || tokens[..j].iter().rev().take(3).any(|t| {
+                    matches!(
+                        t.trim_matches(|c: char| !c.is_alphanumeric())
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "is" | "becomes" | "equals" | "to" | "set" | "at"
+                    ) || t.contains('=')
+                });
+            if introduced {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn parse_what_if(question: &str) -> Option<(String, f64)> {
+    // Quoted-sheet form first via the quote-aware parser:
+    // split_whitespace would shred 'My Sheet'!B2 into two tokens.
+    for qref in qualified_refs(question) {
+        if parse_cell_ref(&qref).is_some() {
+            if let Some(pos) = question.find(&qref) {
+                let tail: Vec<&str> = question[pos + qref.len()..].split_whitespace().collect();
+                if let Some(v) = value_after(&tail, 12) {
+                    return Some((qref, v));
+                }
+            }
+        }
+    }
     // "... B2 is 10 ..." / "... B2 = 10.5 ..." / "... Sheet1!B2 ..."
     let tokens: Vec<&str> = question.split_whitespace().collect();
     // Sheet-qualified form first (Sheet1!B2 / 'My Sheet'!B2): the
@@ -305,11 +404,8 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
         let clean =
             tok.trim_matches(|c: char| !(c.is_alphanumeric() || c == '!' || c == '\'' || c == '$'));
         if clean.contains('!') && parse_cell_ref(clean).is_some() {
-            for next in tokens.iter().skip(i + 1).take(3) {
-                let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-                if let Ok(v) = n.parse::<f64>() {
-                    return Some((clean.to_string(), v));
-                }
+            if let Some(v) = value_after(&tokens[i + 1..], 12) {
+                return Some((clean.to_string(), v));
             }
         }
     }
@@ -334,11 +430,8 @@ fn parse_what_if(question: &str) -> Option<(String, f64)> {
                 .all(|c| c.is_ascii_digit())
             && !clean[byte_at(letters)..].is_empty();
         if is_ref {
-            for next in tokens.iter().skip(i + 1).take(2) {
-                let n = next.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-                if let Ok(v) = n.parse::<f64>() {
-                    return Some((clean.to_string(), v));
-                }
+            if let Some(v) = value_after(&tokens[i + 1..], 12) {
+                return Some((clean.to_string(), v));
             }
         }
     }
@@ -359,6 +452,7 @@ fn parse_what_if_target(question: &str, override_cell: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::parse_range;
     use gridtalk_graph::{build_graph, parse_delimited, Graph, WorkbookSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::EchoBackend;

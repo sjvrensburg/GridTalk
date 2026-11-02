@@ -1,3 +1,5 @@
+> **SUPERSEDED by decision 0004** (single engine: llama.cpp over Vulkan). The candle/mistral.rs rungs below are the historical spike record, not shipped code.
+
 # Spike: local inference engine (Phase 3)
 
 ## Question

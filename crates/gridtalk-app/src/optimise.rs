@@ -25,7 +25,9 @@ pub struct Candidate {
 fn failing(results: &[TaskResult], kind: &str) -> usize {
     results
         .iter()
-        .filter(|r| r.kind == kind && !r.passed)
+        // Errored tasks (backend/tool failures) are not evidence
+        // the harness needs a new rule or knob.
+        .filter(|r| r.kind == kind && !r.passed && r.error.is_none())
         .count()
 }
 
@@ -58,11 +60,13 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
             // Already learned: no duplicate candidate.
         } else {
             let mut a = current.clone();
-            if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+            if !current.rules.contains(FORMULA_RULE) {
+                if !a.rules.ends_with('\n') && !a.rules.is_empty() {
+                    a.rules.push('\n');
+                }
+                a.rules.push_str(FORMULA_RULE);
                 a.rules.push('\n');
             }
-            a.rules.push_str(FORMULA_RULE);
-            a.rules.push('\n');
             a.ref_context = true;
             out.push(Candidate {
                 label: format!(
@@ -160,8 +164,16 @@ pub fn optimise_round(
      -> Result<(Option<f64>, Vec<TaskResult>), String> {
         let key = match adapter {
             Some(a) => format!(
-                "{}|{}|{}|{}|{}",
-                split, a.rules, a.top_k, a.max_steps, a.ref_context
+                "{}|{}|{}|{}|{}|{:?}",
+                split,
+                a.rules,
+                a.top_k,
+                a.max_steps,
+                a.ref_context,
+                a.skills
+                    .iter()
+                    .map(|sk| format!("{}:{:?}:{}", sk.name, sk.triggers, sk.body))
+                    .collect::<Vec<_>>()
             ),
             None => format!("{split}|none"),
         };
@@ -177,13 +189,36 @@ pub fn optimise_round(
             adapter,
         )
         .map_err(|e| e.to_string())?;
+        // Errored tasks (backend/tool failures folded into results
+        // by run_bench_with) contaminate accuracy: no gate decision
+        // may be made on them.
+        if let Some(failed) = report.results.iter().find(|r| r.error.is_some()) {
+            return Err(format!(
+                "scoring {split} had backend/tool errors (first: task {}: {})",
+                failed.id,
+                failed.error.as_deref().unwrap_or("")
+            ));
+        }
         let acc = report.accuracy(split);
         cache.insert(key, (acc, report.results.clone()));
         Ok((acc, report.results))
     };
 
-    let (baseline_train_opt, baseline_results) = score(Some(current), "train", &mut cache)?;
-    let (baseline_dev_opt, _) = score(Some(current), "dev", &mut cache)?;
+    // Every round lands in CARD.md, including scoring failures.
+    let score_or_card = |result: Result<(Option<f64>, Vec<TaskResult>), String>| match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            card_best_effort(
+                root,
+                &current.name,
+                &format!("\n## Round {round}: SCORE FAILED\n\n- error: {e}\n"),
+            );
+            Err(e)
+        }
+    };
+    let (baseline_train_opt, baseline_results) =
+        score_or_card(score(Some(current), "train", &mut cache))?;
+    let (baseline_dev_opt, _) = score_or_card(score(Some(current), "dev", &mut cache))?;
     // An empty split is no evidence: the dev gate would be
     // vacuous. Skip the round and say so in the CARD.
     if baseline_train_opt.is_none() || baseline_dev_opt.is_none() {
@@ -211,7 +246,7 @@ pub fn optimise_round(
     // Score candidates on train, best first.
     let mut scored: Vec<(Candidate, f64)> = Vec::new();
     for cand in candidates {
-        let (train_acc, _) = score(Some(&cand.adapter), "train", &mut cache)?;
+        let (train_acc, _) = score_or_card(score(Some(&cand.adapter), "train", &mut cache))?;
         scored.push((cand, train_acc.unwrap_or(0.0)));
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -226,13 +261,30 @@ pub fn optimise_round(
         if *train_acc <= baseline_train + 1e-9 {
             break;
         }
-        let (dev_acc, _) = score(Some(&cand.adapter), "dev", &mut cache)?;
+        let (dev_acc, _) = score_or_card(score(Some(&cand.adapter), "dev", &mut cache))?;
         let dev_acc = dev_acc.unwrap_or(0.0);
         if let Some(row) = tried.iter_mut().find(|(l, _, _, _)| *l == cand.label) {
             row.2 = dev_acc;
         }
         if dev_acc >= baseline_dev - 1e-9 {
-            let version = commit_version(root, &cand.adapter)?;
+            // A commit failure still records the round in CARD.md
+            // (the documented contract) before propagating.
+            let version = match commit_version(root, &cand.adapter) {
+                Ok(v) => v,
+                Err(e) => {
+                    card_best_effort(
+                        root,
+                        &current.name,
+                        &format!(
+                            "\n## Round {round}: COMMIT FAILED {} (train {:.1}%, dev {:.1}%)\n\n- error: {e}\n",
+                            cand.label,
+                            train_acc * 100.0,
+                            dev_acc * 100.0
+                        ),
+                    );
+                    return Err(e);
+                }
+            };
             let mut entry = format!(
                 "\n## Round {round}: ACCEPTED {} as v{version}\n\n- train: {:.1}% -> {:.1}%\n- dev: {:.1}% -> {:.1}%\n",
                 cand.label,
@@ -266,24 +318,37 @@ pub fn optimise_round(
         }
     }
     if accepted.is_none() {
-        card_best_effort(
-            root,
-            &current.name,
-            &format!(
-                "\n## Round {round}: no candidate improved train\n\n- train: {:.1}%\n- dev: {:.1}%\n",
-                baseline_train * 100.0,
-                baseline_dev * 100.0
-            ),
-        );
+        // Only claim "no candidate improved train" when that is what
+        // happened; candidates that improved train but failed the dev
+        // gate already got their own REJECTED entries above.
+        let any_train_improved = tried.iter().any(|(_, t, _, _)| *t > baseline_train);
+        if !any_train_improved {
+            card_best_effort(
+                root,
+                &current.name,
+                &format!(
+                    "\n## Round {round}: no candidate improved train\n\n- train: {:.1}%\n- dev: {:.1}%\n",
+                    baseline_train * 100.0,
+                    baseline_dev * 100.0
+                ),
+            );
+        }
     }
 
+    // Dev-rejected rounds must be distinguishable by the caller
+    // from no-improvement rounds.
+    let note = if accepted.is_none() && tried.iter().any(|(_, t, _, _)| *t > baseline_train) {
+        Some("candidates improved train but were rejected by the dev gate".to_string())
+    } else {
+        None
+    };
     Ok(RoundOutcome {
         round,
         baseline_train,
         baseline_dev,
         accepted,
         tried,
-        note: None,
+        note,
     })
 }
 

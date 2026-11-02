@@ -1,0 +1,2 @@
+{"id": "demo-formula-1", "kind": "formula_result", "question": "What is the value of Sheet1!B3?", "expected": "30", "citation": "Sheet1!B3", "split": "train"}
+{"id": "demo-formula-2", "kind": "formula_result", "question": "What is the value of Sheet1!B4?", "expected": "60", "citation": "Sheet1!B4", "split": "dev"}

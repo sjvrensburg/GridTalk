@@ -51,10 +51,56 @@ fn dedup_terms(terms: Vec<String>) -> Vec<String> {
 impl Index {
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let mut idx = Index::default();
-        let sheets: BTreeMap<&str, &gridtalk_graph::SheetSnapshot> =
-            wb.sheets.iter().map(|s| (s.name.as_str(), s)).collect();
-        for region in &graph.regions {
-            if let Some(sheet) = sheets.get(region.range.sheet.as_str()) {
+        // Regions arrive in workbook sheet order, contiguous per
+        // sheet. Assign them to sheets by IDENTITY (region counts
+        // re-derived per sheet), so duplicate sheet names render
+        // from their own sheet instead of collapsing by name.
+        let derived_regions: Vec<Vec<gridtalk_graph::Region>> = wb
+            .sheets
+            .iter()
+            .map(gridtalk_graph::detect_regions)
+            .collect();
+        let region_counts: Vec<usize> = derived_regions.iter().map(|r| r.len()).collect();
+        // Prefix sums: region idx -> sheet in O(log sheets).
+        let mut prefix: Vec<usize> = Vec::with_capacity(region_counts.len() + 1);
+        prefix.push(0);
+        for count in &region_counts {
+            prefix.push(prefix.last().unwrap() + count);
+        }
+        let sheet_of_region = |idx: usize| -> Option<&gridtalk_graph::SheetSnapshot> {
+            let sheet_idx = prefix.partition_point(|end| *end <= idx).saturating_sub(1);
+            wb.sheets.get(sheet_idx)
+        };
+        for (region_idx, region) in graph.regions.iter().enumerate() {
+            // A stale/mismatched graph must not render one sheet's
+            // cells under another sheet's citation range.
+            // Validate beyond the name: the graph region must equal
+            // the re-derived region at its sheet-local ordinal, or
+            // a stale graph could cross-render duplicate sheets.
+            let sheet_idx = prefix
+                .partition_point(|end| *end <= region_idx)
+                .saturating_sub(1);
+            let local_ordinal = region_idx - prefix[sheet_idx];
+            let ordinal_ok = derived_regions
+                .get(sheet_idx)
+                .and_then(|rs| rs.get(local_ordinal))
+                .is_some_and(|derived| {
+                    let d = &derived.range;
+                    (d.r0, d.c0, d.r1, d.c1)
+                        == (
+                            region.range.r0,
+                            region.range.c0,
+                            region.range.r1,
+                            region.range.c1,
+                        )
+                });
+            let assigned = if ordinal_ok {
+                sheet_of_region(region_idx)
+                    .filter(|sheet| gridtalk_graph::sheet_name_eq(&sheet.name, &region.range.sheet))
+            } else {
+                None
+            };
+            if let Some(sheet) = assigned {
                 let passage = render_passage(sheet, region);
                 // Index the body only: the "Range Sheet1!A1:B2" header
                 // is citation boilerplate, not content.
@@ -199,6 +245,10 @@ pub struct HybridIndex {
 }
 
 impl HybridIndex {
+    /// Regions dropped while building (stale/mismatched graph).
+    pub fn dropped_regions(&self) -> usize {
+        self.lexical.dropped_regions
+    }
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let lexical = Index::build(wb, graph);
         let model = NGramEmbedding::default();

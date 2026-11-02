@@ -1,0 +1,43 @@
+# Hermit run config for evolving a GridTalk adapter (Phase E).
+# See docs/hermit.md for the full picture and the validation status.
+#
+# Prepare data first (a tiny synthetic demo set is committed under
+# data/ so `hermit check` passes on a fresh checkout; regenerate it
+# from your own workbook to actually train). Bench rows carry no
+# workbook path, so export GRIDTALK_WORKBOOK when running hermit.
+#   gridtalk bench generate book.xlsx --out tasks-array.json
+#   .venv/bin/python -c "import sys; sys.path.insert(0, 'scripts/hermit'); \
+#       import gridtalk_task; gridtalk_task.prepare_data('tasks-array.json', 'scripts/hermit/data')"
+#
+# The pipeline is GridTalk's text CLI (scraping its printed markers); the judge is deterministic
+# (final-number match against evaluator ground truth).
+# A hermit template supplies the adapter skeleton the evolver
+# mutates. continual-harness is hermit's general harness template
+# (policy, sub-agents, skills, memory).
+template: continual-harness
+
+task_info: task_info
+
+data:
+  tasks: data/tasks.jsonl
+  train: data/train.txt
+  val: data/val.txt
+  test: data/test.txt
+
+agent:
+  name: gridtalk_task.py:run
+
+judge:
+  path: gridtalk_task.py
+  name: score
+
+evolver:
+  name: gepa
+
+trainer:
+  budget: {tokens: 200000}
+
+# The evolver/model sections depend on which hermit backend you
+# run (hermit backends). GridTalk's own native loop needs none of
+# this: `gridtalk optimise <workbook>` is the supported path, and
+# this config is the interop surface for hermit-driven evolution.

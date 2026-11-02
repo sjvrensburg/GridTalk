@@ -13,6 +13,7 @@ pub enum EvalError {
     Ref(String),
     Cycle(String),
     Type(String),
+    Depth(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -22,6 +23,7 @@ impl std::fmt::Display for EvalError {
             EvalError::Ref(m) => write!(f, "bad reference: {m}"),
             EvalError::Cycle(m) => write!(f, "circular reference: {m}"),
             EvalError::Type(m) => write!(f, "type error: {m}"),
+            EvalError::Depth(m) => write!(f, "depth error: {m}"),
         }
     }
 }
@@ -29,7 +31,7 @@ impl std::error::Error for EvalError {}
 
 /// Evaluate one cell: numbers pass through, formulas are computed
 /// recursively, text/empty evaluate to errors in numeric context.
-pub const MAX_EVAL_DEPTH: usize = 64;
+pub const MAX_EVAL_DEPTH: usize = 256;
 
 pub fn eval_cell(sheet: &SheetSnapshot, row: usize, col: usize) -> Result<f64, EvalError> {
     let sheets: Vec<&SheetSnapshot> = vec![sheet];
@@ -47,7 +49,7 @@ pub fn eval_cell_in_workbook(
     let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
     let idx = sheets
         .iter()
-        .position(|s| s.name == sheet_name)
+        .position(|s| crate::sheet_name_eq(&s.name, sheet_name))
         .ok_or_else(|| EvalError::Ref(format!("unknown sheet {sheet_name}")))?;
     let mut state = EvalState::default();
     eval_cell_inner(&sheets, idx, row, col, &mut state, 0)
@@ -71,8 +73,8 @@ fn eval_cell_inner(
     depth: usize,
 ) -> Result<f64, EvalError> {
     if depth > MAX_EVAL_DEPTH {
-        return Err(EvalError::Parse(format!(
-            "formula nesting deeper than {MAX_EVAL_DEPTH}"
+        return Err(EvalError::Depth(format!(
+            "dependency chain deeper than {MAX_EVAL_DEPTH} cells"
         )));
     }
     let key = (sheet_idx, row, col);
@@ -146,10 +148,19 @@ fn eval_cell_value(
             })();
             match evaluated {
                 Ok(v) => Ok(v),
-                Err(e) => match cached_num {
-                    Some(n) => Ok(n),
-                    None => Err(e),
-                },
+                Err(e) => {
+                    // Cached fallback ONLY for formulas we cannot
+                    // evaluate (unsupported functions). Genuine
+                    // errors — cycles, type/ref/parse failures in an
+                    // evaluable formula — must propagate, not be
+                    // masked by a stale cached value.
+                    let unevaluable =
+                        matches!(&e, EvalError::Parse(m) if m.contains("unsupported function"));
+                    match cached_num {
+                        Some(n) if unevaluable => Ok(n),
+                        _ => Err(e),
+                    }
+                }
             }
         }
         other => Err(EvalError::Type(format!(
@@ -222,18 +233,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_power(&mut self) -> Result<f64, EvalError> {
+        let base = self.parse_factor()?;
+        self.skip_ws();
+        if self.peek() == Some('^') {
+            self.bump();
+            self.enter()?;
+            let exp = self.parse_power()?;
+            self.nest -= 1;
+            return Ok(base.powf(exp));
+        }
+        Ok(base)
+    }
+
     fn parse_term(&mut self) -> Result<f64, EvalError> {
-        let mut v = self.parse_factor()?;
+        let mut v = self.parse_power()?;
         loop {
             self.skip_ws();
             match self.peek() {
                 Some('*') => {
                     self.bump();
-                    v *= self.parse_factor()?;
+                    v *= self.parse_power()?;
                 }
                 Some('/') => {
                     self.bump();
-                    let d = self.parse_factor()?;
+                    let d = self.parse_power()?;
                     if d == 0.0 {
                         return Err(EvalError::Type("division by zero".into()));
                     }
@@ -293,10 +317,10 @@ impl<'a> Parser<'a> {
                 s.parse::<f64>()
                     .map_err(|_| EvalError::Parse(format!("bad number {s}")))?
             }
-            Some(c) if c.is_ascii_alphabetic() || c == '$' || c == '\'' => {
+            Some(c) if c.is_alphabetic() || c == '_' || c == '$' || c == '\'' => {
                 // Optional sheet qualifier: Name! or 'My Sheet'!
                 let mut target_sheet = self.sheet_idx;
-                if c == '\'' || c.is_ascii_alphabetic() {
+                if c == '\'' || c.is_alphabetic() || c == '_' {
                     if let Some((idx, next)) = self.try_sheet_qualifier() {
                         target_sheet = idx;
                         self.pos = next;
@@ -309,8 +333,44 @@ impl<'a> Parser<'a> {
                 while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
                     self.bump();
                 }
-                let name: String = self.chars[start..self.pos].iter().collect();
+                let mut name: String = self.chars[start..self.pos].iter().collect();
+                // Digit-bearing function names (LOG10(...)): extend
+                // the token over digits when a '(' follows, else it
+                // is a cell ref (LOG10 the cell) as before.
+                if matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    let save = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric()) {
+                        self.bump();
+                    }
+                    let extended: String = self.chars[start..self.pos].iter().collect();
+                    self.skip_ws();
+                    if self.peek() == Some('(') {
+                        name = extended;
+                    } else {
+                        self.pos = save;
+                    }
+                }
                 self.skip_ws();
+                if name.eq_ignore_ascii_case("TRUE") || name.eq_ignore_ascii_case("FALSE") {
+                    let v = if name.eq_ignore_ascii_case("TRUE") {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if self.peek() == Some('(') {
+                        // TRUE() / FALSE() literal form.
+                        let save = self.pos;
+                        self.bump();
+                        self.skip_ws();
+                        if self.peek() == Some(')') {
+                            self.bump();
+                            return Ok(v);
+                        }
+                        self.pos = save; // not the literal form; fall through
+                    } else {
+                        return Ok(v);
+                    }
+                }
                 if self.peek() == Some('(') {
                     if target_sheet != self.sheet_idx {
                         return Err(EvalError::Parse(
@@ -397,7 +457,10 @@ impl<'a> Parser<'a> {
         if self.chars.get(i) != Some(&'!') {
             return None;
         }
-        let idx = self.sheets.iter().position(|s| s.name == name)?;
+        let idx = self
+            .sheets
+            .iter()
+            .position(|s| crate::sheet_name_eq(&s.name, &name))?;
         Some((idx, i + 1))
     }
 
@@ -444,14 +507,16 @@ impl<'a> Parser<'a> {
         Ok((format!("{letters}{digits}"), row1 - 1, col - 1))
     }
 
-    fn parse_ref_token(&mut self) -> Result<(usize, usize, usize), EvalError> {
+    fn parse_ref_token(&mut self) -> Result<(usize, usize, usize, bool), EvalError> {
         self.skip_ws();
         let mut target = self.sheet_idx;
+        let mut qualified = false;
         if matches!(self.peek(), Some('\''))
-            || matches!(self.peek(), Some(c) if c.is_ascii_alphabetic())
+            || matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_')
         {
             if let Some((idx, next)) = self.try_sheet_qualifier() {
                 target = idx;
+                qualified = true;
                 self.pos = next;
             }
         }
@@ -461,7 +526,7 @@ impl<'a> Parser<'a> {
         }
         let letters: String = self.chars[start..self.pos].iter().collect();
         let (_, row, col) = self.finish_ref(&letters)?;
-        Ok((target, row, col))
+        Ok((target, row, col, qualified))
     }
 
     /// Push one scalar argument, except that a lone reference to an
@@ -469,7 +534,7 @@ impl<'a> Parser<'a> {
     /// empty cell is 0, AVERAGE ignores it) — matching range args.
     fn push_scalar(&mut self, values: &mut Vec<f64>) -> Result<(), EvalError> {
         let save = self.pos;
-        if let Ok((t, r, c)) = self.parse_ref_token() {
+        if let Ok((t, r, c, _)) = self.parse_ref_token() {
             self.skip_ws();
             let overridden = self
                 .state
@@ -477,7 +542,10 @@ impl<'a> Parser<'a> {
                 .is_some_and(|(os, orow, ocol, _)| (os, orow, ocol) == (t, r, c));
             if !overridden
                 && matches!(self.peek(), Some(',') | Some(')'))
-                && matches!(self.sheets[t].get(r, c), CellValue::Empty)
+                && matches!(
+                    self.sheets[t].get(r, c),
+                    CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
+                )
             {
                 return Ok(());
             }
@@ -487,61 +555,197 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn collect_range(
+        &mut self,
+        values: &mut Vec<f64>,
+        sheet: usize,
+        r0: usize,
+        c0: usize,
+        r1: usize,
+        c1: usize,
+    ) -> Result<(), EvalError> {
+        for r in r0.min(r1)..=r0.max(r1) {
+            for c in c0.min(c1)..=c0.max(c1) {
+                if let Some((os, orow, ocol, value)) = self.state.override_cell {
+                    if (os, orow, ocol) == (sheet, r, c) {
+                        values.push(value);
+                        continue;
+                    }
+                }
+                let cell = self.sheets[sheet].get_ref(r, c);
+                if matches!(
+                    cell,
+                    CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
+                ) {
+                    continue;
+                }
+                values.push(eval_cell_inner(
+                    self.sheets,
+                    sheet,
+                    r,
+                    c,
+                    self.state,
+                    self.depth + 1,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whole-column (A:A) / whole-row (1:1) range at the current
+    /// position, bounded to the target sheet's used extents.
+    /// Consumes the token on success; restores position otherwise.
+    /// `Some(None)` is a recognised range that covers no used cell
+    /// (empty sheet, or rows/columns past the used extents).
+    #[allow(clippy::type_complexity)]
+    fn try_whole_range(&mut self) -> Option<Option<(usize, usize, usize, usize, usize)>> {
+        let save = self.pos;
+        let mut target = self.sheet_idx;
+        if matches!(self.peek(), Some('\''))
+            || matches!(self.peek(), Some(c) if c.is_alphabetic() || c == '_')
+        {
+            if let Some((idx, next)) = self.try_sheet_qualifier() {
+                target = idx;
+                self.pos = next;
+            }
+        }
+        let sheet = self.sheets[target];
+        let col_of = |letters: &str| -> Option<usize> {
+            let mut col = 0usize;
+            for c in letters.to_ascii_uppercase().chars() {
+                if !c.is_ascii_alphabetic() {
+                    return None;
+                }
+                col = col
+                    .checked_mul(26)?
+                    .checked_add(c as usize - 'A' as usize + 1)?;
+            }
+            if col == 0 || col > 16_384 {
+                return None;
+            }
+            Some(col - 1)
+        };
+        let take_letters = |p: &mut Self| -> String {
+            let st = p.pos;
+            if p.peek() == Some('$') {
+                p.bump();
+            }
+            while matches!(p.peek(), Some(c) if c.is_ascii_alphabetic()) {
+                p.bump();
+            }
+            p.chars[st..p.pos]
+                .iter()
+                .collect::<String>()
+                .replace('$', "")
+        };
+        let take_digits = |p: &mut Self| -> String {
+            let st = p.pos;
+            if p.peek() == Some('$') {
+                p.bump();
+            }
+            while matches!(p.peek(), Some(c) if c.is_ascii_digit()) {
+                p.bump();
+            }
+            p.chars[st..p.pos]
+                .iter()
+                .collect::<String>()
+                .replace('$', "")
+        };
+        // Column form: AA:BB
+        let after_qual = self.pos;
+        let first = take_letters(self);
+        if !first.is_empty() && self.peek() == Some(':') {
+            self.bump();
+            // An end qualifier, if present, must match (skip it
+            // syntactically; the start sheet governs).
+            if let Some((_, next)) = self.try_sheet_qualifier() {
+                self.pos = next;
+            }
+            let second = take_letters(self);
+            if let (Some(c0), Some(c1)) = (col_of(&first), col_of(&second)) {
+                let (lo, hi) = (
+                    c0.min(c1),
+                    c0.max(c1).min(sheet.max_col().saturating_sub(1)),
+                );
+                if sheet.cells.is_empty() || sheet.max_col() == 0 || lo > hi {
+                    return Some(None);
+                }
+                return Some(Some((target, 0, lo, sheet.cells.len() - 1, hi)));
+            }
+            self.pos = save;
+            return None;
+        }
+        // Row form: 1:3
+        self.pos = after_qual;
+        let first = take_digits(self);
+        if !first.is_empty() && self.peek() == Some(':') {
+            self.bump();
+            if let Some((_, next)) = self.try_sheet_qualifier() {
+                self.pos = next;
+            }
+            let second = take_digits(self);
+            if let (Ok(r0), Ok(r1)) = (first.parse::<usize>(), second.parse::<usize>()) {
+                if r0 >= 1 && r1 >= 1 && r0 <= 1_048_576 && r1 <= 1_048_576 {
+                    let lo = r0.min(r1) - 1;
+                    let hi = (r0.max(r1) - 1).min(sheet.cells.len().saturating_sub(1));
+                    if sheet.cells.is_empty() || sheet.max_col() == 0 || lo > hi {
+                        return Some(None);
+                    }
+                    return Some(Some((target, lo, 0, hi, sheet.max_col() - 1)));
+                }
+            }
+        }
+        self.pos = save;
+        None
+    }
+
     fn parse_function(&mut self, name: &str) -> Result<f64, EvalError> {
+        // Unsupported names fail BEFORE any argument is evaluated,
+        // so an argument error cannot mask the cached-value
+        // fallback for formulas we cannot evaluate at all.
+        if !matches!(name, "SUM" | "AVERAGE" | "AVG" | "MIN" | "MAX" | "COUNT") {
+            return Err(EvalError::Parse(format!("unsupported function {name}")));
+        }
         // One range or a comma list of expressions.
         let mut values: Vec<f64> = Vec::new();
         loop {
             self.skip_ws();
             let save = self.pos;
-            // Try range A1:B9 first.
-            if let Ok((t0, r0, c0)) = self.parse_ref_token() {
+            // Whole-column/row ranges (A:A, 1:1) bounded to the
+            // sheet's used extents.
+            if let Some(whole) = self.try_whole_range() {
+                if let Some((t, r0, c0, r1, c1)) = whole {
+                    let area = (r1 - r0 + 1).saturating_mul(c1 - c0 + 1);
+                    if area > 100_000 {
+                        return Err(EvalError::Parse(format!(
+                            "range of {area} cells exceeds the 100000-cell evaluation cap"
+                        )));
+                    }
+                    self.collect_range(&mut values, t, r0, c0, r1, c1)?;
+                }
+            // Try range A1:B9 next.
+            } else if let Ok((t0, r0, c0, _)) = self.parse_ref_token() {
                 self.skip_ws();
                 if self.peek() == Some(':') {
                     self.bump();
-                    let (t1, r1, c1) = self.parse_ref_token()?;
+                    let (t1, r1, c1, end_qualified) = self.parse_ref_token()?;
                     let area = (r0.max(r1) - r0.min(r1) + 1) * (c0.max(c1) - c0.min(c1) + 1);
                     if area > 100_000 {
                         return Err(EvalError::Parse(format!(
                             "range of {area} cells exceeds the 100000-cell evaluation cap"
                         )));
                     }
-                    if t1 != t0 {
+                    // An unqualified range end inherits the start
+                    // sheet (Sheet2!A1:B2); only an explicitly
+                    // different end sheet is an error.
+                    if t1 != t0 && end_qualified {
                         return Err(EvalError::Parse(
-                            "range ends on a different sheet than it starts;                              qualify only the start (Sheet2!A1:B2)"
+                            "range ends on a different sheet than it starts; qualify only the start (Sheet2!A1:B2)"
                                 .into(),
                         ));
                     }
                     let range_sheet = t0;
-                    for r in r0.min(r1)..=r0.max(r1) {
-                        for c in c0.min(c1)..=c0.max(c1) {
-                            // Excel semantics: aggregates ignore empty
-                            // and text cells in ranges, but formula
-                            // errors (e.g. #DIV/0!) propagate.
-                            // A simulated override wins over the
-                            // stored cell, whatever its type.
-                            if let Some((os, orow, ocol, value)) = self.state.override_cell {
-                                if (os, orow, ocol) == (range_sheet, r, c) {
-                                    values.push(value);
-                                    continue;
-                                }
-                            }
-                            let cell = self.sheets[range_sheet].get(r, c);
-                            if matches!(
-                                cell,
-                                CellValue::Empty | CellValue::Text(_) | CellValue::Bool(_)
-                            ) {
-                                continue;
-                            }
-                            values.push(eval_cell_inner(
-                                self.sheets,
-                                range_sheet,
-                                r,
-                                c,
-                                self.state,
-                                self.depth + 1,
-                            )?);
-                        }
-                    }
+                    self.collect_range(&mut values, range_sheet, r0, c0, r1, c1)?;
                 } else {
                     self.pos = save;
                     self.push_scalar(&mut values)?;
@@ -570,16 +774,21 @@ impl<'a> Parser<'a> {
                     Ok(values.iter().sum::<f64>() / values.len() as f64)
                 }
             }
-            "MIN" => values
+            // Excel returns 0 for MIN/MAX over no numbers.
+            "MIN" => Ok(values
                 .iter()
                 .copied()
-                .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.min(v))))
-                .ok_or_else(|| EvalError::Type("MIN of nothing".into())),
-            "MAX" => values
+                .fold(None, |a: Option<f64>, v| {
+                    Some(a.map_or(v, |x: f64| x.min(v)))
+                })
+                .unwrap_or(0.0)),
+            "MAX" => Ok(values
                 .iter()
                 .copied()
-                .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.max(v))))
-                .ok_or_else(|| EvalError::Type("MAX of nothing".into())),
+                .fold(None, |a: Option<f64>, v| {
+                    Some(a.map_or(v, |x: f64| x.max(v)))
+                })
+                .unwrap_or(0.0)),
             "COUNT" => Ok(values.len() as f64),
             other => Err(EvalError::Parse(format!("unsupported function {other}"))),
         }
@@ -608,7 +817,7 @@ pub fn eval_cell_with_override(
     let find = |name: &str| {
         sheets
             .iter()
-            .position(|s| s.name == name)
+            .position(|s| crate::sheet_name_eq(&s.name, name))
             .ok_or_else(|| EvalError::Ref(format!("unknown sheet {name}")))
     };
     let mut state = EvalState {
@@ -636,6 +845,31 @@ pub fn eval_many(sheet: &SheetSnapshot, coords: &[(usize, usize)]) -> Vec<Result
         .collect()
 }
 
+/// Evaluate several cells of one named sheet with a shared memo
+/// (cross-sheet precedents resolve through the workbook).
+pub fn eval_many_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    sheet_name: &str,
+    coords: &[(usize, usize)],
+) -> Vec<Result<f64, EvalError>> {
+    let Some(idx) = wb
+        .sheets
+        .iter()
+        .position(|s| crate::sheet_name_eq(&s.name, sheet_name))
+    else {
+        return coords
+            .iter()
+            .map(|_| Err(EvalError::Ref(format!("no sheet named {sheet_name}"))))
+            .collect();
+    };
+    let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
+    let mut state = EvalState::default();
+    coords
+        .iter()
+        .map(|(r, c)| eval_cell_inner(&sheets, idx, *r, *c, &mut state, 0))
+        .collect()
+}
+
 /// Workbook what-if: the override and target may live on different
 /// sheets (formulas may reference across sheets). Returns
 /// (before, after) for the target cell.
@@ -654,7 +888,11 @@ pub fn what_if_in_workbook(
                 "what-if coordinates beyond the evaluation grid on {sheet}"
             )));
         }
-        if !wb.sheets.iter().any(|s| s.name == sheet) {
+        if !wb
+            .sheets
+            .iter()
+            .any(|s| crate::sheet_name_eq(&s.name, sheet))
+        {
             return Err(EvalError::Ref(format!("unknown sheet {sheet}")));
         }
     }
@@ -790,6 +1028,52 @@ mod tests {
     }
 
     #[test]
+    fn eval_round5_power_literals_and_cached_errors() {
+        // Power operator (right-associative) and TRUE/FALSE literals.
+        let wb = parse_delimited("d", "S", "A\n=2^3^2\n=TRUE+FALSE+1\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 512.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 2, 0).unwrap(), 2.0);
+        // A genuine evaluation error (cycle) is NOT masked by a
+        // stale cached value; an unsupported function is.
+        let mut sh = sheet();
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "D2+1".into(),
+            cached: Some(Box::new(CellValue::Number(999.0))),
+        };
+        assert!(matches!(eval_cell(&sh, 1, 3), Err(EvalError::Cycle(_))));
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "MEDIAN(B2:C2)".into(),
+            cached: Some(Box::new(CellValue::Number(999.0))),
+        };
+        assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 999.0);
+        // Unsupported function whose ARGUMENTS would error still
+        // falls back to the cached value.
+        sh.cells[1][3] = CellValue::Formula {
+            expr: "MEDIAN(1/0)".into(),
+            cached: Some(Box::new(CellValue::Number(42.0))),
+        };
+        assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 42.0);
+        let wb = parse_delimited("d", "S", "A\n=TRUE()+FALSE()\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 1.0);
+        // Whole-column ranges and empty MIN.
+        let wb = parse_delimited("d", "S", "A,B\n1,=SUM(A:A)\n2,=MIN(C1)\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 3.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 2, 1).unwrap(), 0.0);
+        // Whole-row ranges clamp to the used rows; columns past the
+        // used extents sum to 0 instead of erroring.
+        let wb = parse_delimited("d", "S", "=SUM(2:1048576),=SUM(Z:Z)\n1,2\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 0, 0).unwrap(), 3.0);
+        assert_eq!(eval_cell(&wb.sheets[0], 0, 1).unwrap(), 0.0);
+        // Long dependency chains: 120 cells deep, no depth error.
+        let mut csv = String::from("A\n1\n");
+        for i in 3..=121 {
+            csv.push_str(&format!("=A{}+1\n", i - 1));
+        }
+        let wb = parse_delimited("d", "S", &csv, ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 120, 0).unwrap(), 120.0);
+    }
+
+    #[test]
     fn eval_regressions_round3() {
         // Tab whitespace, grid bounds, scalar-empty aggregates.
         let wb = parse_delimited("d", "S", "A,B\n1,=A2\t+1\n", ',');
@@ -802,6 +1086,14 @@ mod tests {
         let wb = parse_delimited("d", "S", "A,B,C\n,=COUNT(A2),=AVERAGE(A2)\n", ',');
         assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 0.0);
         assert!(eval_cell(&wb.sheets[0], 1, 2).is_err());
+        // Start-only qualified ranges inherit the start sheet,
+        // and sheet qualifiers resolve case-insensitively.
+        let mut wb2 = parse_delimited("d", "Sheet1", "A\n=SUM(sheet2!A1:A2)\n", ',');
+        wb2.sheets.push(crate::SheetSnapshot {
+            name: "Sheet2".into(),
+            cells: vec![vec![CellValue::Number(3.0)], vec![CellValue::Number(4.0)]],
+        });
+        assert_eq!(eval_cell_in_workbook(&wb2, "Sheet1", 1, 0).unwrap(), 7.0);
         // Doubly-qualified range ends are a typed error.
         let mut wb = parse_delimited("d", "Sheet1", "A\n=SUM(Sheet2!A1:Sheet1!B1)\n", ',');
         wb.sheets.push(crate::SheetSnapshot {

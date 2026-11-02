@@ -184,6 +184,50 @@ fn connect_timeout(host_port: &str) -> Result<std::net::TcpStream, InferError> {
     Err(last.unwrap_or_else(|| InferError::Http(format!("cannot resolve {host_port}"))))
 }
 
+/// True when `body` contains a complete chunked message: walks
+/// real chunk boundaries (size lines at chunk offsets) and
+/// accepts a terminal 0-chunk with optional trailers.
+fn chunked_complete(body: &[u8]) -> bool {
+    let mut rest = body;
+    loop {
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let size_str = String::from_utf8_lossy(&rest[..line_end]);
+        let Ok(size) = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        let after = &rest[line_end + 2..];
+        if size == 0 {
+            // Terminal chunk: complete once the trailer section
+            // ends with an empty line.
+            return after == b"\r\n" || after.windows(4).any(|w| w == b"\r\n\r\n");
+        }
+        let Some(need) = size.checked_add(2) else {
+            return false;
+        };
+        if after.len() < need {
+            return false;
+        }
+        rest = &after[need..];
+    }
+}
+
+/// Transfer-Encoding contains a `chunked` token (any spacing/case,
+/// possibly `gzip, chunked`).
+fn is_chunked(head: &str) -> bool {
+    head.lines().any(|l| {
+        let Some((name, value)) = l.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
 fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -201,11 +245,15 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
         if size == 0 {
             return Ok(out);
         }
-        if rest.len() < size + 2 {
+        let need = size
+            .checked_add(2)
+            .filter(|n| *n <= 16 * 1024 * 1024 + 2)
+            .ok_or_else(|| InferError::Http(format!("chunk size {size} exceeds cap")))?;
+        if rest.len() < need {
             return Err(InferError::Http("truncated chunk".into()));
         }
         out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
+        rest = &rest[need..];
         if out.len() > 16 * 1024 * 1024 {
             return Err(InferError::Http("response exceeds 16 MiB cap".into()));
         }
@@ -229,10 +277,12 @@ fn read_http_response(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
-    let mut stalls = 0usize;
     let mut last_progress = 0usize;
+    let mut last_progress_at = std::time::Instant::now();
     let mut content_length: Option<usize> = None;
     let mut header_end: Option<usize> = None;
+    let mut chunked = false;
+    let mut header_search_from = 0usize;
     loop {
         if std::time::Instant::now() > deadline {
             return Err(InferError::Http(
@@ -255,22 +305,40 @@ fn read_http_response(
                 if raw.len() > 16 * 1024 * 1024 {
                     return Err(InferError::Http("response exceeds 16 MiB cap".into()));
                 }
+                // Time-based stall: no >=4 KiB of progress for
+                // 10 s is a drip, however many reads it was spread
+                // across (read counts are meaningless under Nagle /
+                // buffering).
                 if raw.len() - last_progress >= 4096 {
                     last_progress = raw.len();
-                    stalls = 0;
-                } else {
-                    stalls += 1;
-                    if stalls > 60 {
-                        return Err(InferError::Http(
-                            "endpoint is slow-dripping the response".into(),
-                        ));
-                    }
+                    last_progress_at = std::time::Instant::now();
+                } else if (last_progress > 0 || header_end.is_some())
+                    && last_progress_at.elapsed() > std::time::Duration::from_secs(30)
+                {
+                    // Only after first progress: a slow FIRST byte
+                    // (a non-streaming endpoint thinking for 10-30 s)
+                    // is governed by the WouldBlock arm and the 300 s
+                    // deadline, not the drip check.
+                    return Err(InferError::Http(
+                        "endpoint is slow-dripping the response".into(),
+                    ));
                 }
                 // Complete as soon as Content-Length bytes of body
                 // have arrived; never wait for connection close.
                 if header_end.is_none() {
-                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    // Incremental search: only new bytes + overlap.
+                    let search_from = header_search_from.min(raw.len());
+                    let found = raw[search_from..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|rel| search_from + rel);
+                    header_search_from = raw.len().saturating_sub(3);
+                    if let Some(pos) = found {
                         header_end = Some(pos + 4);
+                        // The stall window measures from the last
+                        // arrival, not from connect.
+                        last_progress_at = std::time::Instant::now();
+                        last_progress = raw.len();
                         let head = String::from_utf8_lossy(&raw[..pos]);
                         content_length = head.lines().find_map(|l| {
                             let (name, value) = l.split_once(':')?;
@@ -280,10 +348,18 @@ fn read_http_response(
                                 None
                             }
                         });
+                        chunked = is_chunked(&head);
                     }
                 }
                 if let (Some(he), Some(cl)) = (header_end, content_length) {
                     if raw.len() - he >= cl {
+                        break;
+                    }
+                }
+                // Chunked bodies: a chunk-aligned terminal 0-chunk
+                // (with optional trailers) completes in-loop.
+                if let Some(he) = header_end {
+                    if chunked && chunked_complete(&raw[he..]) {
                         break;
                     }
                 }
@@ -299,8 +375,11 @@ fn read_http_response(
                         return Err(InferError::Cancelled);
                     }
                 }
-                stalls += 1;
-                if stalls > 15 {
+                // Pre-first-byte waits are governed by the 300 s
+                // deadline, not the stall budget.
+                if (last_progress > 0 || header_end.is_some())
+                    && last_progress_at.elapsed() > std::time::Duration::from_secs(30)
+                {
                     return Err(InferError::Http(
                         "endpoint stalled for over 30 seconds".into(),
                     ));
@@ -346,9 +425,8 @@ fn read_http_response(
                 .collect::<String>()
         )));
     }
-    let lower = head.to_ascii_lowercase();
     let body = &raw[split + 4..];
-    let decoded = if lower.contains("transfer-encoding: chunked") {
+    let decoded = if is_chunked(&head) {
         decode_chunked(body)?
     } else {
         body.to_vec()
@@ -511,6 +589,13 @@ pub mod config {
         /// never persisted.
         #[serde(default)]
         pub api_key_env: Option<String>,
+        /// Local-backend sampling/layer settings (llama.cpp only).
+        #[serde(default)]
+        pub temperature: Option<f32>,
+        #[serde(default)]
+        pub seed: Option<u32>,
+        #[serde(default)]
+        pub n_gpu_layers: Option<u32>,
     }
 
     fn default_backend() -> String {
@@ -529,6 +614,9 @@ pub mod config {
                 model_path: None,
                 base_url: None,
                 api_key_env: None,
+                temperature: None,
+                seed: None,
+                n_gpu_layers: None,
             }
         }
     }
