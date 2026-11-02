@@ -5,6 +5,7 @@ members = [
     "crates/gridtalk-index",
     "crates/gridtalk-infer",
     "crates/gridtalk-app",
+    "crates/gridtalk-ui",
 ]
 # Gridcraft is vendored as a git submodule under vendor/gridcraft for
 # reference and staged integration. It is not a workspace member yet:

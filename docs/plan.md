@@ -25,9 +25,9 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Snapshot interchange type (`WorkbookSnapshot` / `SheetSnapshot`)
 - [x] CSV/TSV ingestion incl. quoted fields, type inference, formulas
 - [x] Typed `UnsupportedFormat` errors for XLSB/XLS/XLSM (explicit, not silent)
-- [ ] XLSX/ODS via Gridcraft `xlsx` crate (replaces the typed stub error)
-- [ ] Incremental dirty-range re-snapshot on engine command history (500 ms debounce)
-- [ ] egui grid shell on Gridcraft `ui-egui` with chat pane placeholder
+- [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests)
+- [x] Incremental dirty-range re-snapshot (`IncrementalSnapshot`: 500 ms debounce, dirty-range list, revision counter)
+- [x] egui grid+chat shell (`gridtalk-ui`: editable grid, chat pane, settings window) — on egui/eframe directly; Gridcraft `ui-egui` ribbon reuse remains a later swap
 
 ## Phase 3: Graph-RAG & inference — IN PROGRESS
 
@@ -37,18 +37,19 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] `ChatBackend` trait: streaming + cancellation
 - [x] OpenAI-compatible external backend (verbatim send, http; https = typed error until TLS lands)
 - [x] Deterministic echo backend for tests/demos
-- [ ] Inference spike: candle → mistral.rs → llama-cpp FFI (see `docs/spikes/inference-engine.md`)
-- [ ] Local embeddings (bge-small via fastembed/ONNX) + hybrid fusion
-- [ ] Model download/management (`hf-hub`, `~/.cache/gridtalk/models`)
+- [x] Inference spike harness: `gridtalk spike` probes candle → mistral.rs → llama-cpp FFI (candle loads GGUF today; other rungs report why not — see `docs/spikes/inference-engine.md`)
+- [ ] Local embeddings (bge-small via fastembed/ONNX) + hybrid fusion *(not started)*
+- [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|remove|list`, http download (https = typed error)
 - [ ] Investigate tool-loop harness (Phase 3b, behind a toggle)
 
 ## Phase 4: Dual-view & polish — IN PROGRESS
 
 - [x] `ViewState` two-way sync state machine (node→range, cell→node) with tests
 - [x] Terminal dual-view rendering (`gridtalk view`)
-- [ ] egui graph pane: force layout in worker thread, cached subgraphs
-- [ ] Split / Graph-full / Grid-full modes persisted per workbook
-- [ ] Settings dialog, first-run wizard, installers (Linux/macOS/Windows)
+- [x] egui graph pane: force layout computed in a worker thread, cached per revision, click-to-select nodes
+- [x] Split / Graph-full / Grid-full modes persisted per workbook (`~/.config/gridtalk/ui-state.json`)
+- [x] Settings window (config path, verbatim-send notice)
+- [ ] First-run wizard, installers (Linux/macOS/Windows) *(not started)*
 
 ## Validation
 

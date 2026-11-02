@@ -228,15 +228,124 @@ pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError
             ext,
             hint: "GridTalk does not support Excel binary/legacy formats; save as .xlsx or .csv and re-open".into(),
         }),
-        "xlsx" | "ods" => Err(IngestError::UnsupportedFormat {
-            ext,
-            hint: "XLSX/ODS import arrives with the Gridcraft engine integration (Phase 2); CSV/TSV work today".into(),
-        }),
+        "xlsx" | "ods" => {
+            let bytes = std::fs::read(path)?;
+            load_gridcraft_bytes(&name, &ext, &bytes)
+        }
         _ => Err(IngestError::UnsupportedFormat {
             ext,
             hint: "expected .csv, .tsv, .xlsx or .ods".into(),
         }),
     }
+}
+
+/// Read XLSX/ODS bytes through the vendored Gridcraft engine and
+/// convert its workbook model into a GridTalk snapshot.
+#[cfg(feature = "gridcraft")]
+pub fn load_gridcraft_bytes(
+    name: &str,
+    ext: &str,
+    bytes: &[u8],
+) -> Result<WorkbookSnapshot, IngestError> {
+    let (wb, _report) = if ext == "ods" {
+        gridcraft_xlsx::read_ods(bytes)
+    } else {
+        gridcraft_xlsx::read_xlsx(bytes)
+    }
+    .map_err(|e| IngestError::Parse(format!("gridcraft {ext} reader: {e}")))?;
+    Ok(from_gridcraft_workbook(name, &wb))
+}
+
+#[cfg(not(feature = "gridcraft"))]
+pub fn load_gridcraft_bytes(
+    _name: &str,
+    ext: &str,
+    _bytes: &[u8],
+) -> Result<WorkbookSnapshot, IngestError> {
+    Err(IngestError::UnsupportedFormat {
+        ext: ext.into(),
+        hint: "built without the `gridcraft` feature; rebuild with default features for XLSX/ODS"
+            .into(),
+    })
+}
+
+/// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
+/// canonical text; the cached value (when Gridcraft has one) is kept
+/// alongside so passages can show both.
+#[cfg(feature = "gridcraft")]
+pub fn from_gridcraft_workbook(name: &str, wb: &gridcraft_model::Workbook) -> WorkbookSnapshot {
+    use gridcraft_core::Value;
+    let mut sheets = Vec::new();
+    for sheet in &wb.sheets {
+        let (mut max_row, mut max_col) = (0usize, 0usize);
+        for (addr, _) in sheet.cells.iter() {
+            max_row = max_row.max(addr.row as usize);
+            max_col = max_col.max(addr.col as usize);
+        }
+        let mut cells = vec![vec![CellValue::Empty; max_col + 1]; max_row + 1];
+        if sheet.cells.iter().next().is_none() {
+            cells = Vec::new();
+        }
+        for (addr, cell) in sheet.cells.iter() {
+            let cached = match &cell.value {
+                Value::Empty => None,
+                Value::Number(n) => Some(Box::new(CellValue::Number(*n))),
+                Value::Text(t) => Some(Box::new(CellValue::Text(t.to_string()))),
+                Value::Bool(b) => Some(Box::new(CellValue::Bool(*b))),
+                other => Some(Box::new(CellValue::Text(other.display()))),
+            };
+            let value = match &cell.formula {
+                Some(f) => CellValue::Formula {
+                    expr: f.text.clone(),
+                    cached,
+                },
+                None => cached.map(|c| *c).unwrap_or(CellValue::Empty),
+            };
+            cells[addr.row as usize][addr.col as usize] = value;
+        }
+        sheets.push(SheetSnapshot {
+            name: sheet.name.clone(),
+            cells,
+        });
+    }
+    WorkbookSnapshot {
+        name: name.into(),
+        sheets,
+    }
+}
+
+/// Serialise a snapshot to XLSX bytes via Gridcraft (used for
+/// fixtures and Save-As). Formulas are written as formulas.
+#[cfg(feature = "gridcraft")]
+pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
+    use gridcraft_core::Value;
+    let mut gc = gridcraft_model::Workbook::new();
+    gc.sheets.clear();
+    for sheet in &wb.sheets {
+        let mut gs = gridcraft_model::Sheet::new(sheet.name.clone());
+        for (r, row) in sheet.cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                let addr = gridcraft_core::CellRef::new(r as u32, c as u32);
+                match cell {
+                    CellValue::Empty => {}
+                    CellValue::Text(t) => gs.set_value(addr, Value::Text(t.as_str().into())),
+                    CellValue::Number(n) => gs.set_value(addr, Value::Number(*n)),
+                    CellValue::Bool(b) => gs.set_value(addr, Value::Bool(*b)),
+                    CellValue::Formula { expr, .. } => gs.set_cell(
+                        addr,
+                        gridcraft_model::Cell::formula(gridcraft_model::Formula::new(expr)),
+                    ),
+                }
+            }
+        }
+        gc.sheets.push(std::sync::Arc::new(gs));
+    }
+    if gc.sheets.is_empty() {
+        gc.sheets
+            .push(std::sync::Arc::new(gridcraft_model::Sheet::new("Sheet1")));
+    }
+    gridcraft_xlsx::write_xlsx(&gc)
+        .map_err(|e| IngestError::Parse(format!("gridcraft xlsx writer: {e}")))
 }
 
 pub fn parse_delimited(name: &str, sheet: &str, text: &str, delim: char) -> WorkbookSnapshot {
@@ -537,6 +646,107 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
     problems
 }
 
+/// One cell edit coming from the grid / engine command history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellEdit {
+    pub sheet: String,
+    pub row: usize,
+    pub col: usize,
+    pub value: CellValue,
+}
+
+/// Incremental re-snapshot: edits are recorded as they happen, but
+/// the snapshot (and therefore graph/index rebuild) is only updated
+/// once edits have been quiet for `debounce`. Only the edited cells
+/// are touched — untouched rows are never re-copied — and the dirty
+/// ranges are handed to the graph builder so callers know exactly
+/// what changed.
+#[derive(Debug, Clone)]
+pub struct IncrementalSnapshot {
+    snapshot: WorkbookSnapshot,
+    pending: Vec<CellEdit>,
+    dirty: Vec<RangeRef>,
+    last_edit: Option<std::time::Instant>,
+    pub debounce: std::time::Duration,
+    pub revision: u64,
+}
+
+impl IncrementalSnapshot {
+    pub fn new(snapshot: WorkbookSnapshot) -> Self {
+        IncrementalSnapshot {
+            snapshot,
+            pending: Vec::new(),
+            dirty: Vec::new(),
+            last_edit: None,
+            debounce: std::time::Duration::from_millis(500),
+            revision: 0,
+        }
+    }
+
+    pub fn snapshot(&self) -> &WorkbookSnapshot {
+        &self.snapshot
+    }
+
+    pub fn pending_edits(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn record_edit(&mut self, edit: CellEdit, now: std::time::Instant) {
+        self.dirty.push(RangeRef {
+            sheet: edit.sheet.clone(),
+            r0: edit.row,
+            c0: edit.col,
+            r1: edit.row,
+            c1: edit.col,
+        });
+        self.pending.push(edit);
+        self.last_edit = Some(now);
+    }
+
+    /// Apply pending edits if the debounce window has elapsed.
+    /// Returns true when the snapshot changed (revision bumped).
+    pub fn poll(&mut self, now: std::time::Instant) -> bool {
+        let due = self
+            .last_edit
+            .map(|t| now.duration_since(t) >= self.debounce)
+            .unwrap_or(false);
+        if due && !self.pending.is_empty() {
+            self.flush();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply pending edits immediately, patching only edited cells.
+    pub fn flush(&mut self) {
+        let edits = std::mem::take(&mut self.pending);
+        for edit in edits {
+            if let Some(sheet) = self
+                .snapshot
+                .sheets
+                .iter_mut()
+                .find(|s| s.name == edit.sheet)
+            {
+                while sheet.cells.len() <= edit.row {
+                    sheet.cells.push(Vec::new());
+                }
+                let row = &mut sheet.cells[edit.row];
+                while row.len() <= edit.col {
+                    row.push(CellValue::Empty);
+                }
+                row[edit.col] = edit.value;
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// Dirty ranges since the last flush, then clears the list.
+    pub fn take_dirty_ranges(&mut self) -> Vec<RangeRef> {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
 /// Render a region as a cited passage for the LLM context.
 pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
     let mut out = format!("Range {}\n", region.range.a1());
@@ -589,6 +799,69 @@ mod tests {
         assert!(g.nodes.iter().any(|n| n.kind == NodeKind::Region));
         let node = g.node_for_cell("Sheet1", 1, 3).unwrap();
         assert_eq!(node.kind, NodeKind::Column); // most specific node wins
+    }
+
+    #[test]
+    fn incremental_snapshot_debounces_and_patches_only_dirty_cells() {
+        let wb = sample();
+        let mut inc = IncrementalSnapshot::new(wb);
+        let t0 = std::time::Instant::now();
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 1,
+                col: 1,
+                value: CellValue::Number(10.0),
+            },
+            t0,
+        );
+        // Inside the debounce window: snapshot unchanged.
+        assert!(!inc.poll(t0 + std::time::Duration::from_millis(100)));
+        assert_eq!(inc.snapshot().sheets[0].get(1, 1), CellValue::Number(2.0));
+        // After the window: exactly the edited cell changed.
+        assert!(inc.poll(t0 + std::time::Duration::from_millis(600)));
+        assert_eq!(inc.snapshot().sheets[0].get(1, 1), CellValue::Number(10.0));
+        assert_eq!(
+            inc.snapshot().sheets[0].get(1, 0),
+            CellValue::Text("Apples".into())
+        );
+        assert_eq!(inc.revision, 1);
+        let dirty = inc.take_dirty_ranges();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].a1(), "Sheet1!B2:B2");
+        assert!(inc.take_dirty_ranges().is_empty());
+    }
+
+    #[cfg(feature = "gridcraft")]
+    #[test]
+    fn xlsx_round_trip_via_gridcraft_preserves_values_and_formulas() {
+        let wb = sample();
+        let bytes = to_xlsx_bytes(&wb).unwrap();
+        assert_eq!(&bytes[0..2], b"PK"); // zip container
+        let back = load_gridcraft_bytes("demo", "xlsx", &bytes).unwrap();
+        let sheet = &back.sheets[0];
+        assert_eq!(sheet.get(0, 0), CellValue::Text("Item".into()));
+        assert_eq!(sheet.get(1, 1), CellValue::Number(2.0));
+        match sheet.get(1, 3) {
+            CellValue::Formula { ref expr, .. } => {
+                assert!(expr.contains("B2"), "formula text kept: {expr}")
+            }
+            other => panic!("D2 must survive as a formula, got {other:?}"),
+        }
+        let (g, violations) = build_graph(&back);
+        assert!(violations.is_empty(), "{violations:?}");
+        assert!(g.nodes.iter().any(|n| n.kind == NodeKind::Region));
+    }
+
+    #[cfg(feature = "gridcraft")]
+    #[test]
+    fn ods_fixture_loads_via_gridcraft() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/demo.ods");
+        let wb = load_path(&path).unwrap();
+        assert_eq!(wb.sheets[0].get(0, 0), CellValue::Text("Item".into()));
+        assert_eq!(wb.sheets[0].get(1, 0), CellValue::Text("Apples".into()));
+        assert_eq!(wb.sheets[0].get(1, 1), CellValue::Number(2.0));
     }
 
     #[test]

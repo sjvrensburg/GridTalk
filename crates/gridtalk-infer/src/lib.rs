@@ -75,6 +75,9 @@ impl From<std::io::Error> for InferError {
 
 pub type CancelToken = Arc<AtomicBool>;
 
+pub mod models;
+pub mod probe;
+
 pub trait ChatBackend: Send {
     fn name(&self) -> &str;
     /// Stream tokens through `on_token`. Implementations must poll

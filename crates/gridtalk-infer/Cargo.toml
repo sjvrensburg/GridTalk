@@ -8,11 +8,12 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+candle-core = { version = "0.10", optional = true, default-features = false }
 
 [features]
 default = []
 # Engine rungs are feature-gated so a candle or mistral.rs build never
 # pays the llama-cpp native-build cost unless explicitly selected.
-candle = []
+candle = ["dep:candle-core"]
 mistralrs = []
 llamacpp = []

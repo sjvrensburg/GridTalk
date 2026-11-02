@@ -160,8 +160,65 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        "spike" => {
+            let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
+            for report in gridtalk_infer::probe::probe_ladder(std::path::Path::new(file)) {
+                println!(
+                    "{:?}: compiled_in={} loads={} arch={:?} tensors={:?} — {}",
+                    report.engine,
+                    report.compiled_in,
+                    report.loads,
+                    report.gguf_arch,
+                    report.tensor_count,
+                    report.detail
+                );
+            }
+            Ok(())
+        }
+        "models" => {
+            let mgr = gridtalk_infer::models::ModelManager::default_cache();
+            match args.get(2).map(|s| s.as_str()) {
+                Some("import") => {
+                    let src = args
+                        .get(3)
+                        .ok_or("usage: gridtalk models import <file.gguf>")?;
+                    let entry = mgr
+                        .import(std::path::Path::new(src))
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "imported {} ({} bytes) -> {}",
+                        entry.name,
+                        entry.bytes,
+                        entry.path.display()
+                    );
+                    Ok(())
+                }
+                Some("remove") => {
+                    let name = args.get(3).ok_or("usage: gridtalk models remove <name>")?;
+                    mgr.remove(name).map_err(|e| e.to_string())?;
+                    println!("removed {name}");
+                    Ok(())
+                }
+                _ => {
+                    let entries = mgr.list();
+                    if entries.is_empty() {
+                        println!("no models in {}", mgr.dir.display());
+                    }
+                    for e in entries {
+                        println!(
+                            "{} ({} bytes) arch={:?} name={:?}",
+                            e.name,
+                            e.bytes,
+                            e.info.as_ref().and_then(|i| i.architecture.clone()),
+                            e.info.as_ref().and_then(|i| i.name.clone())
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        }
         _ => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv> <question...>\n  gridtalk graph <file.csv|tsv>\n  gridtalk view <file.csv|tsv>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk models [import <file.gguf>|remove <name>]\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
     }
