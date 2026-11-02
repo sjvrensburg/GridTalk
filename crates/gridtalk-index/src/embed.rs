@@ -57,15 +57,35 @@ pub fn tokenize(text: &str) -> Vec<String> {
         }
         let mut t = std::mem::take(cur);
         // Normalise numbers: "1,000" and "1000" are the same token,
-        // ".5" becomes "0.5".
-        if t.chars()
+        // ".5" becomes "0.5", "1,5" is a decimal comma (1.5), and
+        // percent tokens normalise the same way before the %.
+        let (sign, rest0) = match t.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => ("", t.as_str()),
+        };
+        let (body, pct) = match rest0.strip_suffix('%') {
+            Some(rest) => (rest, "%"),
+            None => (rest0, ""),
+        };
+        if body
+            .chars()
             .all(|c| c.is_ascii_digit() || c == ',' || c == '.')
-            && t.chars().any(|c| c.is_ascii_digit())
+            && body.chars().any(|c| c.is_ascii_digit())
         {
-            t = t.replace(',', "");
-            if let Some(rest) = t.strip_prefix('.') {
-                t = format!("0.{rest}");
+            let groups: Vec<&str> = body.split(',').collect();
+            let mut norm = if groups.len() > 1
+                && groups[1..]
+                    .iter()
+                    .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
+            {
+                body.replace(',', "")
+            } else {
+                body.replace(',', ".")
+            };
+            if let Some(rest) = norm.strip_prefix('.') {
+                norm = format!("0.{rest}");
             }
+            t = format!("{sign}{norm}{pct}");
         }
         let t = t.trim_matches('.').to_string();
         let t = if let Some(rest) = t.strip_prefix('.') {
@@ -84,6 +104,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
         if c.is_alphanumeric()
             || (c == '.' && (prev_digit || cur.is_empty()) && (next_digit || prev_digit))
             || (c == ',' && prev_digit && next_digit)
+            || (c == '-' && cur.is_empty() && next_digit)
         {
             cur.push(c);
         } else if c == '%'
@@ -124,15 +145,24 @@ impl EmbeddingModel for NGramEmbedding {
         for w in &words {
             add_feature(&mut v, hash_token(w), 1.0);
             // Character trigrams over chars, not UTF-8 bytes, so
-            // non-ASCII words hash their actual characters.
+            // non-ASCII words hash their actual characters. Bytes
+            // are encoded into a stack buffer — no allocation.
             let chars: Vec<char> = w.chars().collect();
             if chars.len() >= 3 {
                 for tri in chars.windows(3) {
-                    let tri_s: String = tri.iter().collect();
-                    add_feature(&mut v, hash_bytes(tri_s.as_bytes()), 0.5);
+                    let mut buf = [0u8; 16];
+                    let mut len = 0;
+                    for ch in tri {
+                        len += ch.encode_utf8(&mut buf[len..]).len();
+                    }
+                    add_feature(&mut v, hash_bytes(&buf[..len]), 0.5);
                 }
             } else if !chars.is_empty() {
-                add_feature(&mut v, hash_bytes(w.as_bytes()), 0.5);
+                // Salted so the fallback does not land on the exact
+                // same feature as the word hash itself.
+                let mut key = w.to_string();
+                key.push_str("#short");
+                add_feature(&mut v, hash_bytes(key.as_bytes()), 0.5);
             }
         }
         for pair in words.windows(2) {
@@ -186,13 +216,28 @@ pub struct VectorHit {
 
 /// Brute-force cosine index (region counts are small by design —
 /// the graph is lifted, so documents are regions, not cells).
+fn embed_chunks(text: &str, model: &dyn EmbeddingModel) -> Vec<std::sync::Arc<Vec<f32>>> {
+    // Score against the best-matching line/chunk of a region, not
+    // only the whole diluted region vector.
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= 1 {
+        return vec![std::sync::Arc::new(model.embed(text))];
+    }
+    lines
+        .iter()
+        .map(|l| std::sync::Arc::new(model.embed(l)))
+        .collect()
+}
+
 pub struct VectorIndex {
     pub model_name: String,
-    /// Minimum cosine for a hit. Calibrated for all-positive hashed
-    /// vectors; raise it for large corpora of short passages.
+    /// Minimum cosine for a hit. Calibrated for the signed
+    /// hashing embeddings above (unrelated texts centre near 0);
+    /// raise it for large corpora of short passages.
     pub threshold: f32,
     pub dim: usize,
-    vectors: Vec<Vec<f32>>,
+    /// Per-doc chunk vectors (usually one per passage line).
+    vectors: Vec<Vec<std::sync::Arc<Vec<f32>>>>,
     texts: Vec<String>,
 }
 
@@ -202,7 +247,7 @@ impl VectorIndex {
             model_name: model.name().to_string(),
             threshold: 0.15,
             dim: model.dim(),
-            vectors: texts.iter().map(|t| model.embed(t)).collect(),
+            vectors: texts.iter().map(|t| embed_chunks(t, model)).collect(),
             texts: texts.to_vec(),
         }
     }
@@ -215,7 +260,9 @@ impl VectorIndex {
             *self = VectorIndex::build(texts, model);
             return;
         }
-        let cache: std::collections::HashMap<&str, &Vec<f32>> = self
+        // Arc clones: reusing an unchanged doc's vectors is O(1)
+        // per chunk, not a 4 KiB copy.
+        let cache: std::collections::HashMap<&str, &Vec<std::sync::Arc<Vec<f32>>>> = self
             .texts
             .iter()
             .map(|t| t.as_str())
@@ -225,7 +272,7 @@ impl VectorIndex {
             .iter()
             .map(|t| match cache.get(t.as_str()) {
                 Some(v) => (*v).clone(),
-                None => model.embed(t),
+                None => embed_chunks(t, model),
             })
             .collect();
         self.texts = texts.to_vec();
@@ -241,9 +288,11 @@ impl VectorIndex {
             .vectors
             .iter()
             .enumerate()
-            .map(|(doc, v)| VectorHit {
+            .map(|(doc, chunks)| VectorHit {
                 doc,
-                score: cosine(&q, v),
+                // Best chunk wins: a relevant line inside a long
+                // region is not diluted by the rest of the region.
+                score: chunks.iter().map(|v| cosine(&q, v)).fold(0.0f32, f32::max),
             })
             .filter(|h| h.score > self.threshold)
             .collect();
@@ -264,10 +313,23 @@ pub fn reciprocal_rank_fusion(
     k: usize,
     limit: usize,
 ) -> Vec<(usize, f64)> {
+    reciprocal_rank_fusion_weighted(rankings, &[], k, limit)
+}
+
+/// Weighted variant: earlier lists can be trusted more (GridTalk
+/// weights exact lexical ranks above fuzzy vector ranks, so a
+/// vector-only #1 never ties an exact lexical #1).
+pub fn reciprocal_rank_fusion_weighted(
+    rankings: &[Vec<usize>],
+    weights: &[f64],
+    k: usize,
+    limit: usize,
+) -> Vec<(usize, f64)> {
     let mut scores: BTreeMap<usize, f64> = BTreeMap::new();
-    for ranking in rankings {
+    for (list, ranking) in rankings.iter().enumerate() {
+        let w = weights.get(list).copied().unwrap_or(1.0);
         for (rank, doc) in ranking.iter().enumerate() {
-            *scores.entry(*doc).or_default() += 1.0 / (k as f64 + rank as f64 + 1.0);
+            *scores.entry(*doc).or_default() += w / (k as f64 + rank as f64 + 1.0);
         }
     }
     let mut fused: Vec<(usize, f64)> = scores.into_iter().collect();
@@ -320,6 +382,10 @@ mod tests {
         assert_eq!(tokenize("1000"), vec!["1000".to_string()]);
         assert_eq!(tokenize(".5"), vec!["0.5".to_string()]);
         assert_eq!(tokenize("50%"), vec!["50%".to_string()]);
+        assert_eq!(tokenize("-5"), vec!["-5".to_string()]);
+        assert_ne!(tokenize("-5"), tokenize("5"));
+        assert_eq!(tokenize("1,5"), vec!["1.5".to_string()]);
+        assert_eq!(tokenize("1,000%"), tokenize("1000%"));
         let m = NGramEmbedding::default();
         let unrelated = cosine(
             &m.embed("apples quantity price"),

@@ -18,23 +18,28 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 struct OpenWorkbook {
     path: PathBuf,
-    /// (mtime, len) captured *before* reading, so a write during the
-    /// load cannot stamp new metadata onto old content.
-    stamp: Option<(SystemTime, u64)>,
+    /// (len, content hash) captured *before* reading, so a write
+    /// during the load cannot stamp new metadata onto old content,
+    /// and a content-preserving touch does not force a reload.
+    stamp: Option<(u64, u64)>,
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
 }
 
 impl OpenWorkbook {
-    fn stamp_of(path: &PathBuf) -> Option<(SystemTime, u64)> {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+    fn stamp_of(path: &PathBuf) -> Option<(u64, u64)> {
+        let bytes = std::fs::read(path).ok()?;
+        // FNV-1a over the content: cheap and deterministic.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in &bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        Some((bytes.len() as u64, h))
     }
 
     fn load(path: &PathBuf) -> Result<Self, String> {
@@ -55,8 +60,8 @@ impl OpenWorkbook {
     }
 
     fn fresh(&mut self) -> Result<(), String> {
-        // mtime + length: a same-mtime replacement with a different
-        // size is still picked up.
+        // (length, content hash): same-mtime replacements and
+        // content changes are picked up; mere touches are not.
         if Self::stamp_of(&self.path) != self.stamp {
             *self = OpenWorkbook::load(&self.path.clone())?;
         }
@@ -102,14 +107,14 @@ fn req_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i64, String)> {
 
 fn tool_definitions() -> Value {
     json!([
-        {"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods) and return its session id, sheets and regions", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-        {"name": "close_workbook", "description": "Close an open workbook session", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}},
-        {"name": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["workbook_id", "query"]}},
-        {"name": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only, never writes)", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}, "required": ["workbook_id", "cell", "value", "target"]}},
-        {"name": "graph_overview", "description": "All graph nodes and edges for an open workbook", "inputSchema": {"type": "object", "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
+        {"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods) and return its session id, sheets and regions", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+        {"name": "close_workbook", "description": "Close an open workbook session", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}},
+        {"name": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["workbook_id", "query"]}},
+        {"name": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
+        {"name": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
+        {"name": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
+        {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only, never writes)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}, "required": ["workbook_id", "cell", "value", "target"]}},
+        {"name": "graph_overview", "description": "All graph nodes and edges for an open workbook", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
     ])
 }
 
@@ -124,50 +129,64 @@ impl McpServer {
                 json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "invalid request: expected a JSON-RPC object"}}),
             );
         }
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        // Notifications get no response per JSON-RPC.
-        request.get("id")?;
-        if let Some(v) = request.get("jsonrpc") {
-            if v.as_str() != Some("2.0") {
-                return Some(
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request: jsonrpc must be \"2.0\""}}),
-                );
+        // Notifications (no id) get no response; handle them before
+        // any id-based early return so notifications/initialized
+        // can actually land.
+        if request.get("id").is_none() {
+            if request.get("method").and_then(|m| m.as_str()) == Some("notifications/initialized") {
+                self.initialized = true;
             }
+            return None;
+        }
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        if request.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+            return Some(
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request: jsonrpc must be \"2.0\""}}),
+            );
         }
         let method = match request.get("method").and_then(|m| m.as_str()) {
-            Some(m) if !m.is_empty() => m,
+            Some(m) if !m.is_empty() => m.to_string(),
             _ => {
                 return Some(
                     json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request: missing method"}}),
                 );
             }
         };
-        if method == "notifications/initialized" {
-            self.initialized = true;
-            return None;
-        }
-        let result = match method {
+        let result = match method.as_str() {
             "initialize" => {
-                self.initialized = true;
-                let client_version = request
-                    .pointer("/params/protocolVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                // Negotiate: echo the client's version only when we
-                // support it, otherwise offer our newest supported.
-                let negotiated = if SUPPORTED_PROTOCOLS.contains(&client_version) {
-                    client_version
+                if self.initialized {
+                    Err((-32602, "already initialized".to_string()))
                 } else {
-                    SUPPORTED_PROTOCOLS[0]
-                };
-                Ok(json!({
-                    "protocolVersion": negotiated,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "gridtalk", "version": env!("CARGO_PKG_VERSION")}
-                }))
+                    self.initialized = true;
+                    let client_version = request
+                        .pointer("/params/protocolVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    // Negotiate: echo the client's version only when
+                    // we support it, otherwise offer our newest.
+                    let negotiated = if SUPPORTED_PROTOCOLS.contains(&client_version) {
+                        client_version
+                    } else {
+                        SUPPORTED_PROTOCOLS[0]
+                    };
+                    Ok(json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {"name": "gridtalk", "version": env!("CARGO_PKG_VERSION")}
+                    }))
+                }
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_definitions()})),
+            "tools/list" => {
+                if !self.initialized {
+                    Err((
+                        -32002,
+                        "server not initialized: send initialize first".to_string(),
+                    ))
+                } else {
+                    Ok(json!({"tools": tool_definitions()}))
+                }
+            }
             "tools/call" => {
                 if !self.initialized {
                     Err((
@@ -189,11 +208,42 @@ impl McpServer {
     }
 
     fn call_tool(&mut self, params: Value) -> Result<Value, (i64, String)> {
-        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let name = params
+            .get("name")
+            .and_then(|n| n.as_str())
+            .filter(|n| !n.is_empty())
+            .ok_or((-32602, "missing or non-string argument: name".to_string()))?
+            .to_string();
+        let name = name.as_str();
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        // Reject unknown arguments per tool (schemas declare
+        // additionalProperties: false).
+        let allowed: &[&str] = match name {
+            "open_workbook" => &["path"],
+            "close_workbook" => &["workbook_id"],
+            "search" => &["workbook_id", "query", "limit"],
+            "expand" | "get_cells" | "list_formulas" => &["workbook_id", "range"],
+            "what_if" => &["workbook_id", "cell", "value", "target"],
+            "graph_overview" => &["workbook_id"],
+            _ => &[],
+        };
+        if let Some(obj) = args.as_object() {
+            for key in obj.keys() {
+                if !allowed.contains(&key.as_str()) {
+                    return Err((-32602, format!("unknown argument: {key}")));
+                }
+            }
+        }
         let text_result = |text: String, is_error: bool| {
             Ok(json!({
                 "content": [{"type": "text", "text": text}],
+                "isError": is_error
+            }))
+        };
+        let structured_result = |data: Value, is_error: bool| {
+            Ok(json!({
+                "content": [{"type": "text", "text": data.to_string()}],
+                "structuredContent": data,
                 "isError": is_error
             }))
         };
@@ -239,9 +289,8 @@ impl McpServer {
                             .map(|r| json!({"range": r.range.a1(), "headers": r.headers}))
                             .collect();
                         self.workbooks.insert(id.clone(), open);
-                        text_result(
-                            json!({"workbook_id": id, "sheets": sheets, "regions": regions})
-                                .to_string(),
+                        structured_result(
+                            json!({"workbook_id": id, "sheets": sheets, "regions": regions}),
                             false,
                         )
                     }
@@ -275,6 +324,7 @@ impl McpServer {
                             None => 3,
                             Some(v) => v
                                 .as_u64()
+                                .filter(|n| *n >= 1)
                                 .ok_or((-32602, "limit must be a positive integer".to_string()))?
                                 as usize,
                         },
@@ -298,12 +348,13 @@ impl McpServer {
                     },
                     "graph_overview" => ToolRequest::GraphOverview,
                     other => {
-                        return text_result(format!("unknown tool {other}"), true);
+                        return Err((-32602, format!("unknown tool: {other}")));
                     }
                 };
                 let result = tools.call(&req);
-                // Machines get the structured payload as JSON text.
-                text_result(result.data.to_string(), !result.ok)
+                // Machines get structuredContent; the text content
+                // carries the same payload for text-only clients.
+                structured_result(result.data, !result.ok)
             }
         }
     }
@@ -326,10 +377,25 @@ pub fn serve_stdio() -> Result<(), String> {
     loop {
         let mut raw: Vec<u8> = Vec::new();
         loop {
+            // Read in bounded 8 KiB chunks so memory stays capped
+            // even before the 1 MiB frame check can fire.
             let mut chunk = Vec::new();
-            let n = reader
-                .read_until(b'\n', &mut chunk)
-                .map_err(|e| e.to_string())?;
+            let n = {
+                let available = reader.fill_buf().map_err(|e| e.to_string())?;
+                if available.is_empty() {
+                    0
+                } else {
+                    let take_n = available
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map(|i| i + 1)
+                        .unwrap_or(available.len())
+                        .min(8192);
+                    chunk.extend_from_slice(&available[..take_n]);
+                    reader.consume(take_n);
+                    take_n
+                }
+            };
             if n == 0 {
                 break;
             }

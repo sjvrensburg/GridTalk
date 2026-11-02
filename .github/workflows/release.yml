@@ -12,7 +12,7 @@ jobs:
         with:
           submodules: true
       - name: Cache Vulkan SDK (Linux)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/vulkan-sdk
           key: vulkan-sdk-1.4.341.0-linux-x86_64
@@ -52,14 +52,16 @@ jobs:
           cargo test --locked --workspace
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CRATE_VERSION=$(grep -m1 '^version = ' crates/gridtalk-app/Cargo.toml | cut -d'"' -f2)
-          echo "tag=$TAG_VERSION crate=$CRATE_VERSION"
+          UI_VERSION=$(grep -m1 '^version = ' crates/gridtalk-ui/Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG_VERSION crate=$CRATE_VERSION ui=$UI_VERSION"
           test "$TAG_VERSION" = "$CRATE_VERSION" || { echo "tag v$TAG_VERSION does not match gridtalk-app version $CRATE_VERSION"; exit 1; }
+          test "$TAG_VERSION" = "$UI_VERSION" || { echo "tag v$TAG_VERSION does not match gridtalk-ui version $UI_VERSION"; exit 1; }
       - name: Create the release once
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --generate-notes --notes "Binaries: gridtalk (CLI, llama.cpp over Vulkan for local GGUF generation (Linux/Windows)) and gridtalk-ui (desktop). Local model is the private default; external endpoints receive cell values verbatim."
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || gh release create "${{ github.ref_name }}" --draft --generate-notes --notes "Binaries: gridtalk (CLI, llama.cpp over Vulkan for local GGUF generation (Linux/Windows)) and gridtalk-ui (desktop). Local model is the private default; external endpoints receive cell values verbatim."
   build:
     needs: create
     runs-on: ${{ matrix.os }}
@@ -76,7 +78,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Cache Vulkan SDK (Linux)
         if: runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/vulkan-sdk
           key: vulkan-sdk-1.4.341.0-linux-x86_64
@@ -138,7 +140,11 @@ jobs:
           cp vendor/gridcraft/LICENSE-MIT dist/Gridcraft-LICENSE-MIT
           cp vendor/gridcraft/LICENSE-APACHE dist/Gridcraft-LICENSE-APACHE
           cp vendor/gridcraft/NOTICE dist/Gridcraft-NOTICE
-          cp licenses/llama.cpp-LICENSE.txt licenses/README.md dist/
+          cp licenses/llama.cpp-LICENSE.txt dist/
+          cp licenses/README.md dist/licenses-README.md
+          # Bundle the Vulkan loader so driverless machines reach
+          # the CPU fallback instead of failing at load time.
+          cp "$VULKAN_SDK/lib/libvulkan.so.1" dist/
           tar -czf "gridtalk-${{ github.ref_name }}-${{ runner.os }}.tar.gz" -C dist .
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -149,7 +155,8 @@ jobs:
           Copy-Item vendor/gridcraft/LICENSE-MIT dist/Gridcraft-LICENSE-MIT
           Copy-Item vendor/gridcraft/LICENSE-APACHE dist/Gridcraft-LICENSE-APACHE
           Copy-Item vendor/gridcraft/NOTICE dist/Gridcraft-NOTICE
-          Copy-Item licenses/llama.cpp-LICENSE.txt, licenses/README.md dist/
+          Copy-Item licenses/llama.cpp-LICENSE.txt dist/
+          Copy-Item licenses/README.md dist/licenses-README.md
           # The binary hard-links the Vulkan loader; bundle it so a
           # driverless Windows machine starts (CPU fallback) instead
           # of failing at loader time.
@@ -161,3 +168,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.ref_name }}" gridtalk-${{ github.ref_name }}-* --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"

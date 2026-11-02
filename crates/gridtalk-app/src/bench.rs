@@ -6,7 +6,7 @@
 //! over the tasks and writes a CARD.md score report, for the echo
 //! backend (the floor) or the configured local model.
 
-use crate::investigate::{investigate, Investigation};
+use crate::investigate::investigate;
 use crate::tools::Tools;
 use gridtalk_graph::eval::{eval_cell_in_workbook, what_if_in_workbook};
 use gridtalk_graph::{formula_refs_qualified, CellValue, WorkbookSnapshot};
@@ -28,20 +28,53 @@ pub struct BenchTask {
 }
 
 fn a1(sheet: &str, row: usize, col: usize) -> String {
-    format!("{sheet}!{}{}", gridtalk_graph::col_name(col), row + 1)
+    format!(
+        "{}!{}{}",
+        gridtalk_graph::quote_sheet(sheet),
+        gridtalk_graph::col_name(col),
+        row + 1
+    )
+}
+
+fn split_for(kind: &str, question: &str) -> &'static str {
+    // Stable hash split (not positional): the same task lands in
+    // the same split regardless of workbook scan order or --max.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in kind.bytes().chain(question.bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h % 3 == 2 {
+        "dev"
+    } else {
+        "train"
+    }
+}
+
+pub struct TaskGeneration {
+    pub tasks: Vec<BenchTask>,
+    /// Formula cells skipped because they error or are non-finite
+    /// (no deterministic ground truth exists for them).
+    pub skipped_formulas: usize,
 }
 
 /// Synthesise benchmark tasks from a workbook. Deterministic: the
 /// same workbook always yields the same tasks, ids and splits.
+#[allow(dead_code)] // convenience wrapper over generate_tasks_ex
 pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask> {
+    generate_tasks_ex(wb, max_tasks).tasks
+}
+
+pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGeneration {
+    let mut skipped_formulas = 0usize;
     let mut drafts: Vec<(String, String, f64, String)> = Vec::new(); // kind, question, expected, citation
     for sheet in &wb.sheets {
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 match cell {
-                    CellValue::Number(n) if r > 0 => {
-                        // Data cells (below a header row) become
-                        // value-recall tasks.
+                    CellValue::Number(n) if r > 0 && n.is_finite() => {
+                        // Data cells (below the first row, treated
+                        // as a header) become value-recall tasks.
                         drafts.push((
                             "cell_value".into(),
                             format!(
@@ -53,7 +86,11 @@ pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask>
                         ));
                     }
                     CellValue::Formula { expr, .. } => {
-                        if let Ok(v) = eval_cell_in_workbook(wb, &sheet.name, r, c) {
+                        let evaluated = eval_cell_in_workbook(wb, &sheet.name, r, c);
+                        if !matches!(evaluated, Ok(v) if v.is_finite()) {
+                            skipped_formulas += 1;
+                        }
+                        if let Ok(v) = evaluated {
                             if v.is_finite() {
                                 drafts.push((
                                     "formula_result".into(),
@@ -65,8 +102,9 @@ pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask>
                                     a1(&sheet.name, r, c),
                                 ));
                             }
-                            // One what-if task per formula: its first
-                            // numeric precedent, shifted by +10.
+                            // One what-if task per formula: walk
+                            // numeric precedents until one produces
+                            // a non-trivial, finite outcome.
                             for q in formula_refs_qualified(expr) {
                                 let osheet_name =
                                     q.sheet.clone().unwrap_or_else(|| sheet.name.clone());
@@ -76,26 +114,30 @@ pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask>
                                 };
                                 if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
                                     let new_value = orig + 10.0;
-                                    if let Ok((_, after)) = what_if_in_workbook(
+                                    if let Ok((before, after)) = what_if_in_workbook(
                                         wb,
                                         (&osheet_name, q.row, q.col),
                                         new_value,
                                         (&sheet.name, r, c),
                                     ) {
-                                        if after.is_finite() {
+                                        // Trivial tasks (outcome
+                                        // unchanged) teach nothing.
+                                        if after.is_finite() && (after - before).abs() > 1e-9 {
                                             drafts.push((
                                                 "what_if".into(),
                                                 format!(
-                                                    "What happens to {} if {} becomes {new_value}? Answer with just the resulting number.",
-                                                    a1(&sheet.name, r, c),
-                                                    a1(&osheet_name, q.row, q.col)
+                                                    "What if {} becomes {new_value}? What happens to {}? Answer with just the resulting number.",
+                                                    a1(&osheet_name, q.row, q.col),
+                                                    a1(&sheet.name, r, c)
                                                 ),
                                                 after,
                                                 a1(&sheet.name, r, c),
                                             ));
+                                            break;
                                         }
                                     }
-                                    break;
+                                    // Failed/trivial precedent: try
+                                    // the next one.
                                 }
                             }
                         }
@@ -105,61 +147,86 @@ pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask>
             }
         }
     }
-    drafts.truncate(max_tasks);
-    drafts
+    // Evenly-spaced sampling (not a row-major prefix) when capped,
+    // so the pool covers all sheets instead of the top-left corner.
+    if drafts.len() > max_tasks && max_tasks > 0 {
+        let total = drafts.len();
+        drafts = (0..max_tasks)
+            .map(|i| drafts[i * total / max_tasks].clone())
+            .collect();
+    }
+    let tasks = drafts
         .into_iter()
         .enumerate()
         .map(|(i, (kind, question, expected, citation))| BenchTask {
             id: format!("t{:04}", i + 1),
-            // Every third task is a dev task; the rest are train.
-            split: if i % 3 == 2 { "dev" } else { "train" }.into(),
+            split: split_for(&kind, &question).into(),
             kind,
             question,
             expected,
             citation,
         })
-        .collect()
+        .collect();
+    TaskGeneration {
+        tasks,
+        skipped_formulas,
+    }
 }
 
-/// Numbers mentioned in an answer (commas stripped, trailing
-/// punctuation ignored). Range refs like Sheet1!D2 do not parse.
+/// Numbers mentioned in an answer. Tokens that start with a
+/// letter (words, range refs like Sheet1!D2) never contribute, so
+/// citation text cannot leak digits into the judge. Percent tokens
+/// contribute their scaled value ("50%" -> 0.5); a comma is a
+/// thousands separator only when every group after the first has
+/// exactly three digits, otherwise it is a decimal comma.
 pub fn extract_numbers(text: &str) -> Vec<f64> {
-    text.split(|ch: char| ch.is_whitespace() || matches!(ch, '|' | ';' | ':'))
-        .filter_map(|tok| {
-            let t = tok.trim_matches(|ch: char| {
-                !(ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',')
-            });
-            if t.is_empty() || t == "-" || t == "." {
-                return None;
-            }
-            if let Ok(v) = t.parse::<f64>() {
-                return v.is_finite().then_some(v);
-            }
-            // Thousands separators ("1,200") only when the token is
-            // otherwise purely numeric — never mine digits out of
-            // words or range refs like Sheet1!D2.
-            if t.chars()
-                .all(|ch| ch.is_ascii_digit() || matches!(ch, ',' | '.' | '%'))
+    let mut out = Vec::new();
+    for tok in text.split(|ch: char| ch.is_whitespace() || matches!(ch, '|' | ';' | ':')) {
+        let t = tok.trim_matches(|ch: char| {
+            !(ch.is_alphanumeric() || matches!(ch, '.' | '-' | ',' | '%'))
+        });
+        let first = t.chars().next();
+        if !matches!(first, Some(c) if c.is_ascii_digit() || c == '.' || c == '-') {
+            continue;
+        }
+        let (core, percent) = match t.strip_suffix('%') {
+            Some(stripped) => (stripped, true),
+            None => (t, false),
+        };
+        let normalized = if core.contains(',') {
+            let groups: Vec<&str> = core.split(',').collect();
+            if groups.len() > 1
+                && groups[1..]
+                    .iter()
+                    .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
             {
-                return t
-                    .replace(',', "")
-                    .trim_end_matches('%')
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|v| v.is_finite());
+                core.replace(',', "")
+            } else {
+                core.replace(',', ".")
             }
-            None
-        })
-        .collect()
+        } else {
+            core.to_string()
+        };
+        if let Ok(mut v) = normalized.parse::<f64>() {
+            if v.is_finite() {
+                if percent {
+                    v /= 100.0;
+                }
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
-/// Deterministic judge: the expected value must appear in the
-/// answer (within tolerance). No LLM anywhere in scoring.
+/// Deterministic judge: the **final** number in the answer must
+/// match ground truth. Tolerance is 0.1% relative with a small
+/// absolute floor (0.005) so rounded answers near zero pass.
 pub fn judge_number(answer: &str, expected: f64) -> bool {
-    let tol = (expected.abs() * 0.001).max(1e-6);
+    let tol = (expected.abs() * 0.001).max(0.005);
     extract_numbers(answer)
-        .iter()
-        .any(|v| (v - expected).abs() <= tol)
+        .last()
+        .is_some_and(|v| (v - expected).abs() <= tol)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +238,26 @@ pub struct TaskResult {
     pub citation_hit: bool,
     pub latency_ms: f64,
     pub trail_steps: usize,
+    /// Backend/investigation error, when the task could not run.
+    pub error: Option<String>,
+}
+
+/// Citation precision is scored on structured citations only: a
+/// cited *range* counts when it contains the expected cell. An
+/// answer merely restating the question's citation does not.
+fn citation_hit(citations: &[String], citation: &str) -> bool {
+    let Some((_, er, ec)) = crate::tools::parse_cell_ref(citation) else {
+        return false;
+    };
+    citations.iter().any(|cited| {
+        crate::tools::parse_range(cited).is_some_and(|(sheet, r0, c0, r1, c1)| {
+            crate::tools::parse_cell_ref(citation).is_some_and(|(esheet, _, _)| sheet == esheet)
+                && er >= r0
+                && er <= r1
+                && ec >= c0
+                && ec <= c1
+        })
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,17 +317,27 @@ pub fn run_bench(
     let mut results = Vec::new();
     for task in tasks.iter().filter(|t| split == "all" || t.split == split) {
         let started = std::time::Instant::now();
-        let inv: Investigation = investigate(&task.question, tools, backend, max_steps)?;
-        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // A backend error fails that one task; the run still
+        // produces a (partial) CARD for the rest.
+        let (passed, cited, steps, error) =
+            match investigate(&task.question, tools, backend, max_steps) {
+                Ok(inv) => (
+                    judge_number(&inv.answer, task.expected),
+                    citation_hit(&inv.citations, &task.citation),
+                    inv.trail.len(),
+                    None,
+                ),
+                Err(e) => (false, false, 0, Some(e.to_string())),
+            };
         results.push(TaskResult {
             id: task.id.clone(),
             kind: task.kind.clone(),
             split: task.split.clone(),
-            passed: judge_number(&inv.answer, task.expected),
-            citation_hit: inv.citations.iter().any(|c| c == &task.citation)
-                || inv.answer.contains(&task.citation),
-            latency_ms,
-            trail_steps: inv.trail.len(),
+            passed,
+            citation_hit: cited,
+            latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+            trail_steps: steps,
+            error,
         });
     }
     Ok(BenchReport {
@@ -251,11 +348,33 @@ pub fn run_bench(
 }
 
 /// Render the CARD.md score report for a bench run.
+fn esc(field: &str) -> String {
+    field.replace('|', "\\|").replace('\n', " ")
+}
+
+#[allow(dead_code)] // convenience wrapper over render_card_with_skipped
 pub fn render_card(report: &BenchReport, total_tasks: usize) -> String {
+    render_card_with_skipped(report, total_tasks, 0)
+}
+
+pub fn render_card_with_skipped(
+    report: &BenchReport,
+    total_tasks: usize,
+    skipped_formulas: usize,
+) -> String {
     let mut out = String::new();
     out.push_str("# GridTalk bench CARD\n\n");
-    out.push_str(&format!("- Workbook: `{}`\n", report.workbook));
-    out.push_str(&format!("- Backend: `{}`\n", report.backend));
+    out.push_str(&format!("- Workbook: `{}`\n", esc(&report.workbook)));
+    out.push_str(&format!("- Backend: `{}`\n", esc(&report.backend)));
+    if skipped_formulas > 0 {
+        out.push_str(&format!(
+            "- Skipped formulas (erroring/non-finite, no ground truth): {skipped_formulas}\n"
+        ));
+    }
+    if report.results.is_empty() {
+        out.push_str("\nNo tasks were scored (empty task set for this split).\n");
+        return out;
+    }
     out.push_str(&format!(
         "- Tasks generated: {total_tasks}; scored here: {}\n\n",
         report.results.len()
@@ -286,10 +405,16 @@ pub fn render_card(report: &BenchReport, total_tasks: usize) -> String {
     for r in &report.results {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
-            r.id,
-            r.kind,
-            r.split,
-            if r.passed { "PASS" } else { "FAIL" },
+            esc(&r.id),
+            esc(&r.kind),
+            esc(&r.split),
+            if r.error.is_some() {
+                "ERROR"
+            } else if r.passed {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             if r.citation_hit { "yes" } else { "no" },
             r.trail_steps
         ));
@@ -352,6 +477,10 @@ mod tests {
         assert!(!judge_number("The answer is 7.", 6.0));
         assert!(!judge_number("no numbers here", 6.0));
         assert!(judge_number("changes 6 -> 36", 36.0));
+        // A correct value buried mid-answer with a wrong final
+        // number must NOT pass.
+        assert!(!judge_number("It was 6 earlier; the answer is 7", 6.0));
+        assert!(judge_number("It was 6 earlier; the answer is 7", 7.0));
     }
 
     #[test]
@@ -366,18 +495,18 @@ mod tests {
         let report = run_bench(&tasks, &tools, &EchoBackend, "all", 8).unwrap();
         assert_eq!(report.results.len(), tasks.len());
         assert!(report.accuracy("all").is_some());
-        // The echo floor echoes the cited context (including cell
-        // values), so the floor accuracy is above zero — that is
-        // exactly the baseline a real model must beat.
-        assert!(
-            report.results.iter().any(|r| r.passed),
-            "echo floor must pass some tasks: {:?}",
-            report.results
-        );
+        // The echo backend echoes context but never answers, so
+        // its accuracy floor is 0% under the final-number judge —
+        // any real model must beat that, and citation precision
+        // (structured citations) is scored separately.
+        // Echo may luck into a pass when the expected value is the
+        // last number in the echoed context; what matters here is
+        // that every task is scored and citations are tracked.
+        assert!(report.results.iter().any(|r| r.citation_hit));
         let card = render_card(&report, tasks.len());
         assert!(card.contains("train"));
         assert!(card.contains("dev"));
         assert!(card.contains("echo-local"));
-        assert!(card.contains("PASS"));
+        assert!(card.contains("## Per-task results"));
     }
 }

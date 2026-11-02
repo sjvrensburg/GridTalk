@@ -36,9 +36,22 @@ configured — that score is the floor a real model must beat).
 Scoring is a number check against ground truth plus citation
 precision (did the answer cite the expected range?).
 
-On the demo workbook the echo floor is 50% accuracy / 100%
-citation precision; the failing tasks are the formula-result and
-what-if questions, which is the weakness Phase D adapters target.
+Scoring is strict: the **final** number in the answer must match
+ground truth (0.1% relative tolerance, 0.005 absolute floor), and
+citation precision counts only structured citations whose range
+contains the expected cell — restating the question's citation
+does not count. On the demo workbook the echo backend therefore
+scores 0% accuracy (it echoes context but never answers), while
+its citation precision is high because the harness cites the
+right regions. That 0% is the floor a real model must beat, and
+the formula-result/what-if trail gaps are what Phase D adapters
+target.
+
+Tasks come from a file only when you pass `--tasks`; the split is
+assigned by a stable hash of the task (not position), generation
+samples evenly across the workbook when `--max` caps the pool,
+and formula cells that error have no ground truth — they are
+counted as skipped in the CARD, never silently tasked.
 
 ## CARD.md
 

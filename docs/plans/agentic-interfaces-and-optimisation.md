@@ -1,6 +1,6 @@
 # Future development: agentic interfaces + self-optimisation
 
-Status: Phases A+B implemented on branch `feat/agentic-mcp` (typed tool core, `gridtalk tools call --json`, MCP server over stdio with session/mtime invalidation, harness recipes in `docs/mcp.md`). Phases C-E remain future work. Companion to `docs/plan.md`.
+Status: Phases A+B merged (`feat/agentic-mcp`, typed tool core, `gridtalk tools call <file> '<json>'`, MCP server over stdio with session/content-hash invalidation, harness recipes in `docs/mcp.md`); Phase C merged (bench generator). Phases D-E remain future work. Companion to `docs/plan.md`.
 Main CI at time of writing: run 41423800953 (post-merge) — check
 `gh run list --branch main` for the terminal result.
 
@@ -62,8 +62,9 @@ speak for tools. Build `gridtalk mcp` as an MCP server over stdio:
    `--allow-write`, off by default, and the MCP tool list simply
    omits it otherwise. The server is local stdio; a loopback
    streamable-HTTP transport is a later option, never default-on.
-4. **JSON CLI as the fallback surface:** `gridtalk ask --json`,
-   `gridtalk tools call <tool> --json '{…}'` with stable exit
+4. **JSON CLI as the fallback surface:** `gridtalk ask <file> <question...>` and
+   `gridtalk tools call <file> '<json ToolRequest>'` (e.g.
+   `'{"tool":"search","query":"provision"}'`) with stable exit
    codes, so harnesses that prefer subprocess + JSON (and scripts,
    and hermit-style drivers — see Avenue 2) are not forced into
    MCP. One typed core, two transports.
@@ -194,7 +195,7 @@ optimisation can lift small-model performance here.
 **Phase A (foundation, ~1 wk):** typed tool core. Refactor
 `Tools::execute` to serde-typed calls returning structured
 results; string rendering becomes a presentation layer. Add
-`gridtalk tools call --json`. Tests: contract tests per tool.
+`gridtalk tools call <file> '<json ToolRequest>'`. Tests: contract tests per tool.
 
 **Phase B (MCP server, ~1–2 wks):** `gridtalk mcp` (rmcp, stdio),
 session/cache layer, `.mcp.json` + Codex recipes, MCP contract
@@ -204,8 +205,9 @@ end-to-end as acceptance.
 **Phase C (benchmark generator) — SHIPPED:** `gridtalk bench
 generate|run`, deterministic judges, CARD.md writer
 (`crates/gridtalk-app/src/bench.rs`, `docs/bench.md`). Acceptance
-met for the echo backend: demo workbook scores 50% accuracy /
-100% citation precision (the floor). A real-local-model run uses
+met for the echo backend: demo workbook runs end-to-end (echo
+scores 0% accuracy under the strict final-number judge — it
+echoes context but never answers — which is the floor). A real-local-model run uses
 the same command with a model configured.
 
 **Phase D (adapter format + loop, ~2 wks):** adapter directories,

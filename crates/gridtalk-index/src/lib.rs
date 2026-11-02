@@ -7,7 +7,7 @@
 
 pub mod embed;
 
-use embed::{reciprocal_rank_fusion, EmbeddingModel, NGramEmbedding, VectorIndex};
+use embed::{reciprocal_rank_fusion_weighted, EmbeddingModel, NGramEmbedding, VectorIndex};
 use gridtalk_graph::{render_passage, Graph, RangeRef, WorkbookSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -81,8 +81,7 @@ impl Index {
             .docs
             .iter()
             .filter_map(|(range, passage, tf, _)| {
-                let (score, matched) = self.score_doc(tf, &terms, n);
-                let _ = &matched;
+                let score = self.score_doc(tf, &terms, n);
                 let matched: Vec<String> = terms
                     .iter()
                     .filter(|t| tf.contains_key(*t))
@@ -119,7 +118,7 @@ impl Index {
             .iter()
             .enumerate()
             .filter_map(|(i, (_, _, tf, _))| {
-                let (score, _) = self.score_doc(tf, &terms, n);
+                let score = self.score_doc(tf, &terms, n);
                 if score > 0.0 {
                     Some((i, score))
                 } else {
@@ -137,30 +136,21 @@ impl Index {
 
     /// Shared TF-IDF scoring (with length normalisation) used by
     /// both `search` and `ranking` so they cannot drift apart.
-    fn score_doc(
-        &self,
-        tf: &BTreeMap<String, usize>,
-        terms: &[String],
-        n: f64,
-    ) -> (f64, Vec<String>) {
+    fn score_doc(&self, tf: &BTreeMap<String, usize>, terms: &[String], n: f64) -> f64 {
         let mut score = 0.0;
-        let mut matched = Vec::new();
         for t in terms {
             if let Some(&count) = tf.get(t) {
                 let df = *self.df.get(t).unwrap_or(&1) as f64;
                 score += (1.0 + (count as f64).ln()) * (1.0 + (n / (1.0 + df)).ln());
-                matched.push(t.clone());
             }
         }
         let doc_len: usize = tf.values().sum();
         if doc_len > 0 {
-            score /= 1.0 + (doc_len as f64).ln() * 0.1;
+            // Stronger than the old 0.1 factor: long regions must
+            // not win purely by accumulating more matched terms.
+            score /= 1.0 + (doc_len as f64).ln() * 0.35;
         }
-        if score > 0.0 {
-            (score, matched)
-        } else {
-            (0.0, Vec::new())
-        }
+        score
     }
 
     pub fn doc(&self, i: usize) -> Option<(&RangeRef, &str)> {
@@ -237,7 +227,12 @@ impl HybridIndex {
         // Relevance floor: lexical ranking only contains docs with a
         // positive TF-IDF score and vector ranking only docs above
         // the cosine threshold, so a fused hit always cleared one.
-        let fused = reciprocal_rank_fusion(&[lexical_ranking, vector_ranking], 60, limit);
+        let fused = reciprocal_rank_fusion_weighted(
+            &[lexical_ranking, vector_ranking],
+            &[1.0, 0.5],
+            60,
+            limit,
+        );
         let terms = dedup_terms(tokenize(query));
         fused
             .into_iter()
@@ -310,6 +305,24 @@ mod tests {
             .is_empty());
         // "range" (the passage header word) must not match every doc.
         assert!(hybrid.search("range", 5).is_empty());
+    }
+
+    #[test]
+    fn hybrid_vector_rescue_survives_long_regions() {
+        // A morphological variant inside a long region must still
+        // hit via per-line chunk scoring (whole-region dilution
+        // used to sink it below the threshold).
+        let mut text = String::from("Item,Qty,Price\n");
+        for i in 0..30 {
+            text.push_str(&format!("Filler{i},1,1\n"));
+        }
+        text.push_str("Provision,9,9\n");
+        let wb = parse_delimited("demo", "Sheet1", &text, ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let hits = hybrid.search("provisions", 5);
+        assert_eq!(hits.len(), 1, "chunk scoring must rescue the variant");
+        assert!(hits[0].vector_only);
     }
 
     #[test]

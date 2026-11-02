@@ -3,7 +3,7 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_cell, what_if_in_workbook};
+use gridtalk_graph::eval::{eval_many, what_if_in_workbook};
 use gridtalk_graph::{CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
@@ -146,30 +146,44 @@ impl<'a> Tools<'a> {
                 ToolResult::ok("search", serde_json::json!({"hits": data_hits}), text)
             }
             ToolRequest::Expand { range } => {
-                let node = self
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter(|n| {
-                        matches!(
-                            n.kind,
-                            gridtalk_graph::NodeKind::Region | gridtalk_graph::NodeKind::Column
-                        )
-                    })
-                    .find(|n| n.range.as_ref().map(|r| r.a1()) == Some(range.clone()))
-                    .or_else(|| {
-                        self.graph
-                            .nodes
-                            .iter()
-                            .find(|n| n.range.as_ref().map(|r| r.a1()) == Some(range.clone()))
-                    });
+                // Accept caller spellings (sheet1!a1:b2, $A$1) by
+                // canonicalising through the range parser first.
+                let canonical = parse_range(range).map(|(sheet, r0, c0, r1, c1)| {
+                    gridtalk_graph::RangeRef {
+                        sheet,
+                        r0,
+                        c0,
+                        r1,
+                        c1,
+                    }
+                    .a1()
+                });
+                let wanted = canonical.as_deref().unwrap_or(range.as_str());
+                let nodes_by_id: std::collections::HashMap<usize, &gridtalk_graph::Node> =
+                    self.graph.nodes.iter().map(|n| (n.id, n)).collect();
+                let node =
+                    self.graph
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            matches!(
+                                n.kind,
+                                gridtalk_graph::NodeKind::Region | gridtalk_graph::NodeKind::Column
+                            )
+                        })
+                        .find(|n| n.range.as_ref().map(|r| r.a1()) == Some(wanted.to_string()))
+                        .or_else(|| {
+                            self.graph.nodes.iter().find(|n| {
+                                n.range.as_ref().map(|r| r.a1()) == Some(wanted.to_string())
+                            })
+                        });
                 match node {
                     Some(n) => {
                         let mut edges = Vec::new();
                         let mut lines = vec![format!("node {} ({})", n.id, n.label)];
                         for e in &self.graph.edges {
                             if e.from == n.id {
-                                if let Some(t) = self.graph.nodes.iter().find(|x| x.id == e.to) {
+                                if let Some(t) = nodes_by_id.get(&e.to) {
                                     lines.push(format!(" -{}-> {}", e.kind, t.label));
                                     edges.push(serde_json::json!({
                                         "direction": "out", "kind": e.kind, "label": t.label,
@@ -178,7 +192,7 @@ impl<'a> Tools<'a> {
                                 }
                             }
                             if e.to == n.id {
-                                if let Some(t) = self.graph.nodes.iter().find(|x| x.id == e.from) {
+                                if let Some(t) = nodes_by_id.get(&e.from) {
                                     lines.push(format!(" <-{}- {}", e.kind, t.label));
                                     edges.push(serde_json::json!({
                                         "direction": "in", "kind": e.kind, "label": t.label,
@@ -227,13 +241,22 @@ impl<'a> Tools<'a> {
             ToolRequest::Formulas { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
                     Some(sheet) => {
+                        // One shared evaluator memo across the
+                        // whole range, not a fresh one per cell.
+                        let coords: Vec<(usize, usize)> = (r0..=r1)
+                            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
+                            .filter(|(r, c)| matches!(sheet.get(*r, *c), CellValue::Formula { .. }))
+                            .collect();
+                        let evaluated = eval_many(sheet, &coords);
+                        let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
                         let mut lines = Vec::new();
                         for r in r0..=r1 {
                             for c in c0..=c1 {
                                 if let CellValue::Formula { expr, .. } = sheet.get(r, c) {
-                                    let (value, error) = match eval_cell(sheet, r, c) {
-                                        Ok(v) => (Some(v), None),
+                                    let (_, result) = eval_iter.next().unwrap();
+                                    let (value, error) = match result {
+                                        Ok(v) => (Some(*v), None),
                                         Err(e) => (None, Some(e.to_string())),
                                     };
                                     let cell = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
@@ -414,30 +437,38 @@ fn cell_json(cell: &CellValue) -> serde_json::Value {
 /// Largest range a Cells/Formulas call may materialise.
 pub const MAX_RANGE_CELLS: usize = 10_000;
 
-/// `Sheet1!A1:D4` -> (sheet, r0, c0, r1, c1), 0-based inclusive.
-/// A single cell is a 1x1 range; reversed ranges and ranges over
-/// MAX_RANGE_CELLS are rejected.
-pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
-    let (sheet, rest) = a1.split_once('!')?;
-    if let Some((a, b)) = rest.split_once(':') {
-        let (_, r0, c0) = parse_cell_ref(&format!("{sheet}!{a}"))?;
-        let (_, r1, c1) = parse_cell_ref(&format!("{sheet}!{b}"))?;
-        if r1 < r0 || c1 < c0 {
-            return None;
+/// Split `Sheet!rest` or `'My Sheet'!rest` into (sheet, rest),
+/// honouring the doubled-quote escape inside quoted names.
+fn split_sheet_prefix(a1: &str) -> Option<(String, &str)> {
+    if let Some(rest) = a1.strip_prefix('\'') {
+        let mut name = String::new();
+        let mut idx = 0;
+        let bytes = rest.as_bytes();
+        while idx < bytes.len() {
+            if bytes[idx] == b'\'' {
+                if bytes.get(idx + 1) == Some(&b'\'') {
+                    name.push('\'');
+                    idx += 2;
+                    continue;
+                }
+                // Closing quote must be followed by '!'.
+                let after = &rest[idx + 1..];
+                return after.strip_prefix('!').map(|r| (name, r));
+            }
+            // Push one char (byte-walk is safe: we only split on
+            // ASCII quote/bang boundaries).
+            let ch_len = rest[idx..].chars().next()?.len_utf8();
+            name.push_str(&rest[idx..idx + ch_len]);
+            idx += ch_len;
         }
-        if (r1 - r0 + 1).saturating_mul(c1 - c0 + 1) > MAX_RANGE_CELLS {
-            return None;
-        }
-        Some((sheet.to_string(), r0, c0, r1, c1))
+        None
     } else {
-        let (_, r, c) = parse_cell_ref(a1)?;
-        Some((sheet.to_string(), r, c, r, c))
+        let (sheet, rest) = a1.split_once('!')?;
+        Some((sheet.to_string(), rest))
     }
 }
 
-/// `Sheet1!B2` -> (sheet, row, col), 0-based.
-pub fn parse_cell_ref(a1: &str) -> Option<(String, usize, usize)> {
-    let (sheet, cell) = a1.split_once('!')?;
+fn parse_cell_on_sheet(sheet: &str, cell: &str) -> Option<(usize, usize)> {
     let cell_owned = cell.replace('$', "");
     let cell = cell_owned.as_str();
     let split = cell.find(|c: char| c.is_ascii_digit())?;
@@ -455,9 +486,48 @@ pub fn parse_cell_ref(a1: &str) -> Option<(String, usize, usize)> {
             .checked_mul(26)?
             .checked_add(ch as usize - 'A' as usize + 1)?;
     }
-    Some((sheet.to_string(), row - 1, col - 1))
+    let _ = sheet;
+    Some((row - 1, col - 1))
 }
 
+/// `Sheet1!A1:D4` -> (sheet, r0, c0, r1, c1), 0-based inclusive.
+/// A single cell is a 1x1 range; reversed ranges and ranges over
+/// MAX_RANGE_CELLS are rejected. Quoted sheet names and a
+/// qualified range end (`Sheet1!A1:Sheet1!B2`) are accepted.
+pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
+    let (sheet, rest) = split_sheet_prefix(a1)?;
+    if let Some((a, b)) = rest.split_once(':') {
+        let (r0, c0) = parse_cell_on_sheet(&sheet, a)?;
+        // The end may repeat the sheet qualifier.
+        let b_cell = if b.contains('!') {
+            let (end_sheet, cell) = split_sheet_prefix(b)?;
+            if end_sheet != sheet {
+                return None;
+            }
+            cell
+        } else {
+            b
+        };
+        let (r1, c1) = parse_cell_on_sheet(&sheet, b_cell)?;
+        if r1 < r0 || c1 < c0 {
+            return None;
+        }
+        if (r1 - r0 + 1).saturating_mul(c1 - c0 + 1) > MAX_RANGE_CELLS {
+            return None;
+        }
+        Some((sheet, r0, c0, r1, c1))
+    } else {
+        let (r, c) = parse_cell_on_sheet(&sheet, rest)?;
+        Some((sheet, r, c, r, c))
+    }
+}
+
+/// `Sheet1!B2` -> (sheet, row, col), 0-based.
+pub fn parse_cell_ref(a1: &str) -> Option<(String, usize, usize)> {
+    let (sheet, cell) = split_sheet_prefix(a1)?;
+    let (r, c) = parse_cell_on_sheet(&sheet, cell)?;
+    Some((sheet, r, c))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

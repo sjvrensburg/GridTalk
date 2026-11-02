@@ -7,7 +7,7 @@
 # Prerequisites: cargo, CMake, a C++ toolchain and glslc (Vulkan
 # SDK) — llama-cpp-sys-2 needs all of them to build.
 set -eu
-for tool in cargo cmake glslc; do
+for tool in cargo cmake glslc cc c++; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing prerequisite: $tool (install Rust, CMake and the Vulkan SDK/glslc first)" >&2
     exit 1

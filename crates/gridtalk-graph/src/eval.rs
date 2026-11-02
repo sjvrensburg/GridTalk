@@ -57,6 +57,9 @@ pub fn eval_cell_in_workbook(
 struct EvalState {
     visited: BTreeSet<(usize, usize, usize)>,
     memo: std::collections::HashMap<(usize, usize, usize), f64>,
+    /// A single simulated cell override (what-if), applied without
+    /// cloning the workbook.
+    override_cell: Option<(usize, usize, usize, f64)>,
 }
 
 fn eval_cell_inner(
@@ -73,6 +76,11 @@ fn eval_cell_inner(
         )));
     }
     let key = (sheet_idx, row, col);
+    if let Some((os, orow, ocol, value)) = state.override_cell {
+        if (os, orow, ocol) == key {
+            return Ok(value);
+        }
+    }
     if let Some(v) = state.memo.get(&key) {
         return Ok(*v);
     }
@@ -163,7 +171,7 @@ impl<'a> Parser<'a> {
         c
     }
     fn skip_ws(&mut self) {
-        while self.peek() == Some(' ') {
+        while matches!(self.peek(), Some(c) if c.is_whitespace()) {
             self.pos += 1;
         }
     }
@@ -399,8 +407,10 @@ impl<'a> Parser<'a> {
         }
         let digits: String = self.chars[start..self.pos].iter().collect();
         let row1: usize = digits.parse().map_err(|_| EvalError::Ref(digits.clone()))?;
-        if row1 == 0 {
-            return Err(EvalError::Ref("row 0".into()));
+        if row1 == 0 || row1 > 1_048_576 {
+            return Err(EvalError::Ref(format!(
+                "row {row1} is outside the Excel grid"
+            )));
         }
         let mut col = 0usize;
         for c in letters
@@ -415,8 +425,10 @@ impl<'a> Parser<'a> {
                 .and_then(|v| v.checked_add(c as usize - 'A' as usize + 1))
                 .ok_or_else(|| EvalError::Ref("column too large".into()))?;
         }
-        if col == 0 {
-            return Err(EvalError::Ref(format!("{letters} has no column")));
+        if col == 0 || col > 16_384 {
+            return Err(EvalError::Ref(format!(
+                "{letters} is outside the Excel grid (max column XFD)"
+            )));
         }
         Ok((format!("{letters}{digits}"), row1 - 1, col - 1))
     }
@@ -441,6 +453,24 @@ impl<'a> Parser<'a> {
         Ok((target, row, col))
     }
 
+    /// Push one scalar argument, except that a lone reference to an
+    /// empty cell contributes nothing to an aggregate (COUNT of an
+    /// empty cell is 0, AVERAGE ignores it) — matching range args.
+    fn push_scalar(&mut self, values: &mut Vec<f64>) -> Result<(), EvalError> {
+        let save = self.pos;
+        if let Ok((t, r, c)) = self.parse_ref_token() {
+            self.skip_ws();
+            if matches!(self.peek(), Some(',') | Some(')'))
+                && matches!(self.sheets[t].get(r, c), CellValue::Empty)
+            {
+                return Ok(());
+            }
+        }
+        self.pos = save;
+        values.push(self.parse_expr()?);
+        Ok(())
+    }
+
     fn parse_function(&mut self, name: &str) -> Result<f64, EvalError> {
         // One range or a comma list of expressions.
         let mut values: Vec<f64> = Vec::new();
@@ -459,7 +489,12 @@ impl<'a> Parser<'a> {
                             "range of {area} cells exceeds the 100000-cell evaluation cap"
                         )));
                     }
-                    let _ = t1;
+                    if t1 != t0 {
+                        return Err(EvalError::Parse(
+                            "range ends on a different sheet than it starts;                              qualify only the start (Sheet2!A1:B2)"
+                                .into(),
+                        ));
+                    }
                     let range_sheet = t0;
                     for r in r0.min(r1)..=r0.max(r1) {
                         for c in c0.min(c1)..=c0.max(c1) {
@@ -485,11 +520,11 @@ impl<'a> Parser<'a> {
                     }
                 } else {
                     self.pos = save;
-                    values.push(self.parse_expr()?);
+                    self.push_scalar(&mut values)?;
                 }
             } else {
                 self.pos = save;
-                values.push(self.parse_expr()?);
+                self.push_scalar(&mut values)?;
             }
             self.skip_ws();
             match self.bump() {
@@ -527,6 +562,46 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Evaluate a target cell with one simulated override applied,
+/// without cloning the workbook.
+pub fn eval_cell_with_override(
+    wb: &crate::WorkbookSnapshot,
+    override_ref: (&str, usize, usize),
+    value: f64,
+    target_ref: (&str, usize, usize),
+) -> Result<f64, EvalError> {
+    let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
+    let find = |name: &str| {
+        sheets
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| EvalError::Ref(format!("unknown sheet {name}")))
+    };
+    let mut state = EvalState {
+        override_cell: Some((find(override_ref.0)?, override_ref.1, override_ref.2, value)),
+        ..EvalState::default()
+    };
+    eval_cell_inner(
+        &sheets,
+        find(target_ref.0)?,
+        target_ref.1,
+        target_ref.2,
+        &mut state,
+        0,
+    )
+}
+
+/// Evaluate several cells of one sheet sharing a single memo, so
+/// shared precedent chains are walked once across the batch.
+pub fn eval_many(sheet: &SheetSnapshot, coords: &[(usize, usize)]) -> Vec<Result<f64, EvalError>> {
+    let sheets: Vec<&SheetSnapshot> = vec![sheet];
+    let mut state = EvalState::default();
+    coords
+        .iter()
+        .map(|(r, c)| eval_cell_inner(&sheets, 0, *r, *c, &mut state, 0))
+        .collect()
+}
+
 /// Workbook what-if: the override and target may live on different
 /// sheets (formulas may reference across sheets). Returns
 /// (before, after) for the target cell.
@@ -550,21 +625,7 @@ pub fn what_if_in_workbook(
         }
     }
     let before = eval_cell_in_workbook(wb, target_ref.0, target_ref.1, target_ref.2)?;
-    let mut cloned = wb.clone();
-    let sheet = cloned
-        .sheets
-        .iter_mut()
-        .find(|s| s.name == override_ref.0)
-        .unwrap();
-    while sheet.cells.len() <= override_ref.1 {
-        sheet.cells.push(Vec::new());
-    }
-    let row = &mut sheet.cells[override_ref.1];
-    while row.len() <= override_ref.2 {
-        row.push(CellValue::Empty);
-    }
-    row[override_ref.2] = CellValue::Number(value);
-    let after = eval_cell_in_workbook(&cloned, target_ref.0, target_ref.1, target_ref.2)?;
+    let after = eval_cell_with_override(wb, override_ref, value, target_ref)?;
     Ok((before, after))
 }
 
@@ -692,6 +753,28 @@ mod tests {
         let (before, after) =
             what_if_in_workbook(&wb, ("Sheet2", 1, 0), 10.0, ("Sheet1", 1, 0)).unwrap();
         assert_eq!((before, after), (42.0, 20.0));
+    }
+
+    #[test]
+    fn eval_regressions_round3() {
+        // Tab whitespace, grid bounds, scalar-empty aggregates.
+        let wb = parse_delimited("d", "S", "A,B\n1,=A2\t+1\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 2.0);
+        let wb = parse_delimited("d", "S", "A\n=AAAA1+1\n", ',');
+        assert!(matches!(
+            eval_cell(&wb.sheets[0], 1, 0),
+            Err(EvalError::Ref(_))
+        ));
+        let wb = parse_delimited("d", "S", "A,B,C\n,=COUNT(A2),=AVERAGE(A2)\n", ',');
+        assert_eq!(eval_cell(&wb.sheets[0], 1, 1).unwrap(), 0.0);
+        assert!(eval_cell(&wb.sheets[0], 1, 2).is_err());
+        // Doubly-qualified range ends are a typed error.
+        let mut wb = parse_delimited("d", "Sheet1", "A\n=SUM(Sheet2!A1:Sheet1!B1)\n", ',');
+        wb.sheets.push(crate::SheetSnapshot {
+            name: "Sheet2".into(),
+            cells: vec![vec![CellValue::Number(5.0)]],
+        });
+        assert!(eval_cell_in_workbook(&wb, "Sheet1", 1, 0).is_err());
     }
 
     #[test]

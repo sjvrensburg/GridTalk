@@ -85,9 +85,13 @@ impl<'a> Reader<'a> {
             ));
         }
         match ty {
-            0 | 1 | 7 => {
+            0 | 1 => {
                 self.take(1)?;
                 Ok(None)
+            }
+            7 => {
+                let b = self.take(1)?[0] != 0;
+                Ok(Some(b.to_string()))
             }
             2 | 3 => {
                 self.take(2)?;
@@ -111,10 +115,19 @@ impl<'a> Reader<'a> {
                         "GGUF array of {count} elements exceeds sanity cap"
                     )));
                 }
+                let mut parts = Vec::new();
                 for _ in 0..count {
-                    self.skip_value_depth(elem, depth + 1)?;
+                    if let Some(v) = self.skip_value_depth(elem, depth + 1)? {
+                        if parts.len() < 8 {
+                            parts.push(v);
+                        }
+                    }
                 }
-                Ok(None)
+                if parts.is_empty() {
+                    Ok(Some(format!("[{count} items]")))
+                } else {
+                    Ok(Some(format!("[{}]", parts.join(", "))))
+                }
             }
             10 => Ok(Some(self.u64()?.to_string())),
             11 => {
@@ -174,7 +187,7 @@ pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
     const HEADER_CAP: u64 = 64 * 1024 * 1024;
     let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::new();
-    let mut window: u64 = 16 * 1024 * 1024;
+    let mut window: u64 = 1024 * 1024;
     loop {
         buf.clear();
         file.seek(std::io::SeekFrom::Start(0))?;
@@ -194,7 +207,7 @@ use std::io::Seek as _;
 
 /// Unique temp file in the cache dir (O_EXCL via create_new, so a
 /// pre-planted symlink at a predictable name is never followed).
-fn unique_tmp(dir: &Path, name: &str) -> Result<PathBuf, ModelError> {
+fn unique_tmp(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), ModelError> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..16 {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -204,7 +217,10 @@ fn unique_tmp(dir: &Path, name: &str) -> Result<PathBuf, ModelError> {
             .create_new(true)
             .open(&candidate)
         {
-            Ok(_) => return Ok(candidate),
+            // Return the live handle: callers write through it and
+            // never reopen the temp by path (which would void the
+            // O_EXCL protection).
+            Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -218,6 +234,18 @@ pub fn model_cache_dir() -> PathBuf {
     if let Ok(d) = std::env::var("GRIDTALK_MODEL_CACHE") {
         if !d.is_empty() {
             return PathBuf::from(d);
+        }
+    }
+    // Platform cache dir: %LOCALAPPDATA% on Windows, $XDG_CACHE_HOME
+    // or ~/.cache elsewhere.
+    if let Ok(d) = std::env::var("LOCALAPPDATA") {
+        if !d.is_empty() {
+            return PathBuf::from(d).join("gridtalk/models");
+        }
+    }
+    if let Ok(d) = std::env::var("XDG_CACHE_HOME") {
+        if !d.is_empty() {
+            return PathBuf::from(d).join("gridtalk/models");
         }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -306,11 +334,11 @@ impl ModelManager {
             .into_owned();
         let name = Self::checked_name(&file_name)?;
         let dest = self.dir.join(&name);
-        let tmp = unique_tmp(&self.dir, &name)?;
+        let (tmp, mut tmp_file) = unique_tmp(&self.dir, &name)?;
         let copy_result = (|| -> Result<u64, ModelError> {
             let mut from = std::fs::File::open(src)?;
-            let mut to = std::fs::File::create(&tmp)?;
-            let n = std::io::copy(&mut from, &mut to)?;
+            let n = std::io::copy(&mut from, &mut tmp_file)?;
+            drop(tmp_file);
             // Re-validate the copied bytes, not just the source
             // (the source may have changed during the copy).
             parse_gguf_file(&tmp)?;
@@ -323,7 +351,9 @@ impl ModelManager {
                 return Err(e);
             }
         };
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, &dest).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         Ok(ModelEntry {
             name,
             path: dest,
@@ -361,14 +391,30 @@ impl ModelManager {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
+        // The total deadline covers connect and headers too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2 * 60 * 60);
         use std::net::ToSocketAddrs as _;
-        let addr = host_port
+        let addrs: Vec<std::net::SocketAddr> = host_port
             .to_socket_addrs()
             .map_err(|e| ModelError::Http(format!("cannot resolve {host_port}: {e}")))?
-            .next()
-            .ok_or_else(|| ModelError::Http(format!("cannot resolve {host_port}")))?;
-        let mut stream =
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))?;
+            .collect();
+        let mut stream = None;
+        let mut last_err: Option<std::io::Error> = None;
+        for addr in &addrs {
+            match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10)) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let mut stream = stream.ok_or_else(|| {
+            ModelError::Http(format!(
+                "cannot connect to {host_port}: {}",
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            ))
+        })?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(60)))
             .ok();
@@ -380,6 +426,11 @@ impl ModelManager {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
+            if std::time::Instant::now() > deadline {
+                return Err(ModelError::Http(
+                    "download exceeded the 2-hour deadline during headers".into(),
+                ));
+            }
             let n = stream.read(&mut byte)?;
             if n == 0 {
                 return Err(ModelError::Http("connection closed in headers".into()));
@@ -409,16 +460,23 @@ impl ModelManager {
                 "chunked download responses are not supported; use a mirror that sends Content-Length".into(),
             ));
         }
+        // Expected size, when the server sends one: a short read
+        // is a truncated model, never a successful download.
+        let content_length: Option<u64> = head_text.lines().find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        });
         std::fs::create_dir_all(&self.dir)?;
         let name = Self::checked_name(name)?;
-        let tmp = unique_tmp(&self.dir, &name)?;
-        // Stream with a hard size cap (64 GiB) and a total deadline
-        // (2 h); the temp file is deleted on any breach.
+        let (tmp, mut out) = unique_tmp(&self.dir, &name)?;
+        // Stream with a hard size cap (64 GiB) and the total
+        // deadline above; the temp file is deleted on any breach.
         const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2 * 60 * 60);
         let copied = (|| -> Result<u64, ModelError> {
-            // unique_tmp already created the file (O_EXCL).
-            let mut out = std::fs::OpenOptions::new().write(true).open(&tmp)?;
             let mut limited = (&mut stream).take(MAX_DOWNLOAD_BYTES + 1);
             let mut buf = [0u8; 64 * 1024];
             let mut total: u64 = 0;
@@ -441,7 +499,17 @@ impl ModelManager {
             Ok(total)
         })();
         let copied = match copied {
-            Ok(n) => n,
+            Ok(n) => {
+                if let Some(expected) = content_length {
+                    if n != expected {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(ModelError::Http(format!(
+                            "truncated download: got {n} of {expected} bytes"
+                        )));
+                    }
+                }
+                n
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
@@ -451,7 +519,9 @@ impl ModelManager {
             let _ = std::fs::remove_file(&tmp);
         })?;
         let dest = self.dir.join(&name);
-        std::fs::rename(&tmp, &dest)?;
+        std::fs::rename(&tmp, &dest).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         Ok(ModelEntry {
             name,
             path: dest,
