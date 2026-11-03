@@ -477,13 +477,10 @@ fn validate_wizard(backend: &str, model_path: &str, base_url: &str) -> Result<()
             Ok(())
         }
         "openai-compatible" => {
-            if base_url.starts_with("https://") {
+            if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
                 return Err(format!(
-                    "https endpoints are not supported (the client speaks plain http;                      put a local proxy in front): {base_url}"
+                    "base URL must start with http:// or https://: {base_url}"
                 ));
-            }
-            if !base_url.starts_with("http://") {
-                return Err(format!("base URL must start with http://: {base_url}"));
             }
             Ok(())
         }
@@ -1719,7 +1716,7 @@ mod tests {
         assert!(validate_wizard("local", "", "").is_err());
         assert!(validate_wizard("local", "/definitely/missing.gguf", "").is_err());
         assert!(validate_wizard("openai-compatible", "", "ftp://x").is_err());
-        assert!(validate_wizard("openai-compatible", "", "https://api.example.com/v1").is_err());
+        assert!(validate_wizard("openai-compatible", "", "https://api.example.com/v1").is_ok());
         assert!(validate_wizard("openai-compatible", "", "http://127.0.0.1:1/v1").is_ok());
 
         // Save must flush a pending (not yet debounced) edit.
