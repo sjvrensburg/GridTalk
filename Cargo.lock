@@ -1644,6 +1644,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gridcraft-calc"
+version = "0.15.0"
+dependencies = [
+ "gridcraft-core",
+ "gridcraft-formula",
+ "gridcraft-functions",
+ "gridcraft-model",
+ "gridcraft-numfmt",
+ "log",
+]
+
+[[package]]
 name = "gridcraft-core"
 version = "0.15.0"
 dependencies = [
@@ -1663,6 +1675,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gridcraft-functions"
+version = "0.15.0"
+dependencies = [
+ "gridcraft-core",
+ "regex",
+]
+
+[[package]]
 name = "gridcraft-model"
 version = "0.15.0"
 dependencies = [
@@ -1672,6 +1692,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "gridcraft-numfmt"
+version = "0.15.0"
+dependencies = [
+ "gridcraft-core",
 ]
 
 [[package]]
@@ -1709,6 +1736,7 @@ dependencies = [
 name = "gridtalk-graph"
 version = "0.1.0"
 dependencies = [
+ "gridcraft-calc",
  "gridcraft-core",
  "gridcraft-model",
  "gridcraft-xlsx",
