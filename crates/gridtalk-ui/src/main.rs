@@ -40,6 +40,14 @@ impl ViewMode {
     }
 }
 
+/// Maximum height of the chat message log.
+const CHAT_LOG_MAX_HEIGHT: f32 = 180.0;
+/// First-frame guess for the whole chat section (separator, heading,
+/// log, input row); replaced by the measured height after one frame.
+const CHAT_AREA_INITIAL_HEIGHT: f32 = 120.0;
+/// The grid never shrinks below this, however tall chat gets.
+const GRID_MIN_HEIGHT: f32 = 120.0;
+
 /// Per-workbook UI preferences, persisted as JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiPrefs {
@@ -295,6 +303,9 @@ pub struct GridTalkApp {
     adapter_card_cache: String,
     active_adapter: String,
     layout_size: (f32, f32),
+    /// Height of the chat section measured last frame; the grid's
+    /// scroll area leaves this much room so chat stays on screen.
+    chat_area_height: f32,
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
@@ -365,6 +376,7 @@ impl Default for GridTalkApp {
             frame_revision: u64::MAX,
             scrolled_for: None,
             layout_size: (0.0, 0.0),
+            chat_area_height: CHAT_AREA_INITIAL_HEIGHT,
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
@@ -1314,8 +1326,15 @@ impl GridTalkApp {
                 sel.sheet.eq_ignore_ascii_case(&sheet_name)
                     && self.scrolled_for.as_deref() != Some(sel.a1().as_str())
             });
+            // Fill the pane but leave room for the chat section below;
+            // without a cap the grid takes all remaining height and
+            // pushes chat out of the window.
+            let grid_max_height =
+                (ui.available_height() - self.chat_area_height).max(GRID_MIN_HEIGHT);
             egui::ScrollArea::both()
+                .id_salt("grid")
                 .auto_shrink([false, false])
+                .max_height(grid_max_height)
                 .show_viewport(ui, |ui, viewport| {
                     ui.set_min_size(egui::vec2(total_w, total_h));
                     let first = ((viewport.min.y / row_height).floor().max(0.0) as usize)
@@ -1445,10 +1464,12 @@ impl GridTalkApp {
             inc.record_edit(edit, std::time::Instant::now());
         }
 
+        let chat_top = ui.cursor().min.y;
         ui.separator();
         ui.heading("Chat");
         egui::ScrollArea::vertical()
-            .max_height(220.0)
+            .id_salt("chat")
+            .max_height(CHAT_LOG_MAX_HEIGHT)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for msg in &self.chat {
@@ -1479,6 +1500,12 @@ impl GridTalkApp {
                 self.ask();
             }
         });
+        let measured = ui.cursor().min.y - chat_top;
+        if (measured - self.chat_area_height).abs() > 0.5 {
+            // Re-layout next frame with the real reservation.
+            self.chat_area_height = measured;
+            ui.ctx().request_repaint();
+        }
     }
 
     fn graph_pane(&mut self, ui: &mut egui::Ui) {
@@ -1504,6 +1531,12 @@ impl GridTalkApp {
             ));
         }
         let painter = ui.painter_at(rect);
+        // Node widgets live in a child UI clipped to the canvas. Placed
+        // directly with `ui.put`, nodes near the edge extend the
+        // parent's used area, and a resizable side panel then grows
+        // to fit them every frame (squeezing the grid in Split mode).
+        let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        canvas.set_clip_rect(rect.intersect(ui.clip_rect()));
         let origin = rect.min;
         for e in &self.graph.edges {
             if let (Some(a), Some(b)) = (self.positions.get(&e.from), self.positions.get(&e.to)) {
@@ -1571,7 +1604,7 @@ impl GridTalkApp {
                 } else {
                     n.label.clone()
                 };
-                let resp = ui
+                let resp = canvas
                     .put(
                         node_rect,
                         egui::Button::new(
