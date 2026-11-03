@@ -7,6 +7,9 @@ use gridtalk_graph::{Graph, NodeKind};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, Sender};
 
+/// Node centres stay at least this far inside the layout area.
+pub const EDGE_MARGIN: f32 = 18.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pos {
     pub x: f32,
@@ -119,10 +122,11 @@ pub fn compute_layout_cancellable(
             let (fx, fy) = force[id];
             let p = pos.get_mut(id).unwrap();
             // Never invert the clamp range on a tiny pane.
-            let max_x = (width - 18.0).max(18.0);
-            let max_y = (height - 18.0).max(18.0);
-            p.x = (p.x + fx.clamp(-12.0, 12.0)).clamp(18.0, max_x);
-            p.y = (p.y + fy.clamp(-12.0, 12.0)).clamp(18.0, max_y);
+            let m = EDGE_MARGIN;
+            let max_x = (width - m).max(m);
+            let max_y = (height - m).max(m);
+            p.x = (p.x + fx.clamp(-12.0, 12.0)).clamp(m, max_x);
+            p.y = (p.y + fy.clamp(-12.0, 12.0)).clamp(m, max_y);
         }
     }
     pos
