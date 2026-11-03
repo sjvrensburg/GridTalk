@@ -32,6 +32,9 @@ pub struct LlamaCppBackend {
     pub temperature: f32,
     /// GPU layers to offload; u32::MAX = everything (Vulkan).
     pub n_gpu_layers: u32,
+    /// Context window cap in tokens; `None` = the model's training
+    /// length (capped at 16 × MAX_CONTEXT).
+    pub n_ctx: Option<u32>,
 }
 
 impl Default for LlamaCppBackend {
@@ -41,6 +44,7 @@ impl Default for LlamaCppBackend {
             seed: 42,
             temperature: 0.7,
             n_gpu_layers: u32::MAX,
+            n_ctx: None,
         }
     }
 }
@@ -204,10 +208,7 @@ impl LlamaCppBackend {
         let vocab = model.vocab();
         // Context comes from the model's own training length, not a
         // hard-coded window; fall back to MAX_CONTEXT when unknown.
-        let context_len = match model.n_ctx_train() {
-            0 => MAX_CONTEXT,
-            n => (n as usize).min(MAX_CONTEXT * 16),
-        };
+        let context_len = context_window(model.n_ctx_train(), self.n_ctx);
         let prompt_tokens = vocab.tokenize(prompt.as_bytes(), true, true);
         if prompt_tokens.is_empty() {
             return Err(InferError::EngineUnavailable("empty prompt".into()));
@@ -458,5 +459,50 @@ pub fn llama_backend_from_config(cfg: &crate::config::InferenceConfig) -> Option
     if let Some(layers) = cfg.n_gpu_layers {
         backend.n_gpu_layers = layers;
     }
+    backend.n_ctx = cfg.n_ctx;
     Some(backend)
+}
+
+/// The usable context window: the model's training length (or
+/// MAX_CONTEXT when unknown), capped at 16 × MAX_CONTEXT, then at the
+/// user's `n_ctx` limit if set. Never below 1 token.
+fn context_window(n_ctx_train: u32, limit: Option<u32>) -> usize {
+    let trained = match n_ctx_train {
+        0 => MAX_CONTEXT,
+        n => (n as usize).min(MAX_CONTEXT * 16),
+    };
+    match limit {
+        Some(cap) => trained.min(cap as usize).max(1),
+        None => trained,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_window_honours_the_configured_cap() {
+        assert_eq!(context_window(0, None), MAX_CONTEXT);
+        assert_eq!(context_window(32_768, None), 32_768);
+        assert_eq!(context_window(1_000_000, None), MAX_CONTEXT * 16);
+        assert_eq!(context_window(32_768, Some(8_192)), 8_192);
+        // A cap above the model's length cannot extend it.
+        assert_eq!(context_window(8_192, Some(32_768)), 8_192);
+        assert_eq!(context_window(8_192, Some(0)), 1);
+    }
+
+    #[test]
+    fn config_sets_gpu_layers_and_context_cap() {
+        let cfg = crate::config::Config::parse(
+            "[inference]\nmodel_path = \"m.gguf\"\nn_gpu_layers = 20\nn_ctx = 8192\n",
+        );
+        let backend = llama_backend_from_config(&cfg.inference).unwrap();
+        assert_eq!(backend.n_gpu_layers, 20);
+        assert_eq!(backend.n_ctx, Some(8192));
+        let cfg = crate::config::Config::parse("[inference]\nmodel_path = \"m.gguf\"\n");
+        let backend = llama_backend_from_config(&cfg.inference).unwrap();
+        assert_eq!(backend.n_gpu_layers, u32::MAX);
+        assert_eq!(backend.n_ctx, None);
+    }
 }
