@@ -42,6 +42,14 @@ embedding, ranges with `vector_only` flags) · `expand` ·
 `get_cells` (typed values) · `list_formulas` (with evaluated
 values) · `what_if` · `graph_overview`.
 
+Formula results are typed like `get_cells` values:
+`list_formulas` entries carry `result` and `what_if` carries
+`before_result`/`after_result`, each `{"type": "number" | "text" |
+"bool", "value": ...}` (`null` when evaluation failed; `error` then
+says why). The older numeric fields (`value`, `before`, `after`)
+stay for compatibility: booleans there are 1/0 and text results are
+`null`, so read the typed fields to see text.
+
 Sessions are invalidated when the file's (mtime, length) stamp
 changes, so edits saved from the GridTalk UI or Gridcraft are
 picked up on the next call. Sessions are capped at 16 open

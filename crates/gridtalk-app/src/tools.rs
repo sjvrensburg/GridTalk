@@ -3,7 +3,7 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_many_in_workbook, what_if_in_workbook};
+use gridtalk_graph::eval::{eval_many_values_in_workbook, what_if_values_in_workbook, Value};
 use gridtalk_graph::{sheet_name_eq, CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
@@ -287,7 +287,7 @@ impl<'a> Tools<'a> {
                             .collect();
                         // Workbook-aware evaluation with one shared
                         // memo (not a fresh EvalState per cell).
-                        let evaluated = eval_many_in_workbook(self.wb, &sheet.name, &coords);
+                        let evaluated = eval_many_values_in_workbook(self.wb, &sheet.name, &coords);
                         let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
                         let mut lines = Vec::new();
@@ -295,20 +295,18 @@ impl<'a> Tools<'a> {
                             for c in c0..=c1 {
                                 if let CellValue::Formula { expr, .. } = sheet.get(r, c) {
                                     let (_, result) = eval_iter.next().unwrap();
-                                    let (value, error) = match result {
-                                        Ok(v) => (Some(*v), None),
-                                        Err(e) => (None, Some(e.to_string())),
-                                    };
                                     let cell = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
-                                    lines.push(format!(
-                                        "{cell} = {expr} -> {}",
-                                        value.map(|v| v.to_string()).unwrap_or_else(|| format!(
-                                            "error: {}",
-                                            error.clone().unwrap_or_default()
-                                        ))
-                                    ));
+                                    let (value, typed, error) = match result {
+                                        Ok(v) => (legacy_number(v), Some(value_json(v)), None),
+                                        Err(e) => (None, None, Some(e.to_string())),
+                                    };
+                                    lines.push(match result {
+                                        Ok(v) => format!("{cell} = {expr} -> {}", v.display()),
+                                        Err(e) => format!("{cell} = {expr} -> error: {e}"),
+                                    });
                                     formulas.push(serde_json::json!({
-                                        "cell": cell, "formula": expr, "value": value, "error": error
+                                        "cell": cell, "formula": expr, "value": value,
+                                        "result": typed, "error": error
                                     }));
                                 }
                             }
@@ -366,7 +364,7 @@ impl<'a> Tools<'a> {
                 // evaluator matches sheet names exactly.
                 let override_sheet = self.sheet(&override_sheet).unwrap().name.clone();
                 let target_sheet = self.sheet(&target_sheet).unwrap().name.clone();
-                match what_if_in_workbook(
+                match what_if_values_in_workbook(
                     self.wb,
                     (&override_sheet, orow, ocol),
                     *value,
@@ -374,8 +372,17 @@ impl<'a> Tools<'a> {
                 ) {
                     Ok((before, after)) => ToolResult::ok(
                         "what_if",
-                        serde_json::json!({"cell": cell, "value": value, "target": target, "before": before, "after": after}),
-                        format!("what-if {cell}={value}: {target} changes {before} -> {after}"),
+                        serde_json::json!({
+                            "cell": cell, "value": value, "target": target,
+                            "before": legacy_number(&before), "after": legacy_number(&after),
+                            "before_result": value_json(&before),
+                            "after_result": value_json(&after)
+                        }),
+                        format!(
+                            "what-if {cell}={value}: {target} changes {} -> {}",
+                            before.display(),
+                            after.display()
+                        ),
                     ),
                     Err(e) => ToolResult::err("what_if", format!("what-if failed: {e}")),
                 }
@@ -505,6 +512,28 @@ fn split_legacy_args(args: &str) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+/// A formula result in the same typed shape `get_cells` uses.
+fn value_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Number(n) => serde_json::json!({"type": "number", "value": n}),
+        Value::Text(s) => serde_json::json!({"type": "text", "value": s}),
+        Value::Bool(b) => serde_json::json!({"type": "bool", "value": b}),
+        Value::Empty => serde_json::json!({"type": "empty"}),
+    }
+}
+
+/// The numeric field (`list_formulas` `value`, `what_if`
+/// `before`/`after`) these tools have always reported: booleans as
+/// 1/0, text as no number (the typed `*result` field carries it).
+fn legacy_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => Some(*n),
+        Value::Bool(b) => Some(f64::from(u8::from(*b))),
+        Value::Empty => Some(0.0),
+        Value::Text(_) => None,
+    }
 }
 
 fn cell_json(cell: &CellValue) -> serde_json::Value {
@@ -652,6 +681,70 @@ mod tests {
     }
 
     #[test]
+    fn text_and_boolean_results_are_typed() {
+        let wb = parse_delimited(
+            "demo",
+            "Sheet1",
+            "Item,Qty,Label,Big\nApples,2,=A2&\" x\"&B2,=B2>5\nPears,=1/0,,\n",
+            ',',
+        );
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+        };
+        let res = tools.call(&ToolRequest::Formulas {
+            range: "Sheet1!A1:D3".into(),
+        });
+        let f = &res.data["formulas"];
+        // C2: text, no legacy number and no error.
+        assert_eq!(f[0]["cell"], "C2");
+        assert!(f[0]["value"].is_null());
+        assert!(f[0]["error"].is_null());
+        assert_eq!(f[0]["result"]["type"], "text");
+        assert_eq!(f[0]["result"]["value"], "Apples x2");
+        // D2: boolean, legacy 0.
+        assert_eq!(f[1]["value"], 0.0);
+        assert_eq!(f[1]["result"]["type"], "bool");
+        assert_eq!(f[1]["result"]["value"], false);
+        // B3: a genuine error has no result.
+        assert_eq!(f[2]["cell"], "B3");
+        assert!(f[2]["result"].is_null());
+        assert!(f[2]["error"].as_str().unwrap().contains("division"));
+        assert!(
+            res.text.contains("C2 = A2&\" x\"&B2 -> Apples x2"),
+            "{}",
+            res.text
+        );
+        assert!(res.text.contains("D2 = B2>5 -> FALSE"), "{}", res.text);
+
+        let whatif = tools.call(&ToolRequest::WhatIf {
+            cell: "B2".into(),
+            value: 7.0,
+            target: "Sheet1!C2".into(),
+        });
+        assert!(whatif.ok, "{}", whatif.text);
+        assert!(whatif.data["before"].is_null());
+        assert_eq!(whatif.data["before_result"]["value"], "Apples x2");
+        assert_eq!(whatif.data["after_result"]["value"], "Apples x7");
+        assert!(
+            whatif.text.contains("Apples x2 -> Apples x7"),
+            "{}",
+            whatif.text
+        );
+        let whatif = tools.call(&ToolRequest::WhatIf {
+            cell: "B2".into(),
+            value: 7.0,
+            target: "Sheet1!D2".into(),
+        });
+        assert_eq!(whatif.data["before"], 0.0);
+        assert_eq!(whatif.data["after"], 1.0);
+        assert_eq!(whatif.data["after_result"]["value"], true);
+    }
+
+    #[test]
     fn typed_calls_return_structured_data() {
         let (wb, g, hybrid) = fixture();
         let tools = Tools {
@@ -669,6 +762,8 @@ mod tests {
             range: "Sheet1!A1:D3".into(),
         });
         assert_eq!(formulas.data["formulas"][0]["value"], 6.0);
+        assert_eq!(formulas.data["formulas"][0]["result"]["type"], "number");
+        assert_eq!(formulas.data["formulas"][0]["result"]["value"], 6.0);
         let whatif = tools.call(&ToolRequest::WhatIf {
             cell: "B2".into(),
             value: 10.0,
@@ -676,6 +771,8 @@ mod tests {
         });
         assert_eq!(whatif.data["before"], 6.0);
         assert_eq!(whatif.data["after"], 30.0);
+        assert_eq!(whatif.data["after_result"]["type"], "number");
+        assert_eq!(whatif.data["after_result"]["value"], 30.0);
         // Legacy wrapper agrees with the typed path.
         assert!(tools.execute("search", "q=provision").contains("Sheet1!"));
         // An override naming another sheet is honoured (and a
