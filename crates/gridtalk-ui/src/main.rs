@@ -10,6 +10,7 @@ use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
     valid_adapter_name,
 };
+use gridtalk_graph::eval::EvalError;
 use gridtalk_graph::{
     build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
 };
@@ -18,7 +19,8 @@ use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -40,6 +42,16 @@ impl ViewMode {
     }
 }
 
+/// Size of a graph node button.
+const GRAPH_NODE_SIZE: egui::Vec2 = egui::vec2(120.0, 18.0);
+/// Maximum height of the chat message log.
+const CHAT_LOG_MAX_HEIGHT: f32 = 180.0;
+/// First-frame guess for the whole chat section (separator, heading,
+/// log, input row); replaced by the measured height after one frame.
+const CHAT_AREA_INITIAL_HEIGHT: f32 = 120.0;
+/// The grid never shrinks below this, however tall chat gets.
+const GRID_MIN_HEIGHT: f32 = 120.0;
+
 /// Per-workbook UI preferences, persisted as JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiPrefs {
@@ -51,6 +63,12 @@ pub struct UiPrefs {
     /// Active adapter name ("" = none).
     #[serde(default)]
     pub active_adapter: String,
+    /// Show formula text in formula cells instead of their results.
+    #[serde(default)]
+    pub show_formulas: bool,
+    /// Read-only mode: cells cannot be edited and saving is off.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// GridTalk's config directory: `$GRIDTALK_CONFIG_DIR` when set,
@@ -185,6 +203,14 @@ impl UiPrefs {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                prefs.show_formulas = value
+                    .get("show_formulas")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                prefs.read_only = value
+                    .get("read_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 prefs
             }),
             Err(_) => UiPrefs::default(),
@@ -288,6 +314,13 @@ pub struct GridTalkApp {
     edit_buffers: BTreeMap<(usize, usize, usize), String>,
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
+    /// Computed results of formula cells on the current sheet, keyed
+    /// by (row, col): `Ok(display text)` or `Err(reason)`. Valid for
+    /// `value_cache_key` = (snapshot revision, sheet index).
+    value_cache: HashMap<(usize, usize), Result<String, String>>,
+    value_cache_key: Option<(u64, usize)>,
+    /// Read-only forced by `--read-only`: the toggle is disabled.
+    read_only_locked: bool,
     frame_revision: u64,
     scrolled_for: Option<String>,
     show_adapters: bool,
@@ -295,6 +328,9 @@ pub struct GridTalkApp {
     adapter_card_cache: String,
     active_adapter: String,
     layout_size: (f32, f32),
+    /// Height of the chat section measured last frame; the grid's
+    /// scroll area leaves this much room so chat stays on screen.
+    chat_area_height: f32,
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
@@ -362,9 +398,13 @@ impl Default for GridTalkApp {
             edit_buffers: BTreeMap::new(),
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
+            value_cache: HashMap::new(),
+            value_cache_key: None,
+            read_only_locked: false,
             frame_revision: u64::MAX,
             scrolled_for: None,
             layout_size: (0.0, 0.0),
+            chat_area_height: CHAT_AREA_INITIAL_HEIGHT,
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
@@ -528,6 +568,10 @@ impl GridTalkApp {
                 self.selected_sheet = 0;
                 self.edit_buffers.clear();
                 self.frame_revision = u64::MAX;
+                // A new snapshot restarts at revision 0: never reuse
+                // the previous workbook's computed results.
+                self.value_cache.clear();
+                self.value_cache_key = None;
                 // Chat (and any in-flight answer) belongs to the old
                 // workbook; never land its reply in the new one.
                 if let Some(cancel) = &self.chat_cancel {
@@ -690,7 +734,16 @@ impl GridTalkApp {
         });
     }
 
+    /// Read-only from prefs, or locked on by `--read-only`.
+    fn is_read_only(&self) -> bool {
+        self.prefs.read_only || self.read_only_locked
+    }
+
     fn save(&mut self) {
+        if self.is_read_only() {
+            self.status = "Read-only mode is on: saving is disabled.".into();
+            return;
+        }
         let Some(path) = self.current_path.clone() else {
             self.status = "Nothing to save: open a workbook first, or use Save As.".into();
             return;
@@ -699,6 +752,10 @@ impl GridTalkApp {
     }
 
     fn save_as(&mut self, path: &std::path::Path) {
+        if self.is_read_only() {
+            self.status = "Read-only mode is on: saving is disabled.".into();
+            return;
+        }
         // If the chosen name has no usable extension, default to
         // .xlsx rather than failing in save_to.
         let path = if matches!(
@@ -769,6 +826,77 @@ impl GridTalkApp {
             .map(|inc| inc.revision != self.saved_revision || inc.pending_edits() > 0)
             .unwrap_or(false)
     }
+}
+
+/// Display text for a formula cell's result: the computed number,
+/// else — for formulas the numeric evaluator cannot handle (parse or
+/// type errors: unsupported functions, text results) — the value
+/// cached in the file (e.g. by Excel), else the evaluation error
+/// (shown as `#ERR` with the reason on hover). Genuine errors
+/// (cycles, bad references, depth) are never masked by a possibly
+/// stale cached value.
+fn formula_display(
+    result: Result<f64, EvalError>,
+    cached: Option<&gridtalk_graph::CellValue>,
+) -> Result<String, String> {
+    match (result, cached) {
+        (Ok(n), _) => Ok(gridtalk_graph::CellValue::Number(n).display()),
+        // The evaluator is numeric-only: parse errors (unsupported
+        // functions) and type errors (e.g. a formula returning text)
+        // fall back to the file's cached value. Cycles, bad references
+        // and depth errors are genuine and always show as #ERR.
+        (Err(EvalError::Parse(_) | EvalError::Type(_)), Some(c)) if !c.is_empty() => {
+            Ok(c.display())
+        }
+        (Err(e), _) => Err(e.to_string()),
+    }
+}
+
+/// A non-editable grid cell (read-only mode, or a formula result):
+/// painted like an editor, clickable to select.
+fn display_cell(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    text: &str,
+    selected: bool,
+    is_formula: bool,
+    error: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.visuals();
+    let fill = if selected {
+        egui::Color32::from_rgb(74, 62, 0)
+    } else {
+        visuals.extreme_bg_color
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, fill);
+    if resp.hovered() {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            visuals.widgets.hovered.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let colour = if error {
+        egui::Color32::from_rgb(230, 110, 110)
+    } else if selected {
+        egui::Color32::YELLOW
+    } else if is_formula {
+        // Computed results read slightly differently from inputs.
+        egui::Color32::from_rgb(150, 200, 255)
+    } else {
+        egui::Color32::LIGHT_GRAY
+    };
+    painter.text(
+        rect.left_center() + egui::vec2(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::TextStyle::Body.resolve(ui.style()),
+        colour,
+    );
+    resp
 }
 
 fn cell_input_text(cell: &gridtalk_graph::CellValue) -> String {
@@ -976,10 +1104,18 @@ impl eframe::App for GridTalkApp {
                     }
                 }
                 let save_label = if self.dirty() { "Save ●" } else { "Save" };
-                if ui.button(save_label).clicked() {
+                if ui
+                    .add_enabled(!self.is_read_only(), egui::Button::new(save_label))
+                    .on_disabled_hover_text("Read-only mode is on")
+                    .clicked()
+                {
                     self.save();
                 }
-                if ui.button("Save As…").clicked() {
+                if ui
+                    .add_enabled(!self.is_read_only(), egui::Button::new("Save As…"))
+                    .on_disabled_hover_text("Read-only mode is on")
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Excel workbook", &["xlsx"])
                         .add_filter("CSV", &["csv"])
@@ -1037,6 +1173,33 @@ impl eframe::App for GridTalkApp {
                             self.prefs.save();
                         }
                     }
+                }
+                ui.separator();
+                // Values (computed results) vs Formulas (formula text).
+                let view_label = if self.prefs.show_formulas {
+                    "Showing: Formulas"
+                } else {
+                    "Showing: Values"
+                };
+                if ui
+                    .button(view_label)
+                    .on_hover_text("Switch formula cells between computed values and formula text")
+                    .clicked()
+                {
+                    self.prefs.show_formulas = !self.prefs.show_formulas;
+                    self.prefs.save();
+                }
+                let mut read_only = self.is_read_only();
+                let toggle = ui
+                    .add_enabled(
+                        !self.read_only_locked,
+                        egui::Checkbox::new(&mut read_only, "Read-only"),
+                    )
+                    .on_hover_text("Cells cannot be edited and saving is off")
+                    .on_disabled_hover_text("Locked on by --read-only");
+                if toggle.changed() {
+                    self.prefs.read_only = read_only;
+                    self.prefs.save();
                 }
                 ui.separator();
                 if ui.button("Settings").clicked() {
@@ -1305,6 +1468,17 @@ impl GridTalkApp {
             // virtualised: only the visible row/column window is
             // built, with spacers preserving the scroll extent.
             let col_w = 90.0f32;
+            let read_only = self.is_read_only();
+            let show_formulas = self.prefs.show_formulas;
+            // Results are cached per (revision, sheet); visible cells
+            // missing from the cache are evaluated after this frame.
+            let cache_key = (self.frame_revision, sheet_idx);
+            if self.value_cache_key != Some(cache_key) {
+                self.value_cache.clear();
+                self.value_cache_key = Some(cache_key);
+            }
+            let value_cache = &self.value_cache;
+            let mut value_misses: Vec<(usize, usize)> = Vec::new();
             let total_w = 34.0 + display_cols as f32 * col_w;
             let total_h = (display_rows + 1) as f32 * row_height;
             if selected.is_none() {
@@ -1314,8 +1488,15 @@ impl GridTalkApp {
                 sel.sheet.eq_ignore_ascii_case(&sheet_name)
                     && self.scrolled_for.as_deref() != Some(sel.a1().as_str())
             });
+            // Fill the pane but leave room for the chat section below;
+            // without a cap the grid takes all remaining height and
+            // pushes chat out of the window.
+            let grid_max_height =
+                (ui.available_height() - self.chat_area_height).max(GRID_MIN_HEIGHT);
             egui::ScrollArea::both()
+                .id_salt("grid")
                 .auto_shrink([false, false])
+                .max_height(grid_max_height)
                 .show_viewport(ui, |ui, viewport| {
                     ui.set_min_size(egui::vec2(total_w, total_h));
                     let first = ((viewport.min.y / row_height).floor().max(0.0) as usize)
@@ -1374,15 +1555,58 @@ impl GridTalkApp {
                                             && s.contains(r, c)
                                     })
                                     .unwrap_or(false);
+                                let is_formula =
+                                    matches!(cell, gridtalk_graph::CellValue::Formula { .. });
                                 // Index key: no sheet-name String
                                 // allocated per visible cell per frame.
                                 let key = (sheet_idx, r, c);
+                                let editor_id = egui::Id::unique(("grid-cell", key));
+                                // A cell being typed into stays an
+                                // editor even once its debounced edit
+                                // lands as a formula.
+                                let editing = ui.memory(|m| m.has_focus(editor_id));
+                                let show_value = is_formula && !show_formulas && !editing;
+                                if read_only || show_value {
+                                    // Not editable here: a clickable,
+                                    // selectable display cell.
+                                    let (text, error): (Cow<str>, Option<&str>) = if show_value {
+                                        match value_cache.get(&(r, c)) {
+                                            Some(Ok(v)) => (Cow::Borrowed(v), None),
+                                            Some(Err(e)) => (Cow::Borrowed("#ERR"), Some(e)),
+                                            None => {
+                                                value_misses.push((r, c));
+                                                (Cow::Borrowed("…"), None)
+                                            }
+                                        }
+                                    } else {
+                                        (Cow::Owned(cell_input_text(&cell)), None)
+                                    };
+                                    let resp = display_cell(
+                                        ui,
+                                        egui::vec2(col_w, row_height),
+                                        &text,
+                                        is_selected,
+                                        is_formula,
+                                        error.is_some(),
+                                    );
+                                    let resp = match error {
+                                        Some(e) => resp.on_hover_text(e),
+                                        None if show_value && !read_only => resp.on_hover_text(
+                                            "Formula result. Switch to \"Showing: Formulas\" to edit.",
+                                        ),
+                                        None => resp,
+                                    };
+                                    if resp.clicked() {
+                                        clicked_cell = Some((sheet_name.clone(), r, c));
+                                    }
+                                    continue;
+                                }
                                 let buffer = self
                                     .edit_buffers
                                     .entry(key)
                                     .or_insert_with(|| cell_input_text(&cell));
                                 let editor =
-                                    egui::TextEdit::singleline(buffer).text_color(if is_selected {
+                                    egui::TextEdit::singleline(buffer).id(editor_id).text_color(if is_selected {
                                         egui::Color32::YELLOW
                                     } else {
                                         egui::Color32::LIGHT_GRAY
@@ -1437,18 +1661,41 @@ impl GridTalkApp {
             if scroll_target.is_some() {
                 self.scrolled_for = scroll_target.as_ref().map(|sel| sel.a1());
             }
+            if !value_misses.is_empty() {
+                if let Some(inc) = &self.inc {
+                    let results = gridtalk_graph::eval::eval_many_in_workbook(
+                        inc.snapshot(),
+                        &sheet_name,
+                        &value_misses,
+                    );
+                    for ((r, c), result) in value_misses.into_iter().zip(results) {
+                        let cached = match sheet.get(r, c) {
+                            gridtalk_graph::CellValue::Formula { cached, .. } => cached,
+                            _ => None,
+                        };
+                        self.value_cache
+                            .insert((r, c), formula_display(result, cached.as_deref()));
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         if let Some((sheet, r, c)) = clicked_cell {
             self.sync.select_cell(&self.graph, &sheet, r, c);
         }
+        // Read-only cells are not editors, but never record an edit
+        // in read-only mode whatever the source.
+        let pending_edit = pending_edit.filter(|_| !self.is_read_only());
         if let (Some(edit), Some(inc)) = (pending_edit, &mut self.inc) {
             inc.record_edit(edit, std::time::Instant::now());
         }
 
+        let chat_top = ui.cursor().min.y;
         ui.separator();
         ui.heading("Chat");
         egui::ScrollArea::vertical()
-            .max_height(220.0)
+            .id_salt("chat")
+            .max_height(CHAT_LOG_MAX_HEIGHT)
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 for msg in &self.chat {
@@ -1479,32 +1726,49 @@ impl GridTalkApp {
                 self.ask();
             }
         });
+        let measured = ui.cursor().min.y - chat_top;
+        if (measured - self.chat_area_height).abs() > 0.5 {
+            // Re-layout next frame with the real reservation.
+            self.chat_area_height = measured;
+            ui.ctx().request_repaint();
+        }
     }
 
     fn graph_pane(&mut self, ui: &mut egui::Ui) {
         ui.heading("Graph");
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        // The layout keeps node centres a small margin inside its
+        // area, but node buttons are wider than that margin; lay out
+        // in an inset area so edge nodes are not cut off.
+        let inset = (GRAPH_NODE_SIZE.x / 2.0 - layout::EDGE_MARGIN).max(0.0);
+        let layout_rect = rect.shrink2(egui::vec2(inset, 0.0));
         // (Re)spawn layout whenever the graph changed (rebuild
         // clears positions) or on first paint.
         // Respawn when the graph changed OR the pane was resized
         // (positions are absolute to the spawn-time rect).
-        let size_changed = (self.layout_size.0 - rect.width()).abs() > 1.0
-            || (self.layout_size.1 - rect.height()).abs() > 1.0;
+        let size_changed = (self.layout_size.0 - layout_rect.width()).abs() > 1.0
+            || (self.layout_size.1 - layout_rect.height()).abs() > 1.0;
         if (self.positions.len() != self.graph.nodes.len() || size_changed)
             && self.layout_worker.is_none()
         {
-            self.layout_size = (rect.width(), rect.height());
+            self.layout_size = (layout_rect.width(), layout_rect.height());
             self.layout_worker = Some(spawn_layout(
                 self.graph.clone(),
                 self.graph_version,
-                rect.width(),
-                rect.height(),
+                layout_rect.width(),
+                layout_rect.height(),
                 Some(ui.ctx().clone()),
             ));
         }
         let painter = ui.painter_at(rect);
-        let origin = rect.min;
+        // Node widgets live in a child UI clipped to the canvas. Placed
+        // directly with `ui.put`, nodes near the edge extend the
+        // parent's used area, and a resizable side panel then grows
+        // to fit them every frame (squeezing the grid in Split mode).
+        let mut canvas = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        canvas.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let origin = layout_rect.min;
         for e in &self.graph.edges {
             if let (Some(a), Some(b)) = (self.positions.get(&e.from), self.positions.get(&e.to)) {
                 // Cull edges with both ends off the viewport.
@@ -1565,13 +1829,13 @@ impl GridTalkApp {
                     // Off-viewport: no widget this frame.
                     continue;
                 }
-                let node_rect = egui::Rect::from_center_size(centre, egui::vec2(120.0, 18.0));
+                let node_rect = egui::Rect::from_center_size(centre, GRAPH_NODE_SIZE);
                 let label = if n.label.chars().count() > 16 {
                     format!("{}…", n.label.chars().take(16).collect::<String>())
                 } else {
                     n.label.clone()
                 };
-                let resp = ui
+                let resp = canvas
                     .put(
                         node_rect,
                         egui::Button::new(
@@ -1634,8 +1898,20 @@ fn parse_cell_input(text: &str) -> CellValue {
 
 fn main() -> eframe::Result<()> {
     let mut app = GridTalkApp::default();
-    if let Some(path) = std::env::args().nth(1) {
-        app.open(std::path::Path::new(&path));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--read-only") {
+        // Locked on for this session only (never written to prefs): an agent or
+        // kiosk launch cannot be switched back to editing in the UI.
+        app.read_only_locked = true;
+    }
+    for flag in args
+        .iter()
+        .filter(|a| a.starts_with("--") && *a != "--read-only")
+    {
+        eprintln!("gridtalk-ui: warning: ignoring unknown option {flag}");
+    }
+    if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
+        app.open(std::path::Path::new(path));
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 760.0]),
@@ -1722,6 +1998,8 @@ mod tests {
         // Save must flush a pending (not yet debounced) edit.
         let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
         let mut app = GridTalkApp::default();
+        // Independent of the user's saved prefs.
+        app.prefs.read_only = false;
         let mut inc = IncrementalSnapshot::new(wb);
         inc.record_edit(
             CellEdit {
@@ -1772,5 +2050,63 @@ mod tests {
             CellValue::Formula { .. }
         ));
         assert_eq!(parse_cell_input("hi"), CellValue::Text("hi".into()));
+    }
+
+    #[test]
+    fn formula_display_prefers_result_then_cached_value() {
+        assert_eq!(formula_display(Ok(1800.0), None), Ok("1800".to_string()));
+        assert_eq!(formula_display(Ok(2.5), None), Ok("2.5".to_string()));
+        // An unsupported formula falls back to the file's cached value.
+        let cached = CellValue::Text("Q1".into());
+        assert_eq!(
+            formula_display(Err(EvalError::Parse("TEXT()".into())), Some(&cached)),
+            Ok("Q1".to_string())
+        );
+        let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&CellValue::Empty));
+        assert!(err.unwrap_err().contains("circular"));
+        // A text-returning formula (type error) shows Excel's cached text.
+        assert_eq!(
+            formula_display(Err(EvalError::Type("text result".into())), Some(&cached)),
+            Ok("Q1".to_string())
+        );
+        // A genuine error is not masked by a stale cached value.
+        let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&cached));
+        assert!(err.unwrap_err().contains("circular"));
+    }
+
+    #[test]
+    fn view_and_read_only_prefs_persist_and_default_off() {
+        // Older prefs files without the new keys load with both off.
+        let old: UiPrefs = serde_json::from_str(r#"{"mode_by_workbook":{}}"#).unwrap();
+        assert!(!old.show_formulas && !old.read_only);
+        let prefs = UiPrefs {
+            show_formulas: true,
+            read_only: true,
+            ..UiPrefs::default()
+        };
+        let back: UiPrefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert!(back.show_formulas && back.read_only);
+    }
+
+    #[test]
+    fn read_only_blocks_saving_and_edits() {
+        let wb = parse_delimited("d", "Sheet1", "A\n1\n", ',');
+        let mut app = GridTalkApp::default();
+        app.prefs.read_only = false;
+        // --read-only locks the mode for the session without
+        // touching the persisted preference.
+        app.read_only_locked = true;
+        assert!(app.is_read_only());
+        assert!(!app.prefs.read_only);
+        let dir = std::env::temp_dir().join(format!("gt-ui-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.csv");
+        app.inc = Some(IncrementalSnapshot::new(wb));
+        app.current_path = Some(path.clone());
+        app.save();
+        app.save_as(&dir.join("copy.csv"));
+        assert!(!path.exists() && !dir.join("copy.csv").exists());
+        assert!(app.status.contains("Read-only"), "status: {}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
