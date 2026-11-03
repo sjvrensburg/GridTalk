@@ -160,13 +160,24 @@ pub fn eval_cell_in_workbook(
     row: usize,
     col: usize,
 ) -> Result<f64, EvalError> {
+    numeric(eval_cell_value_in_workbook(wb, sheet_name, row, col))
+}
+
+/// Like [`eval_cell_in_workbook`], but returns the cell's value as it
+/// is — number, text or boolean.
+pub fn eval_cell_value_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    sheet_name: &str,
+    row: usize,
+    col: usize,
+) -> Result<Value, EvalError> {
     let sheets: Vec<&SheetSnapshot> = wb.sheets.iter().collect();
     let idx = sheets
         .iter()
         .position(|s| crate::sheet_name_eq(&s.name, sheet_name))
         .ok_or_else(|| EvalError::Ref(format!("unknown sheet {sheet_name}")))?;
     let mut state = EvalState::default();
-    numeric(eval_cell_inner(&sheets, idx, row, col, &mut state, 0))
+    eval_cell_inner(&sheets, idx, row, col, &mut state, 0)
 }
 
 #[derive(Default)]
@@ -1329,6 +1340,22 @@ pub fn eval_cell_with_override(
     value: f64,
     target_ref: (&str, usize, usize),
 ) -> Result<f64, EvalError> {
+    numeric(eval_cell_value_with_override(
+        wb,
+        override_ref,
+        value,
+        target_ref,
+    ))
+}
+
+/// Like [`eval_cell_with_override`], but returns the target's value
+/// as it is — number, text or boolean.
+pub fn eval_cell_value_with_override(
+    wb: &crate::WorkbookSnapshot,
+    override_ref: (&str, usize, usize),
+    value: f64,
+    target_ref: (&str, usize, usize),
+) -> Result<Value, EvalError> {
     if !value.is_finite() {
         return Err(EvalError::Type("what-if value must be finite".into()));
     }
@@ -1350,14 +1377,14 @@ pub fn eval_cell_with_override(
         override_cell: Some((find(override_ref.0)?, override_ref.1, override_ref.2, value)),
         ..EvalState::default()
     };
-    numeric(eval_cell_inner(
+    eval_cell_inner(
         &sheets,
         find(target_ref.0)?,
         target_ref.1,
         target_ref.2,
         &mut state,
         0,
-    ))
+    )
 }
 
 /// Evaluate several cells of one sheet sharing a single memo, so
@@ -1413,13 +1440,26 @@ pub fn eval_many_values_in_workbook(
 
 /// Workbook what-if: the override and target may live on different
 /// sheets (formulas may reference across sheets). Returns
-/// (before, after) for the target cell.
+/// (before, after) for the target cell; a text result is a type
+/// error (see [`what_if_values_in_workbook`] for any value).
 pub fn what_if_in_workbook(
     wb: &crate::WorkbookSnapshot,
     override_ref: (&str, usize, usize),
     value: f64,
     target_ref: (&str, usize, usize),
 ) -> Result<(f64, f64), EvalError> {
+    let (before, after) = what_if_values_in_workbook(wb, override_ref, value, target_ref)?;
+    Ok((numeric(Ok(before))?, numeric(Ok(after))?))
+}
+
+/// Like [`what_if_in_workbook`], but returns the target's values as
+/// they are — number, text or boolean.
+pub fn what_if_values_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    override_ref: (&str, usize, usize),
+    value: f64,
+    target_ref: (&str, usize, usize),
+) -> Result<(Value, Value), EvalError> {
     if !value.is_finite() {
         return Err(EvalError::Type("what-if value must be finite".into()));
     }
@@ -1437,8 +1477,8 @@ pub fn what_if_in_workbook(
             return Err(EvalError::Ref(format!("unknown sheet {sheet}")));
         }
     }
-    let before = eval_cell_in_workbook(wb, target_ref.0, target_ref.1, target_ref.2)?;
-    let after = eval_cell_with_override(wb, override_ref, value, target_ref)?;
+    let before = eval_cell_value_in_workbook(wb, target_ref.0, target_ref.1, target_ref.2)?;
+    let after = eval_cell_value_with_override(wb, override_ref, value, target_ref)?;
     Ok((before, after))
 }
 
