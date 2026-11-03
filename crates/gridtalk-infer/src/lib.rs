@@ -567,8 +567,13 @@ pub mod config {
         pub temperature: Option<f32>,
         #[serde(default)]
         pub seed: Option<u32>,
+        /// Layers to offload to the GPU; unset = all of them.
         #[serde(default)]
         pub n_gpu_layers: Option<u32>,
+        /// Upper bound on the context window in tokens; unset = the
+        /// model's own training length (capped at 64K).
+        #[serde(default)]
+        pub n_ctx: Option<u32>,
     }
 
     fn default_backend() -> String {
@@ -590,6 +595,7 @@ pub mod config {
                 temperature: None,
                 seed: None,
                 n_gpu_layers: None,
+                n_ctx: None,
             }
         }
     }

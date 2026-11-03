@@ -4,13 +4,14 @@
 //! (the Gridcraft `ui-egui` ribbon remains the long-term editor
 //! surface, see docs/decisions/0001).
 
+mod eval_worker;
 mod layout;
 
+use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
     valid_adapter_name,
 };
-use gridtalk_graph::eval::EvalError;
 use gridtalk_graph::{
     build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
 };
@@ -20,7 +21,7 @@ use gridtalk_infer::{backend_from_config, ChatRequest};
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -44,13 +45,16 @@ impl ViewMode {
 
 /// Size of a graph node button.
 const GRAPH_NODE_SIZE: egui::Vec2 = egui::vec2(120.0, 18.0);
-/// Maximum height of the chat message log.
-const CHAT_LOG_MAX_HEIGHT: f32 = 180.0;
-/// First-frame guess for the whole chat section (separator, heading,
-/// log, input row); replaced by the measured height after one frame.
-const CHAT_AREA_INITIAL_HEIGHT: f32 = 120.0;
+/// Initial and minimum height of the chat panel under the grid.
+const CHAT_PANEL_DEFAULT_HEIGHT: f32 = 200.0;
+const CHAT_PANEL_MIN_HEIGHT: f32 = 90.0;
 /// The grid never shrinks below this, however tall chat gets.
 const GRID_MIN_HEIGHT: f32 = 120.0;
+/// Bounds for the llama.cpp settings in the Settings window.
+const LLM_MAX_GPU_LAYERS: u32 = 999;
+const LLM_MIN_N_CTX: u32 = 512;
+const LLM_MAX_N_CTX: u32 = 65_536;
+const LLM_DEFAULT_N_CTX: u32 = 8_192;
 
 /// Per-workbook UI preferences, persisted as JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -303,6 +307,13 @@ pub struct GridTalkApp {
     chat: Vec<ChatMsg>,
     status: String,
     show_settings: bool,
+    /// llama.cpp settings as edited in the Settings window; `None` =
+    /// the backend default (all layers / the model's context).
+    llm_gpu_layers: Option<u32>,
+    llm_n_ctx: Option<u32>,
+    /// Whether the two fields above reflect the config file yet
+    /// (re-read each time Settings opens).
+    llm_settings_loaded: bool,
     config_path: String,
     wizard_step: u8,
     wizard_backend: String,
@@ -314,11 +325,8 @@ pub struct GridTalkApp {
     edit_buffers: BTreeMap<(usize, usize, usize), String>,
     frame_sheet: Option<gridtalk_graph::SheetSnapshot>,
     frame_sheet_idx: usize,
-    /// Computed results of formula cells on the current sheet, keyed
-    /// by (row, col): `Ok(display text)` or `Err(reason)`. Valid for
-    /// `value_cache_key` = (snapshot revision, sheet index).
-    value_cache: HashMap<(usize, usize), Result<String, String>>,
-    value_cache_key: Option<(u64, usize)>,
+    /// Computed formula results, evaluated on a worker thread.
+    values: ValueCache,
     /// Read-only forced by `--read-only`: the toggle is disabled.
     read_only_locked: bool,
     frame_revision: u64,
@@ -328,9 +336,6 @@ pub struct GridTalkApp {
     adapter_card_cache: String,
     active_adapter: String,
     layout_size: (f32, f32),
-    /// Height of the chat section measured last frame; the grid's
-    /// scroll area leaves this much room so chat stays on screen.
-    chat_area_height: f32,
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
@@ -343,7 +348,15 @@ pub struct GridTalkApp {
 
 impl Default for GridTalkApp {
     fn default() -> Self {
-        let mut prefs = UiPrefs::load();
+        GridTalkApp::with_prefs(UiPrefs::load())
+    }
+}
+
+impl GridTalkApp {
+    /// Build the app from explicit preferences. `Default` loads the
+    /// user's saved prefs; tests pass their own so they never depend
+    /// on (or write to) the developer's real `ui-state.json`.
+    pub fn with_prefs(mut prefs: UiPrefs) -> Self {
         // GRIDTALK_CONFIG beats the persisted prefs value (the CLI
         // checks the env first; a wizard-saved path must not
         // silently shadow it).
@@ -387,6 +400,9 @@ impl Default for GridTalkApp {
             chat: Vec::new(),
             status: "Open a workbook (File > Open, or pass a path as argv[1]).".into(),
             show_settings: false,
+            llm_gpu_layers: None,
+            llm_n_ctx: None,
+            llm_settings_loaded: false,
             config_path,
             show_adapters: false,
             adapter_cache: Vec::new(),
@@ -398,13 +414,11 @@ impl Default for GridTalkApp {
             edit_buffers: BTreeMap::new(),
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
-            value_cache: HashMap::new(),
-            value_cache_key: None,
+            values: ValueCache::default(),
             read_only_locked: false,
             frame_revision: u64::MAX,
             scrolled_for: None,
             layout_size: (0.0, 0.0),
-            chat_area_height: CHAT_AREA_INITIAL_HEIGHT,
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
@@ -421,66 +435,74 @@ impl Default for GridTalkApp {
     }
 }
 
-/// Write the wizard's choices to the GridTalk config file.
-fn write_wizard_config(
-    backend: &str,
-    model_path: &str,
-    base_url: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    let dir = UiPrefs::path()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("config.toml");
-    let esc = |s: &str| {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace(['\r', '\n'], " ")
-    };
-    // Merge into any existing config instead of overwriting it:
-    // unrelated keys (model, api_key_env, comments) survive.
-    let mut updates: Vec<(String, String)> = vec![
-        ("backend".into(), esc(backend)),
-        ("engine".into(), "llamacpp".into()),
-    ];
-    if !model_path.is_empty() {
-        updates.push(("model_path".into(), esc(model_path)));
+/// The config file the platform default resolves to
+/// (`<config dir>/config.toml`), as the CLI discovers it.
+fn default_config_file() -> std::path::PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// The config file the app reads: the configured path, else the
+/// platform default.
+fn active_config_file(config_path: &str) -> std::path::PathBuf {
+    if config_path.is_empty() {
+        default_config_file()
+    } else {
+        std::path::PathBuf::from(config_path)
     }
-    if backend == "openai-compatible" {
-        updates.push(("base_url".into(), esc(base_url)));
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+}
+
+/// A TOML basic string literal for `s`.
+fn toml_string(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], " ");
+    format!("\"{escaped}\"")
+}
+
+/// One `[inference]` key: `Some(TOML value text)` sets it, `None`
+/// removes it.
+type ConfigUpdate = (&'static str, Option<String>);
+
+/// Apply `updates` to the `[inference]` table of a config file's
+/// text. Everything else — other keys, other tables, comments — is
+/// kept as written.
+fn merge_inference_config(existing: &str, updates: &[ConfigUpdate]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_inference = false;
     let mut seen_section = false;
     let mut applied: Vec<bool> = vec![false; updates.len()];
+    let flush = |out: &mut Vec<String>, applied: &mut Vec<bool>| {
+        for (i, (k, v)) in updates.iter().enumerate() {
+            if !applied[i] {
+                if let Some(v) = v {
+                    out.push(format!("{k} = {v}"));
+                }
+                applied[i] = true;
+            }
+        }
+    };
     for line in existing.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             if in_inference {
-                // Leaving [inference]: flush unapplied updates first.
-                for (i, (k, v)) in updates.iter().enumerate() {
-                    if !applied[i] {
-                        out.push(format!("{k} = \"{v}\""));
-                        applied[i] = true;
-                    }
-                }
+                // Leaving [inference]: add the keys it did not have.
+                flush(&mut out, &mut applied);
             }
             in_inference = trimmed.split('#').next().map(|h| {
                 h.trim()
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .trim()
-            }) == Some("inference")
-                && trimmed.starts_with('[');
+            }) == Some("inference");
             seen_section |= in_inference;
-        }
-        if in_inference {
+        } else if in_inference {
             if let Some((key, _)) = trimmed.split_once('=') {
                 let key = key.trim();
-                if let Some(i) = updates.iter().position(|(k, _)| k == key) {
-                    out.push(format!("{key} = \"{}\"", updates[i].1));
+                if let Some(i) = updates.iter().position(|(k, _)| *k == key) {
+                    if let (Some(v), false) = (&updates[i].1, applied[i]) {
+                        out.push(format!("{key} = {v}"));
+                    }
                     applied[i] = true;
                     continue;
                 }
@@ -488,15 +510,47 @@ fn write_wizard_config(
         }
         out.push(line.to_string());
     }
-    if !seen_section {
+    if !seen_section && updates.iter().any(|(_, v)| v.is_some()) {
         out.push("[inference]".into());
     }
-    for (i, (k, v)) in updates.iter().enumerate() {
-        if !applied[i] {
-            out.push(format!("{k} = \"{v}\""));
-        }
+    flush(&mut out, &mut applied);
+    out.join("\n") + "\n"
+}
+
+/// Merge `updates` into the config file at `path` (created if
+/// missing), written atomically.
+fn write_inference_config(path: &std::path::Path, updates: &[ConfigUpdate]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
     }
-    write_atomic_bytes(&path, (out.join("\n") + "\n").as_bytes()).map_err(std::io::Error::other)?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Never replace a config we could not read with a fresh one.
+        Err(e) => return Err(e),
+    };
+    let text = merge_inference_config(&existing, updates);
+    write_atomic_bytes(path, text.as_bytes()).map_err(std::io::Error::other)
+}
+
+/// Write the wizard's choices to the GridTalk config file.
+fn write_wizard_config(
+    backend: &str,
+    model_path: &str,
+    base_url: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = default_config_file();
+    let mut updates: Vec<ConfigUpdate> = vec![
+        ("backend", Some(toml_string(backend))),
+        ("engine", Some(toml_string("llamacpp"))),
+    ];
+    if !model_path.is_empty() {
+        updates.push(("model_path", Some(toml_string(model_path))));
+    }
+    if backend == "openai-compatible" {
+        updates.push(("base_url", Some(toml_string(base_url))));
+    }
+    write_inference_config(&path, &updates)?;
     Ok(path)
 }
 
@@ -570,8 +624,7 @@ impl GridTalkApp {
                 self.frame_revision = u64::MAX;
                 // A new snapshot restarts at revision 0: never reuse
                 // the previous workbook's computed results.
-                self.value_cache.clear();
-                self.value_cache_key = None;
+                self.values.clear();
                 // Chat (and any in-flight answer) belongs to the old
                 // workbook; never land its reply in the new one.
                 if let Some(cancel) = &self.chat_cancel {
@@ -734,6 +787,77 @@ impl GridTalkApp {
         });
     }
 
+    /// Load the llama.cpp settings shown in the Settings window from
+    /// the config file in use.
+    fn load_llm_settings(&mut self) {
+        let path = active_config_file(&self.config_path);
+        let cfg = Config::load(&path);
+        // u32::MAX is how the backend spells "all layers".
+        self.llm_gpu_layers = cfg.inference.n_gpu_layers.filter(|&n| n != u32::MAX);
+        self.llm_n_ctx = cfg.inference.n_ctx;
+        self.llm_settings_loaded = true;
+    }
+
+    /// GPU-layer and context-size controls for the local backend.
+    fn llm_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Local model (llama.cpp)");
+        egui::Grid::new("llm-settings")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("GPU layers:");
+                ui.horizontal(|ui| {
+                    let mut all = self.llm_gpu_layers.is_none();
+                    if ui
+                        .checkbox(&mut all, "All")
+                        .on_hover_text("Offload every layer to the GPU (Vulkan).")
+                        .changed()
+                    {
+                        self.llm_gpu_layers = if all { None } else { Some(0) };
+                    }
+                    if let Some(n) = &mut self.llm_gpu_layers {
+                        ui.add(egui::DragValue::new(n).range(0..=LLM_MAX_GPU_LAYERS))
+                            .on_hover_text("0 runs on the CPU only.");
+                    }
+                });
+                ui.end_row();
+                ui.label("Context limit:");
+                ui.horizontal(|ui| {
+                    let mut model = self.llm_n_ctx.is_none();
+                    if ui
+                        .checkbox(&mut model, "Model default")
+                        .on_hover_text("Use the model's training length (up to 64K tokens).")
+                        .changed()
+                    {
+                        self.llm_n_ctx = if model { None } else { Some(LLM_DEFAULT_N_CTX) };
+                    }
+                    if let Some(n) = &mut self.llm_n_ctx {
+                        ui.add(
+                            egui::DragValue::new(n)
+                                .range(LLM_MIN_N_CTX..=LLM_MAX_N_CTX)
+                                .speed(256)
+                                .suffix(" tokens"),
+                        );
+                    }
+                });
+                ui.end_row();
+            });
+        ui.weak("Lower these if the model does not fit in GPU memory.");
+        if ui.button("Save model settings").clicked() {
+            let path = active_config_file(&self.config_path);
+            let updates: [ConfigUpdate; 2] = [
+                ("n_gpu_layers", self.llm_gpu_layers.map(|n| n.to_string())),
+                ("n_ctx", self.llm_n_ctx.map(|n| n.to_string())),
+            ];
+            self.status = match write_inference_config(&path, &updates) {
+                Ok(()) => format!(
+                    "Model settings saved to {}; they apply to the next question.",
+                    path.display()
+                ),
+                Err(e) => format!("Could not save model settings to {}: {e}", path.display()),
+            };
+        }
+    }
+
     /// Read-only from prefs, or locked on by `--read-only`.
     fn is_read_only(&self) -> bool {
         self.prefs.read_only || self.read_only_locked
@@ -825,30 +949,6 @@ impl GridTalkApp {
             .as_ref()
             .map(|inc| inc.revision != self.saved_revision || inc.pending_edits() > 0)
             .unwrap_or(false)
-    }
-}
-
-/// Display text for a formula cell's result: the computed number,
-/// else — for formulas the numeric evaluator cannot handle (parse or
-/// type errors: unsupported functions, text results) — the value
-/// cached in the file (e.g. by Excel), else the evaluation error
-/// (shown as `#ERR` with the reason on hover). Genuine errors
-/// (cycles, bad references, depth) are never masked by a possibly
-/// stale cached value.
-fn formula_display(
-    result: Result<f64, EvalError>,
-    cached: Option<&gridtalk_graph::CellValue>,
-) -> Result<String, String> {
-    match (result, cached) {
-        (Ok(n), _) => Ok(gridtalk_graph::CellValue::Number(n).display()),
-        // The evaluator is numeric-only: parse errors (unsupported
-        // functions) and type errors (e.g. a formula returning text)
-        // fall back to the file's cached value. Cycles, bad references
-        // and depth errors are genuine and always show as #ERR.
-        (Err(EvalError::Parse(_) | EvalError::Type(_)), Some(c)) if !c.is_empty() => {
-            Ok(c.display())
-        }
-        (Err(e), _) => Err(e.to_string()),
     }
 }
 
@@ -1072,6 +1172,10 @@ impl eframe::App for GridTalkApp {
                 self.frame_sheet_idx = self.selected_sheet;
                 self.frame_revision = inc.revision;
             }
+        }
+        // Collect finished formula results.
+        if self.values.poll() {
+            ctx.request_repaint();
         }
         // Collect finished layouts.
         if let Some(worker) = &self.layout_worker {
@@ -1373,6 +1477,9 @@ impl eframe::App for GridTalkApp {
         }
 
         if self.show_settings {
+            if !self.llm_settings_loaded {
+                self.load_llm_settings();
+            }
             egui::Window::new("Settings").show(&ctx, |ui| {
                 ui.label("Config file (blank = platform config dir, else local echo backend):");
                 let resp = ui.text_edit_singleline(&mut self.config_path);
@@ -1381,13 +1488,19 @@ impl eframe::App for GridTalkApp {
                 if resp.lost_focus() {
                     self.prefs.config_path = self.config_path.clone();
                     self.prefs.save();
+                    // Show the model settings of the file now in use.
+                    self.llm_settings_loaded = false;
                 }
                 ui.label("External endpoints receive cell values verbatim.");
                 ui.label("For sensitive workbooks, use a local model.");
+                ui.separator();
+                self.llm_settings_ui(ui);
+                ui.separator();
                 if ui.button("Close").clicked() {
                     self.prefs.config_path = self.config_path.clone();
                     self.prefs.save();
                     self.show_settings = false;
+                    self.llm_settings_loaded = false;
                 }
             });
         }
@@ -1420,6 +1533,16 @@ impl eframe::App for GridTalkApp {
 
 impl GridTalkApp {
     fn grid_and_chat(&mut self, ui: &mut egui::Ui) {
+        // Chat is a resizable bottom panel; egui reserves its space
+        // before the grid lays out, so the grid fills the rest and
+        // can never push chat off screen.
+        let max_chat = (ui.available_height() - GRID_MIN_HEIGHT).max(CHAT_PANEL_MIN_HEIGHT);
+        egui::Panel::bottom("chat")
+            .resizable(true)
+            .default_size(CHAT_PANEL_DEFAULT_HEIGHT.min(max_chat))
+            .min_size(CHAT_PANEL_MIN_HEIGHT)
+            .max_size(max_chat)
+            .show(ui, |ui| self.chat_section(ui));
         // Collect edits/clicks while rendering; apply after.
         let mut pending_edit: Option<CellEdit> = None;
         let mut clicked_cell: Option<(String, usize, usize)> = None;
@@ -1470,14 +1593,11 @@ impl GridTalkApp {
             let col_w = 90.0f32;
             let read_only = self.is_read_only();
             let show_formulas = self.prefs.show_formulas;
-            // Results are cached per (revision, sheet); visible cells
-            // missing from the cache are evaluated after this frame.
-            let cache_key = (self.frame_revision, sheet_idx);
-            if self.value_cache_key != Some(cache_key) {
-                self.value_cache.clear();
-                self.value_cache_key = Some(cache_key);
-            }
-            let value_cache = &self.value_cache;
+            // Visible formula cells without a result for this revision
+            // are sent to the evaluation worker after this frame; until
+            // then they keep the previous result (or "…").
+            let revision = self.frame_revision;
+            let values = &self.values;
             let mut value_misses: Vec<(usize, usize)> = Vec::new();
             let total_w = 34.0 + display_cols as f32 * col_w;
             let total_h = (display_rows + 1) as f32 * row_height;
@@ -1488,15 +1608,9 @@ impl GridTalkApp {
                 sel.sheet.eq_ignore_ascii_case(&sheet_name)
                     && self.scrolled_for.as_deref() != Some(sel.a1().as_str())
             });
-            // Fill the pane but leave room for the chat section below;
-            // without a cap the grid takes all remaining height and
-            // pushes chat out of the window.
-            let grid_max_height =
-                (ui.available_height() - self.chat_area_height).max(GRID_MIN_HEIGHT);
             egui::ScrollArea::both()
                 .id_salt("grid")
                 .auto_shrink([false, false])
-                .max_height(grid_max_height)
                 .show_viewport(ui, |ui, viewport| {
                     ui.set_min_size(egui::vec2(total_w, total_h));
                     let first = ((viewport.min.y / row_height).floor().max(0.0) as usize)
@@ -1570,13 +1684,23 @@ impl GridTalkApp {
                                     // Not editable here: a clickable,
                                     // selectable display cell.
                                     let (text, error): (Cow<str>, Option<&str>) = if show_value {
-                                        match value_cache.get(&(r, c)) {
-                                            Some(Ok(v)) => (Cow::Borrowed(v), None),
-                                            Some(Err(e)) => (Cow::Borrowed("#ERR"), Some(e)),
-                                            None => {
+                                        let result = match values.get(key, revision) {
+                                            Lookup::Fresh(v) => Some(v),
+                                            Lookup::Stale(v) => {
                                                 value_misses.push((r, c));
-                                                (Cow::Borrowed("…"), None)
+                                                Some(v)
                                             }
+                                            Lookup::Missing => {
+                                                value_misses.push((r, c));
+                                                None
+                                            }
+                                        };
+                                        match result {
+                                            Some(Ok(v)) => (Cow::Borrowed(v.as_str()), None),
+                                            Some(Err(e)) => {
+                                                (Cow::Borrowed("#ERR"), Some(e.as_str()))
+                                            }
+                                            None => (Cow::Borrowed("…"), None),
                                         }
                                     } else {
                                         (Cow::Owned(cell_input_text(&cell)), None)
@@ -1661,23 +1785,16 @@ impl GridTalkApp {
             if scroll_target.is_some() {
                 self.scrolled_for = scroll_target.as_ref().map(|sel| sel.a1());
             }
-            if !value_misses.is_empty() {
-                if let Some(inc) = &self.inc {
-                    let results = gridtalk_graph::eval::eval_many_in_workbook(
-                        inc.snapshot(),
-                        &sheet_name,
-                        &value_misses,
-                    );
-                    for ((r, c), result) in value_misses.into_iter().zip(results) {
-                        let cached = match sheet.get(r, c) {
-                            gridtalk_graph::CellValue::Formula { cached, .. } => cached,
-                            _ => None,
-                        };
-                        self.value_cache
-                            .insert((r, c), formula_display(result, cached.as_deref()));
-                    }
-                    ui.ctx().request_repaint();
-                }
+            // `frame_sheet` is refreshed whenever the revision changes,
+            // so the snapshot here is at `revision`.
+            if let Some(inc) = self.inc.as_ref().filter(|i| i.revision == revision) {
+                self.values.request(
+                    inc.snapshot(),
+                    revision,
+                    sheet_idx,
+                    value_misses,
+                    Some(ui.ctx().clone()),
+                );
             }
         }
         if let Some((sheet, r, c)) = clicked_cell {
@@ -1689,49 +1806,49 @@ impl GridTalkApp {
         if let (Some(edit), Some(inc)) = (pending_edit, &mut self.inc) {
             inc.record_edit(edit, std::time::Instant::now());
         }
+    }
 
-        let chat_top = ui.cursor().min.y;
-        ui.separator();
+    /// Chat log and input, drawn in the bottom panel under the grid.
+    fn chat_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Chat");
-        egui::ScrollArea::vertical()
-            .id_salt("chat")
-            .max_height(CHAT_LOG_MAX_HEIGHT)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for msg in &self.chat {
-                    ui.label(format!("{}: {}", msg.role, msg.text));
-                }
-                if self.chat_busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Generating… (on a worker thread; the grid stays live)");
-                        if ui.button("Cancel").clicked() {
-                            if let Some(cancel) = &self.chat_cancel {
-                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            self.status = "Cancelling generation…".into();
-                        }
-                    });
+        // Input row pinned to the bottom, log filling the rest: the
+        // content always uses the panel's full height, so egui never
+        // shrinks the panel to fit it.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.horizontal(|ui| {
+                let resp = ui.text_edit_singleline(&mut self.chat_input);
+                let ask_enabled = !self.chat_input.is_empty() && !self.chat_busy;
+                if (ui
+                    .add_enabled(ask_enabled, egui::Button::new("Ask"))
+                    .clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                    && ask_enabled
+                {
+                    self.ask();
                 }
             });
-        ui.horizontal(|ui| {
-            let resp = ui.text_edit_singleline(&mut self.chat_input);
-            let ask_enabled = !self.chat_input.is_empty() && !self.chat_busy;
-            if (ui
-                .add_enabled(ask_enabled, egui::Button::new("Ask"))
-                .clicked()
-                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
-                && ask_enabled
-            {
-                self.ask();
-            }
+            egui::ScrollArea::vertical()
+                .id_salt("chat")
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for msg in &self.chat {
+                        ui.label(format!("{}: {}", msg.role, msg.text));
+                    }
+                    if self.chat_busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Generating… (on a worker thread; the grid stays live)");
+                            if ui.button("Cancel").clicked() {
+                                if let Some(cancel) = &self.chat_cancel {
+                                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                self.status = "Cancelling generation…".into();
+                            }
+                        });
+                    }
+                });
         });
-        let measured = ui.cursor().min.y - chat_top;
-        if (measured - self.chat_area_height).abs() > 0.5 {
-            // Re-layout next frame with the real reservation.
-            self.chat_area_height = measured;
-            ui.ctx().request_repaint();
-        }
     }
 
     fn graph_pane(&mut self, ui: &mut egui::Ui) {
@@ -1997,9 +2114,7 @@ mod tests {
 
         // Save must flush a pending (not yet debounced) edit.
         let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
-        let mut app = GridTalkApp::default();
-        // Independent of the user's saved prefs.
-        app.prefs.read_only = false;
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
         let mut inc = IncrementalSnapshot::new(wb);
         inc.record_edit(
             CellEdit {
@@ -2053,25 +2168,30 @@ mod tests {
     }
 
     #[test]
-    fn formula_display_prefers_result_then_cached_value() {
-        assert_eq!(formula_display(Ok(1800.0), None), Ok("1800".to_string()));
-        assert_eq!(formula_display(Ok(2.5), None), Ok("2.5".to_string()));
-        // An unsupported formula falls back to the file's cached value.
-        let cached = CellValue::Text("Q1".into());
-        assert_eq!(
-            formula_display(Err(EvalError::Parse("TEXT()".into())), Some(&cached)),
-            Ok("Q1".to_string())
+    fn inference_config_merge_sets_removes_and_keeps_the_rest() {
+        let existing =
+            "# mine\n[inference]\nbackend = \"local\"\nn_gpu_layers = 10\n\n[other]\nx = 1\n";
+        let merged = merge_inference_config(
+            existing,
+            &[("n_gpu_layers", None), ("n_ctx", Some("8192".into()))],
         );
-        let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&CellValue::Empty));
-        assert!(err.unwrap_err().contains("circular"));
-        // A text-returning formula (type error) shows Excel's cached text.
+        let cfg = Config::parse(&merged);
+        assert_eq!(cfg.inference.backend, "local");
+        assert_eq!(cfg.inference.n_gpu_layers, None);
+        assert_eq!(cfg.inference.n_ctx, Some(8192));
+        assert!(merged.starts_with("# mine\n") && merged.contains("[other]\nx = 1"));
+        // Numbers stay numbers: a quoted value would fail to parse.
+        assert!(merged.contains("n_ctx = 8192\n"));
+        // No [inference] table yet: one is added.
+        let fresh =
+            merge_inference_config("", &[("model_path", Some(toml_string("C:\\m \"q\".gguf")))]);
+        let cfg = Config::parse(&fresh);
         assert_eq!(
-            formula_display(Err(EvalError::Type("text result".into())), Some(&cached)),
-            Ok("Q1".to_string())
+            cfg.inference.model_path.as_deref(),
+            Some("C:\\m \"q\".gguf")
         );
-        // A genuine error is not masked by a stale cached value.
-        let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&cached));
-        assert!(err.unwrap_err().contains("circular"));
+        // Only removals on an empty file write nothing.
+        assert_eq!(merge_inference_config("", &[("n_ctx", None)]), "\n");
     }
 
     #[test]
@@ -2091,8 +2211,7 @@ mod tests {
     #[test]
     fn read_only_blocks_saving_and_edits() {
         let wb = parse_delimited("d", "Sheet1", "A\n1\n", ',');
-        let mut app = GridTalkApp::default();
-        app.prefs.read_only = false;
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
         // --read-only locks the mode for the session without
         // touching the persisted preference.
         app.read_only_locked = true;

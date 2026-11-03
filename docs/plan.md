@@ -46,9 +46,9 @@ supports it unchanged by pointing `base_url` at the proxy.
 
 - [x] `ViewState` two-way sync state machine (node→range, cell→node) with tests
 - [x] Terminal dual-view rendering (`gridtalk view`)
-- [x] egui graph pane: force layout computed in a worker thread, cached per revision, click-to-select nodes
+- [x] egui graph pane: force layout computed in a worker thread, cached per revision, click-to-select nodes; formula results evaluated on a worker thread (previous result shown until the new one lands); chat in a resizable bottom panel
 - [x] Split / Graph-full / Grid-full modes persisted per workbook (platform config dir: `~/.config/gridtalk/ui-state.json` on Linux, `%APPDATA%\gridtalk\ui-state.json` on Windows)
-- [x] Settings window (config path, verbatim-send notice)
+- [x] Settings window (config path, verbatim-send notice, llama.cpp GPU layers and context limit)
 - [x] First-run wizard (privacy posture → backend/model → ready; writes `config.toml`, persisted `first_run_done`)
 - [x] Installers: tag-triggered release workflow (Linux/Windows archives attached to the GitHub Release; macOS is not a target, decision 0004) + `scripts/install.sh`; release workflow is exercised on the first `v*` tag
 
@@ -88,4 +88,4 @@ hardware).
   mistral.rs backends and the engine ladder are removed
 - [x] Qwen3-30B-A3B MoE generates locally (~9.7 tok/s incl. load)
 - [x] Platforms: Linux + Windows; macOS dropped from CI/release
-- [ ] llama.cpp GPU-layer/context settings exposed in the UI
+- [x] llama.cpp GPU-layer/context settings exposed in the UI (Settings window; `n_gpu_layers` / `n_ctx` in `[inference]`)
