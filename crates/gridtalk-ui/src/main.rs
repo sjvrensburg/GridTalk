@@ -10,6 +10,7 @@ use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
     valid_adapter_name,
 };
+use gridtalk_graph::eval::EvalError;
 use gridtalk_graph::{
     build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
 };
@@ -18,7 +19,8 @@ use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -315,7 +317,7 @@ pub struct GridTalkApp {
     /// Computed results of formula cells on the current sheet, keyed
     /// by (row, col): `Ok(display text)` or `Err(reason)`. Valid for
     /// `value_cache_key` = (snapshot revision, sheet index).
-    value_cache: std::collections::HashMap<(usize, usize), Result<String, String>>,
+    value_cache: HashMap<(usize, usize), Result<String, String>>,
     value_cache_key: Option<(u64, usize)>,
     /// Read-only forced by `--read-only`: the toggle is disabled.
     read_only_locked: bool,
@@ -396,7 +398,7 @@ impl Default for GridTalkApp {
             edit_buffers: BTreeMap::new(),
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
-            value_cache: std::collections::HashMap::new(),
+            value_cache: HashMap::new(),
             value_cache_key: None,
             read_only_locked: false,
             frame_revision: u64::MAX,
@@ -566,6 +568,10 @@ impl GridTalkApp {
                 self.selected_sheet = 0;
                 self.edit_buffers.clear();
                 self.frame_revision = u64::MAX;
+                // A new snapshot restarts at revision 0: never reuse
+                // the previous workbook's computed results.
+                self.value_cache.clear();
+                self.value_cache_key = None;
                 // Chat (and any in-flight answer) belongs to the old
                 // workbook; never land its reply in the new one.
                 if let Some(cancel) = &self.chat_cancel {
@@ -823,15 +829,25 @@ impl GridTalkApp {
 }
 
 /// Display text for a formula cell's result: the computed number,
-/// else the value cached in the file (e.g. by Excel), else the
-/// evaluation error (shown as `#ERR` with the reason on hover).
+/// else — for formulas the numeric evaluator cannot handle (parse or
+/// type errors: unsupported functions, text results) — the value
+/// cached in the file (e.g. by Excel), else the evaluation error
+/// (shown as `#ERR` with the reason on hover). Genuine errors
+/// (cycles, bad references, depth) are never masked by a possibly
+/// stale cached value.
 fn formula_display(
-    result: Result<f64, gridtalk_graph::eval::EvalError>,
+    result: Result<f64, EvalError>,
     cached: Option<&gridtalk_graph::CellValue>,
 ) -> Result<String, String> {
     match (result, cached) {
         (Ok(n), _) => Ok(gridtalk_graph::CellValue::Number(n).display()),
-        (Err(_), Some(c)) if !matches!(c, gridtalk_graph::CellValue::Empty) => Ok(c.display()),
+        // The evaluator is numeric-only: parse errors (unsupported
+        // functions) and type errors (e.g. a formula returning text)
+        // fall back to the file's cached value. Cycles, bad references
+        // and depth errors are genuine and always show as #ERR.
+        (Err(EvalError::Parse(_) | EvalError::Type(_)), Some(c)) if !c.is_empty() => {
+            Ok(c.display())
+        }
         (Err(e), _) => Err(e.to_string()),
     }
 }
@@ -1541,21 +1557,29 @@ impl GridTalkApp {
                                     .unwrap_or(false);
                                 let is_formula =
                                     matches!(cell, gridtalk_graph::CellValue::Formula { .. });
-                                let show_value = is_formula && !show_formulas;
+                                // Index key: no sheet-name String
+                                // allocated per visible cell per frame.
+                                let key = (sheet_idx, r, c);
+                                let editor_id = egui::Id::unique(("grid-cell", key));
+                                // A cell being typed into stays an
+                                // editor even once its debounced edit
+                                // lands as a formula.
+                                let editing = ui.memory(|m| m.has_focus(editor_id));
+                                let show_value = is_formula && !show_formulas && !editing;
                                 if read_only || show_value {
                                     // Not editable here: a clickable,
                                     // selectable display cell.
-                                    let (text, error) = if show_value {
+                                    let (text, error): (Cow<str>, Option<&str>) = if show_value {
                                         match value_cache.get(&(r, c)) {
-                                            Some(Ok(v)) => (v.clone(), None),
-                                            Some(Err(e)) => ("#ERR".to_string(), Some(e.clone())),
+                                            Some(Ok(v)) => (Cow::Borrowed(v), None),
+                                            Some(Err(e)) => (Cow::Borrowed("#ERR"), Some(e)),
                                             None => {
                                                 value_misses.push((r, c));
-                                                ("…".to_string(), None)
+                                                (Cow::Borrowed("…"), None)
                                             }
                                         }
                                     } else {
-                                        (cell_input_text(&cell), None)
+                                        (Cow::Owned(cell_input_text(&cell)), None)
                                     };
                                     let resp = display_cell(
                                         ui,
@@ -1565,7 +1589,7 @@ impl GridTalkApp {
                                         is_formula,
                                         error.is_some(),
                                     );
-                                    let resp = match &error {
+                                    let resp = match error {
                                         Some(e) => resp.on_hover_text(e),
                                         None if show_value && !read_only => resp.on_hover_text(
                                             "Formula result. Switch to \"Showing: Formulas\" to edit.",
@@ -1577,15 +1601,12 @@ impl GridTalkApp {
                                     }
                                     continue;
                                 }
-                                // Index key: no sheet-name String
-                                // allocated per visible cell per frame.
-                                let key = (sheet_idx, r, c);
                                 let buffer = self
                                     .edit_buffers
                                     .entry(key)
                                     .or_insert_with(|| cell_input_text(&cell));
                                 let editor =
-                                    egui::TextEdit::singleline(buffer).text_color(if is_selected {
+                                    egui::TextEdit::singleline(buffer).id(editor_id).text_color(if is_selected {
                                         egui::Color32::YELLOW
                                     } else {
                                         egui::Color32::LIGHT_GRAY
@@ -1883,6 +1904,12 @@ fn main() -> eframe::Result<()> {
         // kiosk launch cannot be switched back to editing in the UI.
         app.read_only_locked = true;
     }
+    for flag in args
+        .iter()
+        .filter(|a| a.starts_with("--") && *a != "--read-only")
+    {
+        eprintln!("gridtalk-ui: warning: ignoring unknown option {flag}");
+    }
     if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
         app.open(std::path::Path::new(path));
     }
@@ -2027,7 +2054,6 @@ mod tests {
 
     #[test]
     fn formula_display_prefers_result_then_cached_value() {
-        use gridtalk_graph::eval::EvalError;
         assert_eq!(formula_display(Ok(1800.0), None), Ok("1800".to_string()));
         assert_eq!(formula_display(Ok(2.5), None), Ok("2.5".to_string()));
         // An unsupported formula falls back to the file's cached value.
@@ -2037,6 +2063,14 @@ mod tests {
             Ok("Q1".to_string())
         );
         let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&CellValue::Empty));
+        assert!(err.unwrap_err().contains("circular"));
+        // A text-returning formula (type error) shows Excel's cached text.
+        assert_eq!(
+            formula_display(Err(EvalError::Type("text result".into())), Some(&cached)),
+            Ok("Q1".to_string())
+        );
+        // A genuine error is not masked by a stale cached value.
+        let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&cached));
         assert!(err.unwrap_err().contains("circular"));
     }
 
