@@ -85,6 +85,20 @@ impl SheetSnapshot {
 pub struct WorkbookSnapshot {
     pub name: String,
     pub sheets: Vec<SheetSnapshot>,
+    /// Defined names (`Tax_Rate` → `Rates!$B$11`), kept so formulas
+    /// that use them evaluate.
+    #[serde(default)]
+    pub names: Vec<DefinedName>,
+}
+
+/// A workbook defined name. `formula` has no leading `=`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DefinedName {
+    pub name: String,
+    /// The sheet a sheet-scoped name belongs to; `None` is workbook
+    /// scope.
+    pub scope: Option<String>,
+    pub formula: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,16 +468,30 @@ pub fn from_gridcraft_workbook(
             cells,
         });
     }
+    let names = wb
+        .names
+        .iter()
+        .map(|n| DefinedName {
+            name: n.name.clone(),
+            scope: n
+                .scope
+                .and_then(|i| wb.sheets.get(i))
+                .map(|s| s.name.clone()),
+            formula: n.formula.clone(),
+        })
+        .collect();
     Ok(WorkbookSnapshot {
         name: name.into(),
         sheets,
+        names,
     })
 }
 
-/// Serialise a snapshot to XLSX bytes via Gridcraft (used for
-/// fixtures and Save-As). Formulas are written as formulas.
+/// Build a Gridcraft workbook from a snapshot: values, formulas with
+/// their cached values, and defined names. Sheet indices match the
+/// snapshot's.
 #[cfg(feature = "gridcraft")]
-pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
+pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
     use gridcraft_core::Value;
     let mut gc = gridcraft_model::Workbook::new();
     gc.sheets.clear();
@@ -499,6 +527,28 @@ pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
         gc.sheets
             .push(std::sync::Arc::new(gridcraft_model::Sheet::new("Sheet1")));
     }
+    gc.names = wb
+        .names
+        .iter()
+        .map(|n| gridcraft_model::DefinedName {
+            name: n.name.clone(),
+            scope: n
+                .scope
+                .as_deref()
+                .and_then(|s| wb.sheets.iter().position(|sh| sheet_name_eq(&sh.name, s))),
+            formula: n.formula.clone(),
+            comment: String::new(),
+            hidden: false,
+        })
+        .collect();
+    gc
+}
+
+/// Serialise a snapshot to XLSX bytes via Gridcraft (used for
+/// fixtures and Save-As). Formulas are written as formulas.
+#[cfg(feature = "gridcraft")]
+pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
+    let gc = to_gridcraft_workbook(wb);
     gridcraft_xlsx::write_xlsx(&gc)
         .map_err(|e| IngestError::Parse(format!("gridcraft xlsx writer: {e}")))
 }
@@ -530,6 +580,7 @@ pub fn parse_delimited_strict(
             name: sheet.into(),
             cells: rows,
         }],
+        names: Vec::new(),
     })
 }
 
@@ -1561,6 +1612,8 @@ impl IncrementalSnapshot {
     }
 }
 
+#[cfg(feature = "gridcraft")]
+mod calc;
 pub mod eval;
 
 /// Render a region as a cited passage for the LLM context.

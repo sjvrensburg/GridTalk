@@ -2105,6 +2105,7 @@ mod tests {
                     gridtalk_graph::CellValue::Text("  pad ".into()),
                 ]],
             }],
+            names: Vec::new(),
         };
         let back = parse_delimited("d", "Sheet1", &snapshot_to_delimited(&wb, ','), ',');
         assert_eq!(back.sheets[0].cells, wb.sheets[0].cells);

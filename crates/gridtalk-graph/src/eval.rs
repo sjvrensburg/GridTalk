@@ -2,10 +2,11 @@
 //! values: arithmetic, comparisons, `&` concatenation, text and
 //! boolean values, cell references, ranges, and a core set of
 //! functions (aggregates, IF/IFERROR, logic, text, rounding).
-//! Deliberately small — the Gridcraft calc engine remains the
-//! authority for full recalculation; this evaluator answers "what
-//! does this formula give, and what happens if that cell changes"
-//! locally.
+//! The workbook-level entry points (`*_in_workbook`,
+//! `eval_cell_value_with_override`) evaluate through Gridcraft's calc
+//! engine when the default `gridcraft` feature is on (see
+//! `crate::calc`); this module's own small evaluator backs the
+//! single-sheet functions and builds without that feature.
 
 use crate::{CellValue, SheetSnapshot};
 use std::cmp::Ordering;
@@ -164,7 +165,21 @@ pub fn eval_cell_in_workbook(
 }
 
 /// Like [`eval_cell_in_workbook`], but returns the cell's value as it
+/// is — number, text or boolean. Evaluated by Gridcraft's engine.
+#[cfg(feature = "gridcraft")]
+pub fn eval_cell_value_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    sheet_name: &str,
+    row: usize,
+    col: usize,
+) -> Result<Value, EvalError> {
+    let engine = crate::calc::Engine::new(wb);
+    engine.value(engine.sheet(sheet_name)?, row, col)
+}
+
+/// Like [`eval_cell_in_workbook`], but returns the cell's value as it
 /// is — number, text or boolean.
+#[cfg(not(feature = "gridcraft"))]
 pub fn eval_cell_value_in_workbook(
     wb: &crate::WorkbookSnapshot,
     sheet_name: &str,
@@ -1349,7 +1364,21 @@ pub fn eval_cell_with_override(
 }
 
 /// Like [`eval_cell_with_override`], but returns the target's value
+/// as it is — number, text or boolean. Evaluated by Gridcraft's
+/// engine.
+#[cfg(feature = "gridcraft")]
+pub fn eval_cell_value_with_override(
+    wb: &crate::WorkbookSnapshot,
+    override_ref: (&str, usize, usize),
+    value: f64,
+    target_ref: (&str, usize, usize),
+) -> Result<Value, EvalError> {
+    Ok(what_if_values_in_workbook(wb, override_ref, value, target_ref)?.1)
+}
+
+/// Like [`eval_cell_with_override`], but returns the target's value
 /// as it is — number, text or boolean.
+#[cfg(not(feature = "gridcraft"))]
 pub fn eval_cell_value_with_override(
     wb: &crate::WorkbookSnapshot,
     override_ref: (&str, usize, usize),
@@ -1414,7 +1443,30 @@ pub fn eval_many_in_workbook(
 }
 
 /// Like [`eval_many_in_workbook`], but returns each cell's value as
+/// it is — number, text or boolean (an empty cell is `Empty`). The
+/// workbook is recalculated once by Gridcraft's engine for the batch.
+#[cfg(feature = "gridcraft")]
+pub fn eval_many_values_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    sheet_name: &str,
+    coords: &[(usize, usize)],
+) -> Vec<Result<Value, EvalError>> {
+    let engine = crate::calc::Engine::new(wb);
+    match engine.sheet(sheet_name) {
+        Ok(idx) => coords
+            .iter()
+            .map(|(r, c)| engine.value(idx, *r, *c))
+            .collect(),
+        Err(_) => coords
+            .iter()
+            .map(|_| Err(EvalError::Ref(format!("no sheet named {sheet_name}"))))
+            .collect(),
+    }
+}
+
+/// Like [`eval_many_in_workbook`], but returns each cell's value as
 /// it is — number, text or boolean (an empty cell is `Empty`).
+#[cfg(not(feature = "gridcraft"))]
 pub fn eval_many_values_in_workbook(
     wb: &crate::WorkbookSnapshot,
     sheet_name: &str,
@@ -1453,7 +1505,33 @@ pub fn what_if_in_workbook(
 }
 
 /// Like [`what_if_in_workbook`], but returns the target's values as
+/// they are — number, text or boolean. Gridcraft's engine
+/// recalculates the workbook, applies the override, and recalculates
+/// its dependents, so the change flows through every function the
+/// engine supports (VLOOKUP, INDEX/MATCH, PV, SUMPRODUCT, names, 3D
+/// references) instead of stopping at a cached value.
+#[cfg(feature = "gridcraft")]
+pub fn what_if_values_in_workbook(
+    wb: &crate::WorkbookSnapshot,
+    override_ref: (&str, usize, usize),
+    value: f64,
+    target_ref: (&str, usize, usize),
+) -> Result<(Value, Value), EvalError> {
+    if !value.is_finite() {
+        return Err(EvalError::Type("what-if value must be finite".into()));
+    }
+    let mut engine = crate::calc::Engine::new(wb);
+    let over = engine.sheet(override_ref.0)?;
+    let target = engine.sheet(target_ref.0)?;
+    let before = engine.value(target, target_ref.1, target_ref.2)?;
+    engine.set_number(over, override_ref.1, override_ref.2, value)?;
+    let after = engine.value(target, target_ref.1, target_ref.2)?;
+    Ok((before, after))
+}
+
+/// Like [`what_if_in_workbook`], but returns the target's values as
 /// they are — number, text or boolean.
+#[cfg(not(feature = "gridcraft"))]
 pub fn what_if_values_in_workbook(
     wb: &crate::WorkbookSnapshot,
     override_ref: (&str, usize, usize),
@@ -1743,6 +1821,7 @@ mod tests {
         let wb = crate::WorkbookSnapshot {
             name: "w".into(),
             sheets: vec![row_sheet(cells)],
+            names: Vec::new(),
         };
         let coords: Vec<_> = (0..cells.len()).map(|c| (0, c)).collect();
         eval_many_values_in_workbook(&wb, "S", &coords)
@@ -1773,7 +1852,7 @@ mod tests {
             "=AND(B1>1,TRUE)",
             "=OR(B1>5,FALSE)",
             "=NOT(ISBLANK(C1))",
-            "=ROUND(2.5)+ROUND(-1.25,1)+ABS(-1)",
+            "=ROUND(2.5,0)+ROUND(-1.25,1)+ABS(-1)",
             "=ISTEXT(A1)",
             "=A1+1",
             "=IF(B1>2,\"yes\")",
@@ -1815,6 +1894,7 @@ mod tests {
             "=ISERROR(1/A1)",
             "=IFERROR(H1,0)",
             "=IF(A1,MEDIAN(1),2)",
+            "=J1+1",
         ]);
         assert_eq!(v[1], Ok(Value::Number(1.0)));
         assert_eq!(v[2], text("zero"));
@@ -1822,10 +1902,13 @@ mod tests {
         assert_eq!(v[4], Ok(Value::Number(5.0)));
         assert_eq!(v[5], Ok(Value::Number(-1.0)));
         assert_eq!(v[6], Ok(Value::Bool(true)));
-        // Cycles are not swallowed by IFERROR.
-        assert!(matches!(v[7], Err(EvalError::Cycle(_))));
-        // An unsupported function is a parse error even when skipped.
-        assert!(matches!(v[8], Err(EvalError::Parse(_))));
+        // A self-reference inside IFERROR reads as 0, as Excel shows
+        // a circular reference; a bare cycle is a typed error.
+        assert_eq!(v[7], Ok(Value::Number(0.0)));
+        assert!(matches!(v[9], Err(EvalError::Cycle(_))), "{:?}", v[9]);
+        // Gridcraft's library covers MEDIAN; the untaken branch is
+        // skipped either way.
+        assert_eq!(v[8], Ok(Value::Number(2.0)));
     }
 
     #[test]
@@ -1850,7 +1933,9 @@ mod tests {
         assert!(matches!(v[7], Err(EvalError::Type(_))));
         assert!(matches!(v[8], Err(EvalError::Type(_))));
         assert!(matches!(v[9], Err(EvalError::Type(_))));
-        assert!(matches!(v[10], Err(EvalError::Parse(_))));
+        // NOT() has too few arguments: Excel refuses it at entry;
+        // evaluated, it is a typed error either way.
+        assert!(v[10].is_err());
         // The numeric API reports a text result as a type error and
         // keeps booleans as 1/0.
         let sheet = row_sheet(&["=\"a\"", "=1<2"]);
@@ -1868,10 +1953,127 @@ mod tests {
         let wb = crate::WorkbookSnapshot {
             name: "w".into(),
             sheets: vec![sheet],
+            names: Vec::new(),
         };
         assert_eq!(
             eval_many_values_in_workbook(&wb, "S", &[(0, 1)]),
             vec![text("1.00")]
+        );
+    }
+
+    /// The impairment shape: balances look up a provision rate by
+    /// days overdue, a summary totals them, a defined name holds the
+    /// tax rate, and a 3D reference sums three monthly sheets.
+    #[cfg(feature = "gridcraft")]
+    fn impairment() -> crate::WorkbookSnapshot {
+        let f = |e: &str| CellValue::Formula {
+            expr: e.into(),
+            cached: Some(Box::new(CellValue::Number(-1.0))),
+        };
+        let n = CellValue::Number;
+        let month = |name: &str, billed: f64| crate::SheetSnapshot {
+            name: name.into(),
+            cells: vec![vec![CellValue::Text("Billed".into())], vec![n(billed)]],
+        };
+        crate::WorkbookSnapshot {
+            name: "impairment".into(),
+            sheets: vec![
+                crate::SheetSnapshot {
+                    name: "Debtors".into(),
+                    cells: vec![
+                        vec![
+                            CellValue::Text("Balance".into()),
+                            CellValue::Text("Days".into()),
+                            CellValue::Text("Pct".into()),
+                            CellValue::Text("Provision".into()),
+                        ],
+                        vec![
+                            n(1000.0),
+                            n(10.0),
+                            f("VLOOKUP(B2,Rates!$A$1:$B$3,2)"),
+                            f("ROUND(A2*C2,2)"),
+                        ],
+                        vec![
+                            n(5000.0),
+                            n(200.0),
+                            f("VLOOKUP(B3,Rates!$A$1:$B$3,2)"),
+                            f("ROUND(A3*C3,2)"),
+                        ],
+                    ],
+                },
+                crate::SheetSnapshot {
+                    name: "Rates".into(),
+                    cells: vec![
+                        vec![n(0.0), n(0.02)],
+                        vec![n(31.0), n(0.1)],
+                        vec![n(121.0), n(0.85)],
+                        vec![n(0.15)],
+                    ],
+                },
+                month("Jan", 1.0),
+                month("Feb", 2.0),
+                month("Mar", 4.0),
+                crate::SheetSnapshot {
+                    name: "Summary".into(),
+                    cells: vec![vec![
+                        f("SUM(Debtors!D2:D3)"),
+                        f("ROUND(A1*Tax_Rate,2)"),
+                        f("SUM(Jan:Mar!A2)"),
+                        f("A1+"),
+                        f("ROUND(4250.985,2)+ROUND(1.005,2)"),
+                    ]],
+                },
+            ],
+            names: vec![crate::DefinedName {
+                name: "Tax_Rate".into(),
+                scope: None,
+                formula: "Rates!$A$4".into(),
+            }],
+        }
+    }
+
+    #[cfg(feature = "gridcraft")]
+    #[test]
+    fn workbook_evaluation_uses_gridcraft_lookups_names_and_3d_refs() {
+        let wb = impairment();
+        let coords: Vec<_> = (0..5).map(|c| (0, c)).collect();
+        let v = eval_many_values_in_workbook(&wb, "Summary", &coords);
+        // 20 + 4250: VLOOKUP is computed, not read from the cached -1.
+        assert_eq!(v[0], Ok(Value::Number(4270.0)));
+        assert_eq!(v[1], Ok(Value::Number(640.5)));
+        assert_eq!(v[2], Ok(Value::Number(7.0)));
+        assert!(matches!(v[3], Err(EvalError::Parse(_))), "{:?}", v[3]);
+        // Half-cents round up as in Excel, although 4250.985 and
+        // 1.005 are stored just below the half.
+        assert_eq!(v[4], Ok(Value::Number(4250.99 + 1.01)));
+    }
+
+    #[cfg(feature = "gridcraft")]
+    #[test]
+    fn what_if_flows_through_lookup_tables() {
+        let wb = impairment();
+        // Raise the 121+ days rate: the 200-day balance's provision
+        // must follow through VLOOKUP.
+        let (before, after) =
+            what_if_in_workbook(&wb, ("Rates", 2, 1), 0.9, ("Summary", 0, 0)).unwrap();
+        assert_eq!((before, after), (4270.0, 4520.0));
+        // Through a defined name, and across a 3D reference.
+        let (b, a) = what_if_in_workbook(&wb, ("Rates", 3, 0), 0.2, ("Summary", 0, 1)).unwrap();
+        assert_eq!((b, a), (640.5, 854.0));
+        let (b, a) = what_if_in_workbook(&wb, ("Feb", 1, 0), 10.0, ("Summary", 0, 2)).unwrap();
+        assert_eq!((b, a), (7.0, 15.0));
+    }
+
+    #[cfg(feature = "gridcraft")]
+    #[test]
+    fn defined_names_survive_an_xlsx_round_trip() {
+        let wb = impairment();
+        let bytes = crate::to_xlsx_bytes(&wb).unwrap();
+        let back = crate::load_gridcraft_bytes("impairment", "xlsx", &bytes).unwrap();
+        assert_eq!(back.names, wb.names);
+        assert_eq!(
+            eval_cell_in_workbook(&back, "Summary", 0, 1).unwrap(),
+            640.5
         );
     }
 }

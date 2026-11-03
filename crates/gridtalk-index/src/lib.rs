@@ -24,6 +24,69 @@ pub struct Hit {
     /// the embedding ranker alone. Morphological, not semantic.
     #[serde(default)]
     pub vector_only: bool,
+    /// True when `passage` is an excerpt of a region too large to
+    /// return whole (see [`MAX_PASSAGE_CHARS`]); fetch the rest of
+    /// `range` cell by cell.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Budget for a hit's passage. A region is indexed whole, but a hit
+/// returns at most this many characters (about 1K tokens) so a
+/// 2,000-row table cannot flood an agent's or a local model's
+/// context.
+pub const MAX_PASSAGE_CHARS: usize = 4_000;
+
+/// Fit a rendered passage (`Range …` line, header row, data rows)
+/// into `max_chars`. A passage that fits is returned unchanged.
+/// Otherwise the excerpt keeps the range and header lines, then the
+/// data rows that contain a query term (all rows, in order, when
+/// none match), each prefixed with its 1-based sheet row so it stays
+/// citable, and ends with a note naming how much was left out.
+/// Returns the passage and whether it was truncated.
+pub fn excerpt(
+    passage: &str,
+    range: &RangeRef,
+    terms: &[String],
+    max_chars: usize,
+) -> (String, bool) {
+    if passage.len() <= max_chars {
+        return (passage.to_string(), false);
+    }
+    let mut lines = passage.lines();
+    let mut out = String::new();
+    for line in lines.by_ref().take(2) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let rows: Vec<(usize, &str)> = lines
+        .enumerate()
+        .map(|(i, line)| (range.r0 + 2 + i, line))
+        .collect();
+    let matches = |line: &str| tokenize(line).iter().any(|t| terms.contains(t));
+    let matching: Vec<&(usize, &str)> = rows.iter().filter(|(_, l)| matches(l)).collect();
+    let (pool, how): (Vec<&(usize, &str)>, &str) = if matching.is_empty() {
+        (rows.iter().collect(), "first rows")
+    } else {
+        (matching, "rows matching the query")
+    };
+    // Leave room for the closing note.
+    let budget = max_chars.saturating_sub(200);
+    let mut shown = 0;
+    for (row, line) in &pool {
+        let entry = format!("row {row}: {line}\n");
+        if out.len() + entry.len() > budget {
+            break;
+        }
+        out.push_str(&entry);
+        shown += 1;
+    }
+    out.push_str(&format!(
+        "[truncated: {shown} of {} data rows shown ({how}); read more with get_cells on {}]\n",
+        rows.len(),
+        range.a1()
+    ));
+    (out, true)
 }
 
 pub type DocEntry = (RangeRef, String, BTreeMap<String, usize>, String, usize);
@@ -167,12 +230,14 @@ impl Index {
                     .cloned()
                     .collect();
                 if score > 0.0 {
+                    let (passage, truncated) = excerpt(passage, range, &matched, MAX_PASSAGE_CHARS);
                     Some(Hit {
                         range: range.clone(),
                         score,
-                        passage: passage.clone(),
+                        passage,
                         matched_terms: matched,
                         vector_only: false,
+                        truncated,
                     })
                 } else {
                     None
@@ -327,12 +392,15 @@ impl HybridIndex {
             .filter_map(|(doc, score)| {
                 self.lexical.doc(doc).map(|(range, passage)| {
                     let lexically_matched = self.lexical.matched_terms(doc, &terms);
+                    let (passage, truncated) =
+                        excerpt(passage, range, &lexically_matched, MAX_PASSAGE_CHARS);
                     Hit {
                         range: range.clone(),
                         score,
-                        passage: passage.to_string(),
+                        passage,
                         vector_only: lexically_matched.is_empty(),
                         matched_terms: lexically_matched,
+                        truncated,
                     }
                 })
             })
@@ -344,6 +412,63 @@ impl HybridIndex {
 mod tests {
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
+
+    /// A 2,000-row ledger; row 1234's territory is unique.
+    fn ledger() -> WorkbookSnapshot {
+        let mut csv = String::from("Account,Territory,Balance\n");
+        for i in 0..2000 {
+            let territory = if i == 1232 { "Ironwood" } else { "Northgate" };
+            csv.push_str(&format!("RB-{i},{territory},{}.5\n", 1000 + i));
+        }
+        parse_delimited("ledger", "Debtors", &csv, ',')
+    }
+
+    #[test]
+    fn large_regions_return_a_bounded_excerpt_of_matching_rows() {
+        let wb = ledger();
+        let (graph, _) = build_graph(&wb);
+        for hit in [
+            Index::build(&wb, &graph).search("ironwood", 3),
+            HybridIndex::build(&wb, &graph).search("ironwood", 3),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(hit.truncated);
+            assert!(
+                hit.passage.len() <= MAX_PASSAGE_CHARS,
+                "{}",
+                hit.passage.len()
+            );
+            // Header kept; the one matching row is shown with its
+            // sheet row (header is row 1, RB-1232 is on row 1234).
+            assert!(hit.passage.contains("Account | Territory | Balance"));
+            assert!(hit
+                .passage
+                .contains("row 1234: RB-1232 | Ironwood | 2232.5"));
+            assert!(!hit.passage.contains("Northgate"));
+            assert!(hit
+                .passage
+                .contains("[truncated: 1 of 2000 data rows shown"));
+        }
+    }
+
+    #[test]
+    fn excerpt_falls_back_to_leading_rows_and_keeps_small_passages_whole() {
+        let wb = ledger();
+        let (graph, _) = build_graph(&wb);
+        let range = &graph.regions[0].range;
+        let full = render_passage(&wb.sheets[0], &graph.regions[0]);
+        let (cut, truncated) = excerpt(&full, range, &["nomatch".into()], MAX_PASSAGE_CHARS);
+        assert!(truncated && cut.len() <= MAX_PASSAGE_CHARS);
+        assert!(cut.contains("row 2: RB-0 | Northgate | 1000.5"));
+        assert!(cut.contains("(first rows)"));
+        let small = "Range S!A1:A2\nA\n1\n";
+        assert_eq!(
+            excerpt(small, range, &[], MAX_PASSAGE_CHARS),
+            (small.into(), false)
+        );
+    }
 
     #[test]
     fn recorded_region_sheets_match_redetection_and_reject_mismatches() {

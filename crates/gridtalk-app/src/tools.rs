@@ -137,6 +137,7 @@ impl<'a> Tools<'a> {
                             "vector_only": h.vector_only,
                             "matched_terms": h.matched_terms,
                             "passage": h.passage,
+                            "truncated": h.truncated,
                         })
                     })
                     .collect();
