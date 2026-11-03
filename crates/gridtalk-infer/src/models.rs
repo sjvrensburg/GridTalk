@@ -576,18 +576,22 @@ impl ModelManager {
             }
             break (stream, head_text);
         };
-        if head_text
-            .to_ascii_lowercase()
-            .contains("transfer-encoding: chunked")
-        {
-            return Err(ModelError::Http(
-                "chunked download responses are not supported; use a mirror that sends Content-Length".into(),
-            ));
-        }
+        // A chunked body is decoded as it streams; its terminator
+        // stands in for Content-Length (which RFC 9112 says to ignore
+        // alongside chunked), so truncation is still detected.
+        let chunked = crate::is_chunked(&head_text);
         // Expected size, when the server sends one: a short read
         // is a truncated model, never a successful download.
-        let content_length: Option<u64> =
-            header_value(&head_text, "content-length").and_then(|v| v.parse().ok());
+        let content_length: Option<u64> = if chunked {
+            None
+        } else {
+            header_value(&head_text, "content-length").and_then(|v| v.parse().ok())
+        };
+        let mut body: Box<dyn Read + '_> = if chunked {
+            Box::new(crate::transport::ChunkedReader::new(&mut stream))
+        } else {
+            Box::new(&mut stream)
+        };
         std::fs::create_dir_all(&self.dir)?;
         let name = Self::checked_name(name)?;
         let (tmp, mut out) = unique_tmp(&self.dir, &name)?;
@@ -595,7 +599,7 @@ impl ModelManager {
         // deadline above; the temp file is deleted on any breach.
         const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
         let copied = (|| -> Result<u64, ModelError> {
-            let mut limited = (&mut stream).take(MAX_DOWNLOAD_BYTES + 1);
+            let mut limited = (&mut body).take(MAX_DOWNLOAD_BYTES + 1);
             let mut buf = [0u8; 64 * 1024];
             let mut total: u64 = 0;
             loop {
@@ -888,6 +892,55 @@ mod tests {
             "{err}"
         );
         assert!(!dir.join("other.gguf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_decodes_chunked_bodies_after_a_relative_redirect() {
+        use crate::transport::{test_support, TEST_TLS_CONFIG};
+        let gguf = synthetic_gguf("llama");
+        let (a, b) = gguf.split_at(gguf.len() / 2);
+        let mut ok = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for part in [a, b] {
+            ok.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            ok.extend_from_slice(part);
+            ok.extend_from_slice(b"\r\n");
+        }
+        ok.extend_from_slice(b"0\r\n\r\n");
+        // The same body cut off before its terminating chunk.
+        let mut cut = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        cut.extend_from_slice(format!("{:x}\r\n", a.len()).as_bytes());
+        cut.extend_from_slice(a);
+        cut.extend_from_slice(b"\r\n");
+        let (port, cert, requests) = test_support::serve_tls(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: ../blobs/m.gguf\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+            ok,
+            cut,
+        ]);
+        TEST_TLS_CONFIG
+            .with(|c| *c.borrow_mut() = Some(test_support::client_config_trusting(&cert)));
+        let dir = std::env::temp_dir().join(format!("gt-chunked-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mgr = ModelManager::new(dir.clone());
+        let base = format!("https://localhost:{port}");
+        let entry = mgr
+            .download_http(&format!("{base}/resolve/main/m.gguf"), "m.gguf")
+            .unwrap();
+        assert_eq!(entry.bytes, gguf.len() as u64);
+        assert_eq!(std::fs::read(&entry.path).unwrap(), gguf);
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /resolve/main/m.gguf"));
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /resolve/blobs/m.gguf"));
+        let err = mgr.download_http(&format!("{base}/t.gguf"), "t.gguf");
+        TEST_TLS_CONFIG.with(|c| *c.borrow_mut() = None);
+        assert!(err.is_err());
+        assert!(!dir.join("t.gguf").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

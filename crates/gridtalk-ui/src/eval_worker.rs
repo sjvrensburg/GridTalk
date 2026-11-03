@@ -6,7 +6,7 @@
 //! previous result (or "…" if there is none), so an edit never stalls
 //! a frame or makes every formula flicker.
 
-use gridtalk_graph::eval::{eval_many_in_workbook, EvalError};
+use gridtalk_graph::eval::{eval_many_values_in_workbook, EvalError, Value};
 use gridtalk_graph::{CellValue, WorkbookSnapshot};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -164,7 +164,7 @@ fn evaluate(wb: &WorkbookSnapshot, sheet_idx: usize, coords: &[(usize, usize)]) 
     let Some(sheet) = wb.sheets.get(sheet_idx) else {
         return vec![Err("sheet no longer exists".to_string()); coords.len()];
     };
-    let results = eval_many_in_workbook(wb, &sheet.name, coords);
+    let results = eval_many_values_in_workbook(wb, &sheet.name, coords);
     coords
         .iter()
         .zip(results)
@@ -178,19 +178,17 @@ fn evaluate(wb: &WorkbookSnapshot, sheet_idx: usize, coords: &[(usize, usize)]) 
         .collect()
 }
 
-/// Display text for a formula cell's result: the computed number,
-/// else — for formulas the numeric evaluator cannot handle (parse or
-/// type errors: unsupported functions, text results) — the value
-/// cached in the file (e.g. by Excel), else the evaluation error
-/// (shown as `#ERR` with the reason on hover). Genuine errors
-/// (cycles, bad references, depth) are never masked by a possibly
-/// stale cached value.
-pub fn formula_display(result: Result<f64, EvalError>, cached: Option<&CellValue>) -> CellResult {
+/// Display text for a formula cell's result: the computed value
+/// (number, text or TRUE/FALSE), else — for formulas the evaluator
+/// cannot parse (unsupported syntax) — the value cached in the file
+/// (e.g. by Excel), else the evaluation error (shown as `#ERR` with
+/// the reason on hover). Genuine errors (type errors such as division
+/// by zero, cycles, bad references, depth) are never masked by a
+/// possibly stale cached value.
+pub fn formula_display(result: Result<Value, EvalError>, cached: Option<&CellValue>) -> CellResult {
     match (result, cached) {
-        (Ok(n), _) => Ok(CellValue::Number(n).display()),
-        (Err(EvalError::Parse(_) | EvalError::Type(_)), Some(c)) if !c.is_empty() => {
-            Ok(c.display())
-        }
+        (Ok(v), _) => Ok(v.display()),
+        (Err(EvalError::Parse(_)), Some(c)) if !c.is_empty() => Ok(c.display()),
         (Err(e), _) => Err(e.to_string()),
     }
 }
@@ -202,24 +200,46 @@ mod tests {
 
     #[test]
     fn formula_display_prefers_result_then_cached_value() {
-        assert_eq!(formula_display(Ok(1800.0), None), Ok("1800".to_string()));
-        assert_eq!(formula_display(Ok(2.5), None), Ok("2.5".to_string()));
-        // An unsupported formula falls back to the file's cached value.
+        let num = |n| Ok(Value::Number(n));
+        assert_eq!(formula_display(num(1800.0), None), Ok("1800".to_string()));
+        assert_eq!(formula_display(num(2.5), None), Ok("2.5".to_string()));
+        assert_eq!(
+            formula_display(Ok(Value::Text("Q1".into())), None),
+            Ok("Q1".to_string())
+        );
+        assert_eq!(
+            formula_display(Ok(Value::Bool(true)), None),
+            Ok("TRUE".to_string())
+        );
+        // Syntax the evaluator cannot parse falls back to the file's
+        // cached value.
         let cached = CellValue::Text("Q1".into());
         assert_eq!(
-            formula_display(Err(EvalError::Parse("TEXT()".into())), Some(&cached)),
+            formula_display(Err(EvalError::Parse("{1,2}".into())), Some(&cached)),
             Ok("Q1".to_string())
         );
         let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&CellValue::Empty));
         assert!(err.unwrap_err().contains("circular"));
-        // A text-returning formula (type error) shows Excel's cached text.
-        assert_eq!(
-            formula_display(Err(EvalError::Type("text result".into())), Some(&cached)),
-            Ok("Q1".to_string())
-        );
-        // A genuine error is not masked by a stale cached value.
+        // Genuine errors are not masked by a stale cached value.
         let err = formula_display(Err(EvalError::Cycle("A1".into())), Some(&cached));
         assert!(err.unwrap_err().contains("circular"));
+        let err = formula_display(
+            Err(EvalError::Type("division by zero".into())),
+            Some(&cached),
+        );
+        assert!(err.unwrap_err().contains("division"));
+    }
+
+    #[test]
+    fn text_formulas_show_their_text() {
+        let wb = parse_delimited("d", "Sheet1", "A\tB\nWidget\t=A2&\"!\"\n", '\t');
+        let mut cache = ValueCache::default();
+        cache.request(&wb, 0, 0, vec![(1, 1)], None);
+        cache.wait();
+        match cache.get((0, 1, 1), 0) {
+            Lookup::Fresh(Ok(v)) => assert_eq!(v, "Widget!"),
+            _ => panic!("expected a fresh text result"),
+        }
     }
 
     #[test]

@@ -1229,7 +1229,13 @@ impl eframe::App for GridTalkApp {
                         self.save_as(&path);
                     }
                 }
-                if ui.button("Open in Gridcraft").clicked() {
+                // Gridcraft is a full editor that can save over the
+                // file, so it is unavailable in read-only mode.
+                if ui
+                    .add_enabled(!self.is_read_only(), egui::Button::new("Open in Gridcraft"))
+                    .on_disabled_hover_text("Read-only mode is on: Gridcraft could edit the file")
+                    .clicked()
+                {
                     match &self.current_path {
                         Some(path) if self.dirty() => {
                             self.status =

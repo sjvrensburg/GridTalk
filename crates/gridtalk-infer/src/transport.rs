@@ -103,18 +103,158 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
     })
 }
 
-/// Resolve a redirect `Location` against the URL that returned it.
-/// Absolute, scheme-relative (`//host/...`) and absolute-path
-/// (`/...`) forms are supported.
+/// Resolve a redirect `Location` against the URL that returned it
+/// (RFC 3986 reference resolution): absolute, scheme-relative
+/// (`//host/...`), absolute-path (`/...`), query-only (`?...`) and
+/// relative-path (`file`, `../dir/file`) forms.
 pub fn resolve_location(base: &Url, location: &str) -> Result<Url, String> {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        parse_url(location)
-    } else if let Some(rest) = location.strip_prefix("//") {
-        parse_url(&format!("{}://{rest}", base.scheme()))
-    } else if location.starts_with('/') {
-        parse_url(&format!("{}://{}{location}", base.scheme(), base.authority))
+    let location = location.trim();
+    let lower = location.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return parse_url(location);
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        return parse_url(&format!("{}://{rest}", base.scheme()));
+    }
+    if location.is_empty() || location.starts_with('#') {
+        return Err(format!("unsupported redirect location {location:?}"));
+    }
+    // Fragments never go on the wire.
+    let location = location.split('#').next().unwrap_or_default();
+    let base_path = match base.path.split('?').next() {
+        Some(p) if !p.is_empty() => p,
+        _ => "/",
+    };
+    let (path, query) = match location.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (location, None),
+    };
+    let merged = if path.is_empty() {
+        // `?query` keeps the base path.
+        base_path.to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
     } else {
-        Err(format!("unsupported redirect location {location:?}"))
+        let dir = &base_path[..=base_path.rfind('/').unwrap_or(0)];
+        format!("{dir}{path}")
+    };
+    let mut target = remove_dot_segments(&merged);
+    if let Some(q) = query {
+        target.push('?');
+        target.push_str(q);
+    }
+    parse_url(&format!("{}://{}{target}", base.scheme(), base.authority))
+}
+
+/// Resolve `.` and `..` segments of an absolute path; `..` never
+/// climbs above the root.
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        match *seg {
+            "." | ".." => {
+                if *seg == ".." {
+                    out.pop();
+                }
+                // A trailing dot segment names the directory itself.
+                if i == last {
+                    out.push("");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// Decodes an HTTP/1.1 chunked body while streaming it: yields the
+/// chunk data, consumes the size lines, CRLFs and trailers, and
+/// reports EOF only after the terminating zero-size chunk. A
+/// connection that closes before that is an `UnexpectedEof` error,
+/// so a truncated body is never mistaken for a complete one.
+pub struct ChunkedReader<R> {
+    inner: R,
+    /// Bytes left in the current chunk.
+    remaining: u64,
+    done: bool,
+}
+
+/// Longest size or trailer line accepted.
+const CHUNK_LINE_MAX: usize = 4096;
+
+impl<R: Read> ChunkedReader<R> {
+    pub fn new(inner: R) -> Self {
+        ChunkedReader {
+            inner,
+            remaining: 0,
+            done: false,
+        }
+    }
+
+    fn read_line(&mut self) -> io::Result<String> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while !line.ends_with(b"\r\n") {
+            if self.inner.read(&mut byte)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed inside a chunked body",
+                ));
+            }
+            line.push(byte[0]);
+            if line.len() > CHUNK_LINE_MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunked encoding line too long",
+                ));
+            }
+        }
+        line.truncate(line.len() - 2);
+        Ok(String::from_utf8_lossy(&line).into_owned())
+    }
+}
+
+impl<R: Read> Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let line = self.read_line()?;
+            let size = line.split(';').next().unwrap_or_default().trim();
+            self.remaining = u64::from_str_radix(size, 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad chunk size line {line:?}"),
+                )
+            })?;
+            if self.remaining == 0 {
+                // Skip trailers up to the final blank line.
+                while !self.read_line()?.is_empty() {}
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed inside a chunk",
+            ));
+        }
+        self.remaining -= n as u64;
+        if self.remaining == 0 && !self.read_line()?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after chunk data",
+            ));
+        }
+        Ok(n)
     }
 }
 
@@ -387,7 +527,35 @@ mod tests {
             parse_url("https://cdn.example/x").unwrap()
         );
         assert!(!resolve_location(&base, "http://plain/x").unwrap().tls);
-        assert!(resolve_location(&base, "relative").is_err());
+        let rel = |loc: &str| resolve_location(&base, loc).unwrap().path;
+        assert_eq!(rel("c"), "/a/c");
+        assert_eq!(rel("./c/d?x=1#frag"), "/a/c/d?x=1");
+        assert_eq!(rel("../c"), "/c");
+        assert_eq!(rel("../../../c"), "/c");
+        assert_eq!(rel("?q=2"), "/a/b?q=2");
+        assert_eq!(rel("."), "/a/");
+        let root = parse_url("https://hub.example").unwrap();
+        assert_eq!(resolve_location(&root, "x").unwrap().path, "/x");
+        assert!(resolve_location(&base, "").is_err());
+        assert!(resolve_location(&base, "#only").is_err());
+    }
+
+    #[test]
+    fn chunked_reader_decodes_and_detects_truncation() {
+        let body: &[u8] = b"4;ext=1\r\nWiki\r\n6\r\npedia \r\nE\r\nin \r\n\r\nchunks.\r\n0\r\nX-Trailer: y\r\n\r\nleftover";
+        let mut out = Vec::new();
+        ChunkedReader::new(body).read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"Wikipedia in \r\n\r\nchunks.");
+        // Closed before the zero-size chunk: an error, not EOF.
+        let mut out = Vec::new();
+        let err = ChunkedReader::new(&b"4\r\nWiki\r\n"[..])
+            .read_to_end(&mut out)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        let err = ChunkedReader::new(&b"zz\r\n"[..])
+            .read_to_end(&mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

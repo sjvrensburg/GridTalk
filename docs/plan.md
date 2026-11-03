@@ -39,8 +39,8 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Deterministic echo backend for tests/demos
 - [x] Inference: single llama.cpp-over-Vulkan engine (decision 0004); `gridtalk spike <model.gguf>` validates a GGUF header (header-only, not a load test)
 - [x] Local embeddings + hybrid fusion: offline n-gram `EmbeddingModel` (bge-small ONNX remains an adapter swap behind the same trait), cosine vector index, Reciprocal Rank Fusion of lexical+vector rankings (`HybridIndex`, used by chat + investigate)
-- [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|download|remove|list`, http/https download following up to 5 redirects (never https→http)
-- [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → cells → formulas → what_if tools with a recorded trail and citations; formula evaluator with what-if recomputation
+- [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|download|remove|list`, http/https download following up to 5 redirects (absolute or relative; never https→http), chunked or Content-Length bodies with truncation detected either way
+- [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → cells → formulas → what_if tools with a recorded trail and citations; formula evaluator with what-if recomputation (numbers, text and booleans; comparisons and `&`; aggregates, IF/IFERROR/ISERROR with lazy branches, AND/OR/NOT, LEN/UPPER/LOWER/TRIM/LEFT/RIGHT/MID/CONCAT, ROUND/ABS, ISBLANK/ISNUMBER/ISTEXT; unsupported functions fall back to the file's cached value)
 
 ## Phase 4: Dual-view & polish — IN PROGRESS
 
