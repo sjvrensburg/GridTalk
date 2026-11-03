@@ -814,8 +814,31 @@ fn run(args: &[String]) -> Result<(), String> {
                     println!("removed {name}");
                     Ok(())
                 }
+                Some("download") => {
+                    let usage = "usage: gridtalk models download <http(s)://…/file.gguf> [name]";
+                    let url = args.get(3).ok_or(usage)?;
+                    // Default name: the URL's last path segment.
+                    let name = match args.get(4) {
+                        Some(n) => n.clone(),
+                        None => url
+                            .split(['?', '#'])
+                            .next()
+                            .and_then(|u| u.rsplit('/').next())
+                            .filter(|n| !n.is_empty())
+                            .ok_or("cannot derive a model name from the URL; pass one")?
+                            .to_string(),
+                    };
+                    let entry = mgr.download_http(url, &name).map_err(|e| e.to_string())?;
+                    println!(
+                        "downloaded {} ({} bytes) -> {}",
+                        entry.name,
+                        entry.bytes,
+                        entry.path.display()
+                    );
+                    Ok(())
+                }
                 Some(other) => Err(format!(
-                    "unknown models subcommand {other:?}; usage: gridtalk models [import <file.gguf>|remove <name>]"
+                    "unknown models subcommand {other:?}; usage: gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]"
                 )),
                 _ => {
                     let entries = mgr.list();
@@ -836,7 +859,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),

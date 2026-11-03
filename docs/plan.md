@@ -35,11 +35,11 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Lifted-edge invariant check re-derived from raw formulas
 - [x] Lexical TF-IDF index with cited passages (tantivy swap keeps this API)
 - [x] `ChatBackend` trait: streaming + cancellation
-- [x] OpenAI-compatible external backend (verbatim send, http; https = typed error until TLS lands)
+- [x] OpenAI-compatible external backend (verbatim send over http or certificate-verified https via rustls; extra CAs from `GRIDTALK_CA_FILE`)
 - [x] Deterministic echo backend for tests/demos
 - [x] Inference: single llama.cpp-over-Vulkan engine (decision 0004); `gridtalk spike <model.gguf>` validates a GGUF header (header-only, not a load test)
 - [x] Local embeddings + hybrid fusion: offline n-gram `EmbeddingModel` (bge-small ONNX remains an adapter swap behind the same trait), cosine vector index, Reciprocal Rank Fusion of lexical+vector rankings (`HybridIndex`, used by chat + investigate)
-- [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|remove|list`, http download (https = typed error)
+- [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|download|remove|list`, http/https download following up to 5 redirects (never https→http)
 - [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → cells → formulas → what_if tools with a recorded trail and citations; formula evaluator with what-if recomputation
 
 ## Phase 4: Dual-view & polish — IN PROGRESS

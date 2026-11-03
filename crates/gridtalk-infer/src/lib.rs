@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +56,7 @@ pub type CancelToken = Arc<AtomicBool>;
 
 pub mod models;
 pub mod probe;
+pub mod transport;
 
 pub mod llama_backend;
 
@@ -127,11 +127,9 @@ impl ChatBackend for UnavailableBackend {
 }
 
 /// OpenAI-compatible chat-completions client (external backend and
-/// future redacting-proxy endpoint). Sends the request verbatim;
-/// supports plain http for loopback/proxy endpoints. HTTPS endpoints
-/// require the deployment to terminate TLS at a local proxy until a
-/// TLS transport is wired in — reported as a typed error, never a
-/// silent downgrade.
+/// future redacting-proxy endpoint). Sends the request verbatim over
+/// `https` (certificate-verified TLS) or plain `http`. An API key is
+/// only sent over cleartext http to a loopback host.
 pub struct OpenAiCompatibleBackend {
     pub base_url: String, // e.g. http://127.0.0.1:11434/v1
     pub model: String,
@@ -161,27 +159,6 @@ fn is_loopback_host(host_port: &str) -> bool {
     }
     host.parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn connect_timeout(host_port: &str) -> Result<std::net::TcpStream, InferError> {
-    let addrs: Vec<std::net::SocketAddr> = host_port
-        .to_socket_addrs()
-        .map_err(|e| InferError::Http(format!("cannot resolve {host_port}: {e}")))?
-        .collect();
-    let mut last: Option<InferError> = None;
-    for addr in addrs {
-        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
-            Ok(s) => {
-                s.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                    .ok();
-                s.set_write_timeout(Some(std::time::Duration::from_secs(30)))
-                    .ok();
-                return Ok(s);
-            }
-            Err(e) => last = Some(InferError::Io(e)),
-        }
-    }
-    Err(last.unwrap_or_else(|| InferError::Http(format!("cannot resolve {host_port}"))))
 }
 
 /// True when `body` contains a complete chunked message: walks
@@ -263,7 +240,7 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, InferError> {
 /// Read an HTTP/1.1 response (status checked, chunked decoded,
 /// 16 MiB cap) and return the body text.
 fn read_http_response(
-    stream: &mut std::net::TcpStream,
+    stream: &mut transport::Conn,
     cancel: Option<&CancelToken>,
 ) -> Result<String, InferError> {
     use std::io::Read as _;
@@ -452,23 +429,15 @@ impl ChatBackend for OpenAiCompatibleBackend {
         if let Some(k) = &self.api_key {
             reject_crlf("api_key", k)?;
         }
-        if self.base_url.starts_with("https://") {
-            return Err(InferError::Http(
-                "https endpoints need a TLS transport or local proxy; none configured".into(),
-            ));
-        }
-        let rest = self.base_url.strip_prefix("http://").ok_or_else(|| {
-            InferError::Http("base_url must start with http:// or https://".into())
-        })?;
-        let (host_port, path_prefix) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, ""),
-        };
-        if self.api_key.is_some() && !is_loopback_host(host_port) {
+        let url = transport::parse_url(&self.base_url)
+            .map_err(|e| InferError::Http(format!("base_url: {e}")))?;
+        let host_port = url.authority.as_str();
+        if self.api_key.is_some() && !url.tls && !is_loopback_host(host_port) {
             return Err(InferError::Http(format!(
-                "refusing to send an API key over cleartext http to non-loopback host {host_port}; use a loopback redacting proxy or a TLS endpoint"
+                "refusing to send an API key over cleartext http to non-loopback host {host_port}; use https or a loopback redacting proxy"
             )));
         }
+        let path_prefix = url.path.as_str();
         let path = format!("{}/chat/completions", path_prefix.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -482,7 +451,11 @@ impl ChatBackend for OpenAiCompatibleBackend {
         .to_string();
         // Note: stream:false, so tokens are replayed word-by-word
         // locally; cancellation is honoured between words.
-        let mut stream = connect_timeout(host_port)?;
+        let mut stream = transport::connect(
+            &url,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
+        )?;
         let mut req_text = format!(
             "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
             body.len()
@@ -846,11 +819,23 @@ mod tests {
     }
 
     #[test]
-    fn external_backend_rejects_https_without_transport() {
+    fn external_backend_speaks_https_and_sends_key_over_tls() {
+        let body = r#"{"choices":[{"message":{"content":"over tls"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (port, cert, requests) =
+            transport::test_support::serve_tls(vec![response.into_bytes()]);
+        transport::TEST_TLS_CONFIG.with(|c| {
+            *c.borrow_mut() = Some(transport::test_support::client_config_trusting(&cert))
+        });
+        // A key is fine over TLS, even though the check for
+        // cleartext http would refuse a non-loopback host.
         let b = OpenAiCompatibleBackend {
-            base_url: "https://api.example.com/v1".into(),
+            base_url: format!("https://localhost:{port}/v1"),
             model: "m".into(),
-            api_key: None,
+            api_key: Some("secret".into()),
         };
         let req = ChatRequest {
             system: "s".into(),
@@ -858,9 +843,15 @@ mod tests {
             max_tokens: 1,
         };
         let cancel: CancelToken = Arc::new(AtomicBool::new(false));
-        assert!(matches!(
-            b.stream(&req, &cancel, &mut |_| {}),
-            Err(InferError::Http(_))
-        ));
+        let mut out = String::new();
+        b.stream(&req, &cancel, &mut |t| out.push_str(t)).unwrap();
+        transport::TEST_TLS_CONFIG.with(|c| *c.borrow_mut() = None);
+        assert_eq!(out, "over tls");
+        let sent = requests.recv().unwrap();
+        assert!(
+            sent.starts_with("POST /v1/chat/completions HTTP/1.1"),
+            "{sent}"
+        );
+        assert!(sent.contains("Authorization: Bearer secret"));
     }
 }

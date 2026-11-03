@@ -11,4 +11,8 @@ backend = "local"
 engine = "llamacpp"
 # model_path = "/home/you/.cache/gridtalk/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"  # any GGUF, incl. MoE
 # base_url = "http://127.0.0.1:11434/v1"   # external backend / redacting proxy
+# base_url = "https://api.example.com/v1"   # https: certificate-verified TLS
+# An API key goes over plain http only to a loopback host; use https
+# otherwise. Extra trusted CAs (corporate or self-signed): set
+# GRIDTALK_CA_FILE=/path/to/ca.pem
 # api_key_env = "GRIDTALK_API_KEY"

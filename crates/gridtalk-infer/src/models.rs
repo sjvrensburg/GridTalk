@@ -1,5 +1,5 @@
 //! GGUF model management: cache directory, metadata parsing,
-//! import/remove, and plain-http download (for local mirrors and
+//! import/remove, and http/https download (for local mirrors and
 //! future proxies). No model is ever downloaded implicitly.
 
 use std::collections::BTreeMap;
@@ -513,89 +513,69 @@ impl ModelManager {
         Ok(())
     }
 
-    /// Download a GGUF over plain http (local mirrors / proxies),
-    /// streamed to a temp file (never held whole in RAM) and
-    /// renamed into place only after its header validates.
-    /// https is refused until a TLS transport lands.
+    /// Download a GGUF over `https` (certificate-verified TLS) or
+    /// plain `http` (local mirrors / proxies), streamed to a temp
+    /// file (never held whole in RAM) and renamed into place only
+    /// after its header validates. Up to 5 redirects are followed
+    /// (Hugging Face `resolve/` URLs redirect to a CDN); a redirect
+    /// from https to http is refused.
     pub fn download_http(&self, url: &str, name: &str) -> Result<ModelEntry, ModelError> {
-        if url.contains(['\r', '\n', ' ']) {
-            return Err(ModelError::Http(
-                "url contains whitespace/control characters".into(),
-            ));
-        }
-        if url.starts_with("https://") {
-            return Err(ModelError::Http(
-                "https model URLs need a TLS transport or local proxy; none configured".into(),
-            ));
-        }
-        let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| ModelError::Http("url must start with http://".into()))?;
-        let (host_port, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
+        const MAX_REDIRECTS: usize = 5;
         // The total deadline covers connect and headers too.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2 * 60 * 60);
-        use std::net::ToSocketAddrs as _;
-        let addrs: Vec<std::net::SocketAddr> = host_port
-            .to_socket_addrs()
-            .map_err(|e| ModelError::Http(format!("cannot resolve {host_port}: {e}")))?
-            .collect();
-        let mut stream = None;
-        let mut last_err: Option<std::io::Error> = None;
-        for addr in &addrs {
-            match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10)) {
-                Ok(s) => {
-                    stream = Some(s);
-                    break;
+        let mut target = crate::transport::parse_url(url).map_err(ModelError::Http)?;
+        let mut redirects = 0usize;
+        let (mut stream, head_text) = loop {
+            let mut stream = crate::transport::connect(
+                &target,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(60),
+            )
+            .map_err(|e| ModelError::Http(e.to_string()))?;
+            let path = if target.path.is_empty() {
+                "/"
+            } else {
+                target.path.as_str()
+            };
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: GridTalk\r\n\r\n",
+                target.authority
+            );
+            stream.write_all(req.as_bytes())?;
+            let head_text = read_head(&mut stream, deadline)?;
+            let status: u32 = head_text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0);
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let location = header_value(&head_text, "location").ok_or_else(|| {
+                    ModelError::Http(format!("HTTP {status} redirect without a Location header"))
+                })?;
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(ModelError::Http(format!(
+                        "more than {MAX_REDIRECTS} redirects"
+                    )));
                 }
-                Err(e) => last_err = Some(e),
+                let next = crate::transport::resolve_location(&target, &location)
+                    .map_err(ModelError::Http)?;
+                if target.tls && !next.tls {
+                    return Err(ModelError::Http(format!(
+                        "refusing redirect from https to plain http ({location})"
+                    )));
+                }
+                target = next;
+                continue;
             }
-        }
-        let mut stream = stream.ok_or_else(|| {
-            ModelError::Http(format!(
-                "cannot connect to {host_port}: {}",
-                last_err.map(|e| e.to_string()).unwrap_or_default()
-            ))
-        })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-            .ok();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nUser-Agent: GridTalk\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes())?;
-        // Read headers byte-wise until CRLFCRLF.
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            if std::time::Instant::now() > deadline {
-                return Err(ModelError::Http(
-                    "download exceeded the 2-hour deadline during headers".into(),
-                ));
+            if status != 200 {
+                return Err(ModelError::Http(format!(
+                    "unexpected status: {}",
+                    head_text.lines().next().unwrap_or("")
+                )));
             }
-            let n = stream.read(&mut byte)?;
-            if n == 0 {
-                return Err(ModelError::Http("connection closed in headers".into()));
-            }
-            head.push(byte[0]);
-            if head.len() > 64 * 1024 {
-                return Err(ModelError::Http("headers too large".into()));
-            }
-        }
-        let head_text = String::from_utf8_lossy(&head).into_owned();
-        let status: u32 = head_text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or(0);
-        if status != 200 {
-            return Err(ModelError::Http(format!(
-                "unexpected status: {}",
-                head_text.lines().next().unwrap_or("")
-            )));
-        }
+            break (stream, head_text);
+        };
         if head_text
             .to_ascii_lowercase()
             .contains("transfer-encoding: chunked")
@@ -606,14 +586,8 @@ impl ModelManager {
         }
         // Expected size, when the server sends one: a short read
         // is a truncated model, never a successful download.
-        let content_length: Option<u64> = head_text.lines().find_map(|l| {
-            let (name, value) = l.split_once(':')?;
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                value.trim().parse().ok()
-            } else {
-                None
-            }
-        });
+        let content_length: Option<u64> =
+            header_value(&head_text, "content-length").and_then(|v| v.parse().ok());
         std::fs::create_dir_all(&self.dir)?;
         let name = Self::checked_name(name)?;
         let (tmp, mut out) = unique_tmp(&self.dir, &name)?;
@@ -678,6 +652,41 @@ impl ModelManager {
             info: Some(info),
         })
     }
+}
+
+/// Read a response head byte-wise up to the blank line (64 KiB cap).
+fn read_head(
+    stream: &mut crate::transport::Conn,
+    deadline: std::time::Instant,
+) -> Result<String, ModelError> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if std::time::Instant::now() > deadline {
+            return Err(ModelError::Http(
+                "download exceeded the 2-hour deadline during headers".into(),
+            ));
+        }
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            return Err(ModelError::Http("connection closed in headers".into()));
+        }
+        head.push(byte[0]);
+        if head.len() > 64 * 1024 {
+            return Err(ModelError::Http("headers too large".into()));
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// First value of header `name` (case-insensitive), trimmed.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_string())
+    })
 }
 
 #[cfg(test)]
@@ -834,6 +843,51 @@ mod tests {
         mgr.remove("src").unwrap();
         assert!(mgr.list().is_empty());
         assert!(mgr.remove("../evil").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn https_download_follows_redirect_and_refuses_downgrade() {
+        use crate::transport::{test_support, TEST_TLS_CONFIG};
+        let gguf = synthetic_gguf("llama");
+        let mut ok =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", gguf.len()).into_bytes();
+        ok.extend_from_slice(&gguf);
+        let (port, cert, requests) = test_support::serve_tls(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /cdn/real.gguf?sig=1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ok,
+            format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{}/x\r\nContent-Length: 0\r\n\r\n", 1)
+                .into_bytes(),
+        ]);
+        TEST_TLS_CONFIG
+            .with(|c| *c.borrow_mut() = Some(test_support::client_config_trusting(&cert)));
+        let dir = std::env::temp_dir().join(format!("gt-https-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mgr = ModelManager::new(dir.clone());
+        let base = format!("https://localhost:{port}");
+        let entry = mgr
+            .download_http(&format!("{base}/resolve/main/m.gguf"), "m.gguf")
+            .unwrap();
+        assert_eq!(entry.bytes, gguf.len() as u64);
+        assert_eq!(entry.info.unwrap().architecture.as_deref(), Some("llama"));
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /resolve/main/m.gguf HTTP/1.1"));
+        assert!(requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /cdn/real.gguf?sig=1 HTTP/1.1"));
+        let err = mgr
+            .download_http(&format!("{base}/other.gguf"), "other.gguf")
+            .unwrap_err()
+            .to_string();
+        TEST_TLS_CONFIG.with(|c| *c.borrow_mut() = None);
+        assert!(
+            err.contains("refusing redirect from https to plain http"),
+            "{err}"
+        );
+        assert!(!dir.join("other.gguf").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
