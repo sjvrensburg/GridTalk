@@ -286,8 +286,8 @@ impl<'a> Tools<'a> {
                             .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
                             .filter(|(r, c)| matches!(sheet.get(*r, *c), CellValue::Formula { .. }))
                             .collect();
-                        // Workbook-aware evaluation with one shared
-                        // memo (not a fresh EvalState per cell).
+                        // One recalculation for the whole batch, not
+                        // one per cell.
                         let evaluated = eval_many_values_in_workbook(self.wb, &sheet.name, &coords);
                         let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
