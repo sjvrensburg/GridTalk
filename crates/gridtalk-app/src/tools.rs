@@ -19,10 +19,10 @@ pub enum ToolRequest {
     Expand {
         range: String,
     },
-    Cells {
+    GetCells {
         range: String,
     },
-    Formulas {
+    ListFormulas {
         range: String,
     },
     WhatIf {
@@ -43,8 +43,8 @@ impl ToolRequest {
         match self {
             ToolRequest::Search { .. } => "search",
             ToolRequest::Expand { .. } => "expand",
-            ToolRequest::Cells { .. } => "cells",
-            ToolRequest::Formulas { .. } => "formulas",
+            ToolRequest::GetCells { .. } => "get_cells",
+            ToolRequest::ListFormulas { .. } => "list_formulas",
             ToolRequest::WhatIf { .. } => "what_if",
             ToolRequest::GraphOverview => "graph_overview",
         }
@@ -60,8 +60,8 @@ impl ToolRequest {
             "tools": [
                 {"name": "search", "tool": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "default": 3}}), &["query"])},
                 {"name": "expand", "tool": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
-                {"name": "cells", "tool": "cells", "description": "Typed cell values and formulas in a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
-                {"name": "formulas", "tool": "formulas", "description": "Formulas in a range with evaluated values", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
+                {"name": "get_cells", "tool": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
+                {"name": "list_formulas", "tool": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
                 {"name": "what_if", "tool": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only)", "inputSchema": schema(serde_json::json!({"cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}), &["cell", "value", "target"])},
                 {"name": "graph_overview", "tool": "graph_overview", "description": "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": schema(serde_json::json!({}), &[])}
             ]
@@ -111,7 +111,7 @@ impl<'a> Tools<'a> {
 
     fn sheet(&self, name: &str) -> Option<&gridtalk_graph::SheetSnapshot> {
         // Caller spellings are case-insensitive (expand already
-        // canonicalises sheet1!a1:b2; cells/formulas/what_if agree).
+        // canonicalises sheet1!a1:b2; get_cells/list_formulas/what_if agree).
         self.wb.sheets.iter().find(|s| sheet_name_eq(&s.name, name))
     }
 
@@ -249,7 +249,7 @@ impl<'a> Tools<'a> {
                     None => ToolResult::err("expand", format!("no graph node for range {range}")),
                 }
             }
-            ToolRequest::Cells { range } => match parse_range(range) {
+            ToolRequest::GetCells { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
                     Some(sheet) => {
                         let mut rows = Vec::new();
@@ -268,16 +268,16 @@ impl<'a> Tools<'a> {
                             rows.push(serde_json::Value::Array(row));
                         }
                         ToolResult::ok(
-                            "cells",
+                            "get_cells",
                             serde_json::json!({"range": range, "rows": rows}),
                             text,
                         )
                     }
-                    None => ToolResult::err("cells", format!("no sheet named {sheet_name}")),
+                    None => ToolResult::err("get_cells", format!("no sheet named {sheet_name}")),
                 },
-                None => ToolResult::err("cells", range_error(range)),
+                None => ToolResult::err("get_cells", range_error(range)),
             },
-            ToolRequest::Formulas { range } => match parse_range(range) {
+            ToolRequest::ListFormulas { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
                     Some(sheet) => {
                         // One shared evaluator memo across the
@@ -314,21 +314,23 @@ impl<'a> Tools<'a> {
                         }
                         if formulas.is_empty() {
                             ToolResult::ok(
-                                "formulas",
+                                "list_formulas",
                                 serde_json::json!({"formulas": []}),
                                 "no formulas in range".into(),
                             )
                         } else {
                             ToolResult::ok(
-                                "formulas",
+                                "list_formulas",
                                 serde_json::json!({"formulas": formulas}),
                                 lines.join("\n"),
                             )
                         }
                     }
-                    None => ToolResult::err("formulas", format!("no sheet named {sheet_name}")),
+                    None => {
+                        ToolResult::err("list_formulas", format!("no sheet named {sheet_name}"))
+                    }
                 },
-                None => ToolResult::err("formulas", range_error(range)),
+                None => ToolResult::err("list_formulas", range_error(range)),
             },
             ToolRequest::WhatIf {
                 cell,
@@ -458,10 +460,10 @@ impl<'a> Tools<'a> {
             "expand" => ToolRequest::Expand {
                 range: arg("range").unwrap_or_default(),
             },
-            "cells" => ToolRequest::Cells {
+            "get_cells" => ToolRequest::GetCells {
                 range: arg("range").unwrap_or_default(),
             },
-            "formulas" => ToolRequest::Formulas {
+            "list_formulas" => ToolRequest::ListFormulas {
                 range: arg("range").unwrap_or_default(),
             },
             "what_if" => {
@@ -481,7 +483,7 @@ impl<'a> Tools<'a> {
             "graph_overview" => ToolRequest::GraphOverview,
             other => {
                 return format!(
-                    "unknown tool {other}; available: search, expand, cells, formulas, what_if, graph_overview"
+                    "unknown tool {other}; available: search, expand, get_cells, list_formulas, what_if, graph_overview"
                 )
             }
         };
@@ -550,7 +552,7 @@ fn cell_json(cell: &CellValue) -> serde_json::Value {
     }
 }
 
-/// Largest range a Cells/Formulas call may materialise.
+/// Largest range a GetCells/ListFormulas call may materialise.
 pub const MAX_RANGE_CELLS: usize = 10_000;
 
 /// Split `Sheet!rest` or `'My Sheet'!rest` into (sheet, rest),
@@ -668,6 +670,53 @@ mod tests {
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
 
+    /// The range a truncation note suggests must work as a `get_cells`
+    /// call, including on a region over the tool's range limit and a
+    /// sheet name that needs quoting.
+    #[test]
+    fn truncation_note_range_works_as_a_get_cells_call() {
+        let mut csv = String::from("Account,Territory,Balance\n");
+        for i in 0..5000 {
+            csv.push_str(&format!("BG-{i},Ironwood,{i}.5\n"));
+        }
+        let wb = parse_delimited("big", "Debtors Ledger", &csv, ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+        };
+        let whole = tools.call(&ToolRequest::GetCells {
+            range: g.regions[0].range.a1(),
+        });
+        assert!(!whole.ok, "the region itself is over the range limit");
+
+        let hit = &hybrid.search("ironwood", 1)[0];
+        let (_, next) = hit
+            .passage
+            .split_once("next: get_cells on ")
+            .expect("note names a next range");
+        let next = next.trim_end().trim_end_matches(']');
+        let cells = tools.call(&ToolRequest::GetCells { range: next.into() });
+        assert!(cells.ok, "{}", cells.text);
+        let rows = cells.data["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 100);
+        // Picks up straight after the last row the excerpt showed.
+        let last_shown = hit
+            .passage
+            .lines()
+            .rfind(|l| l.starts_with("row "))
+            .expect("rows shown");
+        let number: usize = last_shown
+            .trim_start_matches("row ")
+            .split(':')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("row label");
+        assert_eq!(rows[0][0]["value"], format!("BG-{}", number - 1));
+    }
+
     fn fixture() -> (WorkbookSnapshot, Graph, HybridIndex) {
         let wb = parse_delimited(
             "demo",
@@ -696,7 +745,7 @@ mod tests {
             graph: &g,
             hybrid: &hybrid,
         };
-        let res = tools.call(&ToolRequest::Formulas {
+        let res = tools.call(&ToolRequest::ListFormulas {
             range: "Sheet1!A1:D3".into(),
         });
         let f = &res.data["formulas"];
@@ -759,7 +808,7 @@ mod tests {
         });
         assert!(search.ok);
         assert_eq!(search.data["hits"][0]["range"], "Sheet1!A1:D3");
-        let formulas = tools.call(&ToolRequest::Formulas {
+        let formulas = tools.call(&ToolRequest::ListFormulas {
             range: "Sheet1!A1:D3".into(),
         });
         assert_eq!(formulas.data["formulas"][0]["value"], 6.0);
@@ -800,7 +849,7 @@ mod tests {
         // Bad input is an ok:false result, never a panic.
         assert!(
             !tools
-                .call(&ToolRequest::Cells {
+                .call(&ToolRequest::GetCells {
                     range: "nonsense".into()
                 })
                 .ok

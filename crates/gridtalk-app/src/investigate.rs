@@ -96,10 +96,10 @@ pub fn investigate_with(
     // formulas/cells directly, even when retrieval missed it.
     if adapter.is_some_and(|a| a.ref_context) && trail.len() < max_steps {
         if let Some(clean) = qualified_refs(question).into_iter().next() {
-            let formulas = run("formulas", &format!("range={clean}"), &mut trail);
+            let formulas = run("list_formulas", &format!("range={clean}"), &mut trail);
             context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
             if trail.len() < max_steps {
-                let cells = run("cells", &format!("range={clean}"), &mut trail);
+                let cells = run("get_cells", &format!("range={clean}"), &mut trail);
                 context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
             }
             // Directly-read ref_context cells are citations too —
@@ -121,11 +121,11 @@ pub fn investigate_with(
             context.push_str(&format!("\n\ngraph expansion:\n{expanded}"));
         }
         if trail.len() < max_steps {
-            let cells = run("cells", &format!("range={range}"), &mut trail);
+            let cells = run("get_cells", &format!("range={range}"), &mut trail);
             context.push_str(&format!("\n\ncells:\n{cells}"));
         }
         if trail.len() < max_steps {
-            let formulas = run("formulas", &format!("range={range}"), &mut trail);
+            let formulas = run("list_formulas", &format!("range={range}"), &mut trail);
             context.push_str(&format!("\n\nformulas:\n{formulas}"));
         }
     }
@@ -467,7 +467,7 @@ mod tests {
         };
         assert!(tools.execute("search", "q=provision").contains("Sheet1!"));
         assert!(tools
-            .execute("formulas", "range=Sheet1!A1:D3")
+            .execute("list_formulas", "range=Sheet1!A1:D3")
             .contains("B2*C2"));
         let inv = investigate("how is the provision calculated", &tools, &EchoBackend, 8).unwrap();
         assert!(!inv.trail.is_empty());
