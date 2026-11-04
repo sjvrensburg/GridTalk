@@ -379,7 +379,6 @@ pub fn load_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<WorkbookSnapsh
 
 /// Read XLSX/ODS bytes through the vendored Gridcraft engine and
 /// convert its workbook model into a GridTalk snapshot.
-#[cfg(feature = "gridcraft")]
 pub fn load_gridcraft_bytes(
     name: &str,
     ext: &str,
@@ -394,19 +393,6 @@ pub fn load_gridcraft_bytes(
     from_gridcraft_workbook(name, &wb)
 }
 
-#[cfg(not(feature = "gridcraft"))]
-pub fn load_gridcraft_bytes(
-    _name: &str,
-    ext: &str,
-    _bytes: &[u8],
-) -> Result<WorkbookSnapshot, IngestError> {
-    Err(IngestError::UnsupportedFormat {
-        ext: ext.into(),
-        hint: "built without the `gridcraft` feature; rebuild with default features for XLSX/ODS"
-            .into(),
-    })
-}
-
 /// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
 /// canonical text; the cached value (when Gridcraft has one) is kept
 /// alongside so passages can show both.
@@ -415,7 +401,6 @@ pub fn load_gridcraft_bytes(
 /// billion-cell grid.
 pub const MAX_SNAPSHOT_CELLS: usize = 4_000_000;
 
-#[cfg(feature = "gridcraft")]
 pub fn from_gridcraft_workbook(
     name: &str,
     wb: &gridcraft_model::Workbook,
@@ -490,7 +475,6 @@ pub fn from_gridcraft_workbook(
 /// Build a Gridcraft workbook from a snapshot: values, formulas with
 /// their cached values, and defined names. Sheet indices match the
 /// snapshot's.
-#[cfg(feature = "gridcraft")]
 pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
     use gridcraft_core::Value;
     let mut gc = gridcraft_model::Workbook::new();
@@ -546,7 +530,6 @@ pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook
 
 /// Serialise a snapshot to XLSX bytes via Gridcraft (used for
 /// fixtures and Save-As). Formulas are written as formulas.
-#[cfg(feature = "gridcraft")]
 pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
     let gc = to_gridcraft_workbook(wb);
     gridcraft_xlsx::write_xlsx(&gc)
@@ -1612,7 +1595,6 @@ impl IncrementalSnapshot {
     }
 }
 
-#[cfg(feature = "gridcraft")]
 mod calc;
 pub mod eval;
 
@@ -1751,7 +1733,6 @@ mod tests {
         assert!(inc.take_dirty_ranges().is_empty());
     }
 
-    #[cfg(feature = "gridcraft")]
     #[test]
     fn xlsx_round_trip_via_gridcraft_preserves_values_and_formulas() {
         let wb = sample();
@@ -1772,7 +1753,6 @@ mod tests {
         assert!(g.nodes.iter().any(|n| n.kind == NodeKind::Region));
     }
 
-    #[cfg(feature = "gridcraft")]
     #[test]
     fn ods_fixture_loads_via_gridcraft() {
         let path =

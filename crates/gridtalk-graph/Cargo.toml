@@ -5,15 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[features]
-default = ["gridcraft"]
-# XLSX/ODS ingestion and formula evaluation through the vendored
-# Gridcraft engine crates.
-gridcraft = ["dep:gridcraft-xlsx", "dep:gridcraft-model", "dep:gridcraft-core", "dep:gridcraft-calc"]
-
 [dependencies]
 serde.workspace = true
-gridcraft-xlsx = { path = "../../vendor/gridcraft/crates/xlsx", optional = true }
-gridcraft-model = { path = "../../vendor/gridcraft/crates/model", optional = true }
-gridcraft-core = { path = "../../vendor/gridcraft/crates/core", optional = true }
-gridcraft-calc = { path = "../../vendor/gridcraft/crates/calc", optional = true }
+gridcraft-xlsx = { path = "../../vendor/gridcraft/crates/xlsx" }
+gridcraft-model = { path = "../../vendor/gridcraft/crates/model" }
+gridcraft-core = { path = "../../vendor/gridcraft/crates/core" }
+gridcraft-calc = { path = "../../vendor/gridcraft/crates/calc" }
