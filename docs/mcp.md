@@ -40,7 +40,9 @@ args = ["mcp"]
 `open_workbook` · `close_workbook` · `search` (hybrid lexical +
 embedding, ranges with `vector_only` flags; a passage longer than
 4,000 characters is cut to the header plus the rows matching the
-query, labelled with their sheet rows, and flagged `truncated`) ·
+query, labelled with their sheet rows, and flagged `truncated`; a closing
+note counts rows shown, matching and total, and names a bounded range to
+read next) ·
 `expand` ·
 `get_cells` (typed values) · `list_formulas` (with evaluated
 values) · `what_if` · `graph_overview`.

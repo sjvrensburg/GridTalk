@@ -37,12 +37,51 @@ pub struct Hit {
 /// context.
 pub const MAX_PASSAGE_CHARS: usize = 4_000;
 
+/// Cells in the range a truncation note suggests reading next. A
+/// whole region can be rejected by the tools' range limit or flood
+/// the caller's context; about this many cells does neither.
+const NEXT_READ_CELLS: usize = 300;
+
+/// The range to read after an excerpt stops before 1-based sheet row
+/// `row`: up to [`NEXT_READ_CELLS`] cells of `region` from that row.
+fn next_read(region: &RangeRef, row: usize) -> RangeRef {
+    let c1 = region.c1.min(region.c0 + NEXT_READ_CELLS - 1);
+    let rows = (NEXT_READ_CELLS / (c1 - region.c0 + 1)).max(1);
+    let r0 = row - 1;
+    RangeRef {
+        sheet: region.sheet.clone(),
+        r0,
+        c0: region.c0,
+        r1: region.r1.min(r0 + rows - 1),
+        c1,
+    }
+}
+
+/// Cut a header line longer than `max_bytes` at a column boundary
+/// and say so, leaving the excerpt's budget for the rows.
+fn shorten_header(header: &str, region: &RangeRef, max_bytes: usize) -> String {
+    if header.len() <= max_bytes {
+        return header.to_string();
+    }
+    let cut = header.floor_char_boundary(max_bytes);
+    let end = header[..cut].rfind(" | ").unwrap_or(cut);
+    format!(
+        "{} | ... [header cut; {} columns in region]",
+        &header[..end],
+        region.c1 - region.c0 + 1
+    )
+}
+
 /// Fit a rendered passage (`Range …` line, header row, data rows)
 /// into `max_chars`. A passage that fits is returned unchanged.
-/// Otherwise the excerpt keeps the range and header lines, then the
+/// Otherwise the excerpt keeps the range line and the header line
+/// (shortened if very wide, so rows still fit), then the
 /// data rows that contain a query term (all rows, in order, when
 /// none match), each prefixed with its 1-based sheet row so it stays
-/// citable, and ends with a note naming how much was left out.
+/// citable, and ends with a note counting the rows shown, the rows
+/// that matched and the rows in the region, so a reader can tell
+/// whether the matches are complete. The note names a bounded range
+/// to read next, starting at the first row left out.
 /// Returns the passage and whether it was truncated.
 pub fn excerpt(
     passage: &str,
@@ -55,8 +94,12 @@ pub fn excerpt(
     }
     let mut lines = passage.lines();
     let mut out = String::new();
-    for line in lines.by_ref().take(2) {
-        out.push_str(line);
+    if let Some(title) = lines.next() {
+        out.push_str(title);
+        out.push('\n');
+    }
+    if let Some(header) = lines.next() {
+        out.push_str(&shorten_header(header, range, max_chars / 8));
         out.push('\n');
     }
     let rows: Vec<(usize, &str)> = lines
@@ -65,10 +108,11 @@ pub fn excerpt(
         .collect();
     let matches = |line: &str| tokenize(line).iter().any(|t| terms.contains(t));
     let matching: Vec<&(usize, &str)> = rows.iter().filter(|(_, l)| matches(l)).collect();
-    let (pool, how): (Vec<&(usize, &str)>, &str) = if matching.is_empty() {
-        (rows.iter().collect(), "first rows")
+    let matched = matching.len();
+    let pool: Vec<&(usize, &str)> = if matching.is_empty() {
+        rows.iter().collect()
     } else {
-        (matching, "rows matching the query")
+        matching
     };
     // Leave room for the closing note.
     let budget = max_chars.saturating_sub(200);
@@ -81,11 +125,18 @@ pub fn excerpt(
         out.push_str(&entry);
         shown += 1;
     }
-    out.push_str(&format!(
-        "[truncated: {shown} of {} data rows shown ({how}); read more with get_cells on {}]\n",
-        rows.len(),
-        range.a1()
-    ));
+    let total = rows.len();
+    let counts = if matched == 0 {
+        format!("no rows match the query; first {shown} of {total} data rows shown")
+    } else {
+        let noun = if total == 1 { "row" } else { "rows" };
+        format!("{shown} of {matched} matching rows shown; {total} data {noun} in region")
+    };
+    let read = match pool.get(shown) {
+        Some(next) => format!("next: get_cells on {}", next_read(range, next.0).a1()),
+        None => format!("for other rows use get_cells on part of {}", range.a1()),
+    };
+    out.push_str(&format!("[truncated: {counts}; {read}]\n"));
     (out, true)
 }
 
@@ -449,8 +500,123 @@ mod tests {
             assert!(!hit.passage.contains("Northgate"));
             assert!(hit
                 .passage
-                .contains("[truncated: 1 of 2000 data rows shown"));
+                .contains("[truncated: 1 of 1 matching rows shown; 2000 data rows in region;"));
         }
+    }
+
+    /// Every row matches, so the budget cuts the matches short and the
+    /// note has to say so: otherwise the excerpt reads as complete.
+    #[test]
+    fn truncation_note_counts_matches_the_budget_left_out() {
+        let wb = ledger();
+        let (graph, _) = build_graph(&wb);
+        let range = &graph.regions[0].range;
+        let full = render_passage(&wb.sheets[0], &graph.regions[0]);
+        let (cut, truncated) = excerpt(&full, range, &["northgate".into()], MAX_PASSAGE_CHARS);
+        assert!(truncated && cut.len() <= MAX_PASSAGE_CHARS);
+        let shown = cut.lines().filter(|l| l.starts_with("row ")).count();
+        assert!(shown > 0 && shown < 1999);
+        assert!(cut.contains(&format!(
+            "[truncated: {shown} of 1999 matching rows shown; 2000 data rows in region;"
+        )));
+    }
+
+    /// A line break inside a cell must not shift row labels or inflate
+    /// the row count: ML-700 is on sheet row 702 of a 1,000-row table.
+    #[test]
+    fn line_breaks_in_cells_keep_row_labels_and_counts_right() {
+        let mut csv = String::from("Account,Notes,Balance\n");
+        for i in 0..1000 {
+            let term = if i == 700 { "Ironwood" } else { "plain" };
+            csv.push_str(&format!("ML-{i},\"first\nsecond {term}\",{i}.5\n"));
+        }
+        let wb = parse_delimited("book", "Sheet1", &csv, ',');
+        let (graph, _) = build_graph(&wb);
+        let hit = &HybridIndex::build(&wb, &graph).search("ironwood", 1)[0];
+        assert!(hit.truncated);
+        assert!(
+            hit.passage
+                .contains("row 702: ML-700 | first second Ironwood | 700.5"),
+            "{}",
+            hit.passage
+        );
+        assert!(hit
+            .passage
+            .contains("[truncated: 1 of 1 matching rows shown; 1000 data rows in region;"));
+    }
+
+    /// The note points at the first row left out, with a range small
+    /// enough to read. It never suggests the whole region.
+    #[test]
+    fn truncation_note_names_a_bounded_next_range() {
+        let wb = ledger();
+        let (graph, _) = build_graph(&wb);
+        let range = &graph.regions[0].range;
+        let full = render_passage(&wb.sheets[0], &graph.regions[0]);
+        let (cut, _) = excerpt(&full, range, &["northgate".into()], MAX_PASSAGE_CHARS);
+        let shown = cut.lines().filter(|l| l.starts_with("row ")).count();
+        let (first, last) = (shown + 2, shown + 101);
+        assert!(
+            cut.contains(&format!("next: get_cells on Debtors!A{first}:C{last}]")),
+            "{cut}"
+        );
+        // All matches shown: nothing is next, and the region is only
+        // offered as something to read part of.
+        let (cut, _) = excerpt(&full, range, &["ironwood".into()], MAX_PASSAGE_CHARS);
+        assert!(cut.contains("for other rows use get_cells on part of Debtors!A1:C2001]"));
+    }
+
+    #[test]
+    fn next_read_stays_inside_the_region_and_under_the_cell_budget() {
+        let range = |c1, r1| RangeRef {
+            sheet: "S".into(),
+            r0: 0,
+            c0: 1,
+            r1,
+            c1,
+        };
+        // Ends with the region's last row.
+        assert_eq!(next_read(&range(3, 99), 95).a1(), "S!B95:D100");
+        // A row wider than the budget is cut to the budget's columns.
+        let wide = next_read(&range(5000, 99), 10);
+        assert_eq!((wide.r0, wide.r1), (9, 9));
+        assert_eq!(wide.c1 - wide.c0 + 1, NEXT_READ_CELLS);
+    }
+
+    /// A header wider than the whole budget cannot break the cap or
+    /// crowd out the row that matched.
+    #[test]
+    fn very_wide_headers_keep_the_cap_and_the_matching_row() {
+        let header: Vec<String> = (0..300).map(|i| format!("Long_header_{i:04}é")).collect();
+        let mut csv = format!("{}\n", header.join(","));
+        for r in 0..50 {
+            let cells: Vec<String> = (0..300)
+                .map(|c| {
+                    if r == 40 && c == 0 {
+                        "Ironwood".to_string()
+                    } else {
+                        format!("{}.5", r * c)
+                    }
+                })
+                .collect();
+            csv.push_str(&format!("{}\n", cells.join(",")));
+        }
+        let wb = parse_delimited("book", "Sheet1", &csv, ',');
+        let (graph, _) = build_graph(&wb);
+        let hit = &HybridIndex::build(&wb, &graph).search("ironwood", 1)[0];
+        assert!(hit.truncated);
+        assert!(
+            hit.passage.len() <= MAX_PASSAGE_CHARS,
+            "{}",
+            hit.passage.len()
+        );
+        assert!(hit.passage.contains("[header cut; 300 columns in region]"));
+        assert!(
+            hit.passage.contains("row 42: Ironwood | "),
+            "{}",
+            hit.passage
+        );
+        assert!(hit.passage.contains("1 of 1 matching rows shown"));
     }
 
     #[test]
@@ -462,7 +628,8 @@ mod tests {
         let (cut, truncated) = excerpt(&full, range, &["nomatch".into()], MAX_PASSAGE_CHARS);
         assert!(truncated && cut.len() <= MAX_PASSAGE_CHARS);
         assert!(cut.contains("row 2: RB-0 | Northgate | 1000.5"));
-        assert!(cut.contains("(first rows)"));
+        assert!(cut.contains("no rows match the query; first "));
+        assert!(cut.contains(" of 2000 data rows shown"));
         let small = "Range S!A1:A2\nA\n1\n";
         assert_eq!(
             excerpt(small, range, &[], MAX_PASSAGE_CHARS),

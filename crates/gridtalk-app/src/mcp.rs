@@ -411,10 +411,10 @@ impl McpServer {
                     "expand" => ToolRequest::Expand {
                         range: req_str(&args, "range")?.into(),
                     },
-                    "get_cells" => ToolRequest::Cells {
+                    "get_cells" => ToolRequest::GetCells {
                         range: req_str(&args, "range")?.into(),
                     },
-                    "list_formulas" => ToolRequest::Formulas {
+                    "list_formulas" => ToolRequest::ListFormulas {
                         range: req_str(&args, "range")?.into(),
                     },
                     "what_if" => ToolRequest::WhatIf {
@@ -537,6 +537,44 @@ mod tests {
 
     fn rpc(server: &mut McpServer, value: Value) -> Value {
         server.handle(&value).expect("requests get responses")
+    }
+
+    /// Tool names are one vocabulary: MCP's list is the shared tool
+    /// list plus its session tools, and each shared name round-trips
+    /// through `ToolRequest` and back out of `ToolRequest::name`.
+    #[test]
+    fn mcp_and_cli_share_tool_names() {
+        let names = |tools: &Value| -> Vec<String> {
+            tools
+                .as_array()
+                .expect("tool list")
+                .iter()
+                .map(|t| t["name"].as_str().expect("tool name").to_string())
+                .collect()
+        };
+        let shared = names(&ToolRequest::schemas()["tools"]);
+        let mcp: Vec<String> = names(&tool_definitions())
+            .into_iter()
+            .filter(|n| n != "open_workbook" && n != "close_workbook")
+            .collect();
+        assert_eq!(mcp, shared);
+        for (tool, args) in [
+            ("search", json!({"query": "q"})),
+            ("expand", json!({"range": "S!A1"})),
+            ("get_cells", json!({"range": "S!A1"})),
+            ("list_formulas", json!({"range": "S!A1"})),
+            (
+                "what_if",
+                json!({"cell": "A1", "value": 1.0, "target": "S!A2"}),
+            ),
+            ("graph_overview", json!({})),
+        ] {
+            assert!(shared.iter().any(|n| n == tool), "{tool} not listed");
+            let mut request = args;
+            request["tool"] = json!(tool);
+            let parsed: ToolRequest = serde_json::from_value(request).expect(tool);
+            assert_eq!(parsed.name(), tool);
+        }
     }
 
     #[test]

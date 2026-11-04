@@ -1617,11 +1617,20 @@ mod calc;
 pub mod eval;
 
 /// Render a region as a cited passage for the LLM context.
+///
+/// Each sheet row renders as exactly one line, so a line's position
+/// gives its sheet row: line breaks inside a cell become spaces.
 pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
     let mut out = format!("Range {}\n", region.range.a1());
     for r in region.range.r0..=region.range.r1 {
         let cells: Vec<String> = (region.range.c0..=region.range.c1)
-            .map(|c| sheet.get(r, c).display())
+            .map(|c| {
+                sheet
+                    .get(r, c)
+                    .display()
+                    .replace("\r\n", " ")
+                    .replace(['\r', '\n'], " ")
+            })
             .collect();
         out.push_str(&cells.join(" | "));
         out.push('\n');
@@ -1632,6 +1641,22 @@ pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_passage_keeps_each_sheet_row_on_one_line() {
+        let wb = parse_delimited(
+            "book",
+            "Sheet1",
+            "Item,Notes,Qty\nApples,\"one\ntwo\r\nthree\rfour\",2\nPears,plain,3\n",
+            ',',
+        );
+        let (graph, _) = build_graph(&wb);
+        let passage = render_passage(&wb.sheets[0], &graph.regions[0]);
+        let lines: Vec<&str> = passage.lines().collect();
+        assert_eq!(lines.len(), 4, "{passage}");
+        assert_eq!(lines[2], "Apples | one two three four | 2");
+        assert_eq!(lines[3], "Pears | plain | 3");
+    }
 
     #[test]
     fn load_bytes_matches_load_path_and_checks_format() {
