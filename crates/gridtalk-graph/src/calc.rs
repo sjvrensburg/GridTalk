@@ -128,5 +128,9 @@ fn describe(e: CellError) -> &'static str {
         CellError::Spill => "spill range is blocked",
         CellError::Calc => "calculation error",
         CellError::Circ => "circular reference",
+        CellError::Python => "a Python cell raised an error",
+        CellError::Busy => "a Python cell is waiting to run",
+        CellError::Timeout => "a Python cell ran past the time limit",
+        CellError::Blocked => "Python cannot run here",
     }
 }
