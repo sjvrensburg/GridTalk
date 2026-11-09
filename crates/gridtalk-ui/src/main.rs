@@ -668,6 +668,9 @@ impl GridTalkApp {
                         "Opened {} — but graph invariants violated: {violations:?}; search index disabled",
                         path.display()
                     );
+                    if !warnings.is_empty() {
+                        self.status.push_str(&format!(". Warning: {warnings}"));
+                    }
                 }
             }
             Err(e) => self.status = format!("Open failed: {e}"),
@@ -933,11 +936,15 @@ impl GridTalkApp {
     /// Flush pending debounced edits first, then write. Returns
     /// true on success.
     fn save_to(&mut self, path: &std::path::Path, _is_current: bool) -> bool {
-        let to_xlsx = path
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
-        if to_xlsx && self.lossy_source && !self.lossy_save_confirmed {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Any other save attempt supersedes a pending confirmation, so
+        // a later Save never writes to a path the user moved away from.
+        self.pending_lossy_save = None;
+        if ext == "xlsx" && self.lossy_source && !self.lossy_save_confirmed {
             self.pending_lossy_save = Some(path.to_path_buf());
             self.status = format!(
                 "Saving {} keeps values, formulas and defined names only: formatting, merged cells, charts, images and tables from the original file are lost. Click Save to confirm.",
@@ -947,19 +954,27 @@ impl GridTalkApp {
         }
         // An edit typed <500ms ago must be in the saved file.
         let mut dropped_note = None;
+        let mut applied = 0;
         if let Some(inc) = &mut self.inc {
             let before = inc.dropped_edits();
-            inc.flush();
+            applied = inc.flush();
             dropped_note = dropped_edit_note(inc, before);
         }
-        let Some(inc) = &self.inc else { return false };
+        let Some(inc) = &mut self.inc else {
+            return false;
+        };
+        // The flush empties the pending queue, so poll() will not see
+        // these edits: rebuild the graph and index here instead.
+        inc.take_dirty_ranges();
         let snapshot = inc.snapshot().clone();
         let revision = inc.revision;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        if applied > 0 {
+            let violations = self.rebuild(snapshot.clone());
+            self.layout_revision = revision;
+            if !violations.is_empty() {
+                self.status = format!("Graph invariants violated: {violations:?}");
+            }
+        }
         let result: Result<(), String> = match ext.as_str() {
             "xlsx" => gridtalk_graph::to_xlsx_bytes(&snapshot)
                 .map_err(|e| e.to_string())
@@ -2351,6 +2366,16 @@ mod tests {
         assert!(out.exists());
         app.save_as(&dir.join("copy.csv"));
         assert!(dir.join("copy.csv").exists());
+        // A different save in between cancels a pending confirmation.
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
+        app.open(&source);
+        let abandoned = dir.join("abandoned.xlsx");
+        app.save_as(&abandoned);
+        let csv = dir.join("instead.csv");
+        app.save_as(&csv);
+        app.save();
+        assert!(!abandoned.exists());
+        assert_eq!(app.current_path.as_deref(), Some(csv.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

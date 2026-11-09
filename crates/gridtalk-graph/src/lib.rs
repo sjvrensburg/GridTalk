@@ -1567,13 +1567,17 @@ impl IncrementalSnapshot {
         self.dropped
     }
 
-    /// Why `edit` cannot be applied, or `None` when it can.
-    fn rejection(&self, edit: &CellEdit) -> Option<String> {
-        let Some(sheet) = self
+    /// Why `edit` cannot be applied, or `None` when it can. `extents`
+    /// holds each sheet's densified `(rows, cols)`, computed once per
+    /// flush. Only an edit that grows its sheet can trip the cell cap,
+    /// so overwriting a cell inside a workbook that is already over
+    /// the cap (a large CSV has no cell cap at load) stays allowed.
+    fn rejection(&self, edit: &CellEdit, extents: &[(u64, u64)]) -> Option<String> {
+        let Some(idx) = self
             .snapshot
             .sheets
             .iter()
-            .find(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
+            .position(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
         else {
             return Some(format!("unknown sheet {}", edit.sheet));
         };
@@ -1588,23 +1592,25 @@ impl IncrementalSnapshot {
         if edit.value == CellValue::Empty {
             return None;
         }
-        let rows = sheet.cells.len().max(edit.row + 1) as u64;
-        let cols = sheet.max_col().max(edit.col + 1) as u64;
-        let others: u64 = self
-            .snapshot
-            .sheets
-            .iter()
-            .filter(|s| !std::ptr::eq(*s, sheet))
-            .map(|s| s.cells.len() as u64 * s.max_col() as u64)
-            .sum();
+        let (old_rows, old_cols) = extents[idx];
+        let rows = old_rows.max(edit.row as u64 + 1);
+        let cols = old_cols.max(edit.col as u64 + 1);
+        let old_area = old_rows.saturating_mul(old_cols);
         let area = rows.saturating_mul(cols);
+        if area <= old_area {
+            return None;
+        }
+        let total: u64 = extents
+            .iter()
+            .map(|(r, c)| r.saturating_mul(*c))
+            .fold(0u64, u64::saturating_add);
         if area > MAX_SNAPSHOT_CELLS as u64
-            || others.saturating_add(area) > MAX_SNAPSHOT_CELLS as u64
+            || (total - old_area).saturating_add(area) > MAX_SNAPSHOT_CELLS as u64
         {
             return Some(format!(
                 "editing {} would grow the workbook past {MAX_SNAPSHOT_CELLS} cells",
                 CellRef {
-                    sheet: sheet.name.clone(),
+                    sheet: self.snapshot.sheets[idx].name.clone(),
                     row: edit.row,
                     col: edit.col,
                 }
@@ -1626,8 +1632,14 @@ impl IncrementalSnapshot {
     pub fn flush(&mut self) -> usize {
         let edits = std::mem::take(&mut self.pending);
         let mut applied = 0usize;
+        let mut extents: Vec<(u64, u64)> = self
+            .snapshot
+            .sheets
+            .iter()
+            .map(|s| (s.cells.len() as u64, s.max_col() as u64))
+            .collect();
         for edit in edits {
-            if let Some(reason) = self.rejection(&edit) {
+            if let Some(reason) = self.rejection(&edit, &extents) {
                 self.dropped += 1;
                 self.last_drop_reason = Some(reason);
                 // A dropped edit changed nothing: unpublish its dirty range.
@@ -1644,12 +1656,28 @@ impl IncrementalSnapshot {
                 continue;
             }
             applied += 1;
-            if let Some(sheet) = self
+            if let Some((idx, sheet)) = self
                 .snapshot
                 .sheets
                 .iter_mut()
-                .find(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
+                .enumerate()
+                .find(|(_, s)| crate::sheet_name_eq(&s.name, &edit.sheet))
             {
+                if edit.value == CellValue::Empty {
+                    // Clearing a cell past the sheet's edge is a no-op:
+                    // padding up to it would grow the sheet unchecked.
+                    if let Some(cell) = sheet
+                        .cells
+                        .get_mut(edit.row)
+                        .and_then(|r| r.get_mut(edit.col))
+                    {
+                        *cell = CellValue::Empty;
+                    }
+                    continue;
+                }
+                let (rows, cols) = &mut extents[idx];
+                *rows = (*rows).max(edit.row as u64 + 1);
+                *cols = (*cols).max(edit.col as u64 + 1);
                 while sheet.cells.len() <= edit.row {
                     sheet.cells.push(Vec::new());
                 }
@@ -2000,6 +2028,18 @@ mod tests {
             now,
         );
         assert_eq!(inc.flush(), 1);
+        assert_eq!(inc.snapshot().sheets[0].cells.len(), 20_000);
+        // A sheet already over the cap (e.g. a ragged CSV) still takes
+        // edits that do not grow it.
+        let mut wide = sample();
+        wide.sheets[0].cells.push(vec![CellValue::Empty; 5_000]);
+        wide.sheets[0]
+            .cells
+            .extend(std::iter::repeat_n(vec![CellValue::Number(0.0)], 1_000));
+        let mut inc = IncrementalSnapshot::new(wide);
+        inc.record_edit(edit(500, 0), now);
+        assert_eq!(inc.flush(), 1);
+        assert_eq!(inc.dropped_edits(), 0);
     }
 
     #[test]
