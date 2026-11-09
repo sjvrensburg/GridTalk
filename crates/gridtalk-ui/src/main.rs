@@ -339,6 +339,15 @@ pub struct GridTalkApp {
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
+    /// The workbook came from an .xlsx/.ods package, whose styles,
+    /// merges, charts and tables the snapshot does not keep.
+    lossy_source: bool,
+    /// The user confirmed that saving this workbook as .xlsx drops
+    /// those features (asked once per opened workbook).
+    lossy_save_confirmed: bool,
+    /// An .xlsx save waiting for that confirmation; the next Save
+    /// click writes here.
+    pending_lossy_save: Option<std::path::PathBuf>,
     close_armed: bool,
     graph_version: u64,
     chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
@@ -422,6 +431,9 @@ impl GridTalkApp {
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
+            lossy_source: false,
+            lossy_save_confirmed: false,
+            pending_lossy_save: None,
             close_armed: false,
             graph_version: 0,
             chat_rx: None,
@@ -608,6 +620,7 @@ impl GridTalkApp {
         match load_path(path) {
             Ok(wb) => {
                 self.workbook_name = wb.name.clone();
+                let warnings = wb.warnings.join(" ");
                 self.sync.mode = self
                     .prefs
                     .mode_by_workbook
@@ -616,6 +629,15 @@ impl GridTalkApp {
                     .unwrap_or_default();
                 let inc = IncrementalSnapshot::new(wb);
                 self.saved_revision = inc.revision;
+                self.lossy_source = matches!(
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("xlsx") | Some("ods")
+                );
+                self.lossy_save_confirmed = false;
+                self.pending_lossy_save = None;
                 let violations = self.rebuild(inc.snapshot().clone());
                 self.inc = Some(inc);
                 self.current_path = Some(path.to_path_buf());
@@ -637,8 +659,10 @@ impl GridTalkApp {
                 self.chat_started = None;
                 // rebuild() reports invariant violations explicitly;
                 // surface them instead of papering over the status.
-                if violations.is_empty() {
+                if violations.is_empty() && warnings.is_empty() {
                     self.status = format!("Opened {}", path.display());
+                } else if violations.is_empty() {
+                    self.status = format!("Opened {}. Warning: {warnings}", path.display());
                 } else {
                     self.status = format!(
                         "Opened {} — but graph invariants violated: {violations:?}; search index disabled",
@@ -868,6 +892,15 @@ impl GridTalkApp {
             self.status = "Read-only mode is on: saving is disabled.".into();
             return;
         }
+        // A Save click confirms a pending lossy .xlsx save, whether
+        // Save or Save As started it.
+        if let Some(path) = self.pending_lossy_save.take() {
+            self.lossy_save_confirmed = true;
+            if self.save_to(&path, false) {
+                self.current_path = Some(path);
+            }
+            return;
+        }
         let Some(path) = self.current_path.clone() else {
             self.status = "Nothing to save: open a workbook first, or use Save As.".into();
             return;
@@ -900,9 +933,24 @@ impl GridTalkApp {
     /// Flush pending debounced edits first, then write. Returns
     /// true on success.
     fn save_to(&mut self, path: &std::path::Path, _is_current: bool) -> bool {
+        let to_xlsx = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
+        if to_xlsx && self.lossy_source && !self.lossy_save_confirmed {
+            self.pending_lossy_save = Some(path.to_path_buf());
+            self.status = format!(
+                "Saving {} keeps values, formulas and defined names only: formatting, merged cells, charts, images and tables from the original file are lost. Click Save to confirm.",
+                path.display()
+            );
+            return false;
+        }
         // An edit typed <500ms ago must be in the saved file.
+        let mut dropped_note = None;
         if let Some(inc) = &mut self.inc {
+            let before = inc.dropped_edits();
             inc.flush();
+            dropped_note = dropped_edit_note(inc, before);
         }
         let Some(inc) = &self.inc else { return false };
         let snapshot = inc.snapshot().clone();
@@ -934,7 +982,10 @@ impl GridTalkApp {
         match result {
             Ok(()) => {
                 self.saved_revision = revision;
-                self.status = format!("Saved {}", path.display());
+                self.status = match dropped_note {
+                    Some(note) => format!("Saved {}. {note}", path.display()),
+                    None => format!("Saved {}", path.display()),
+                };
                 true
             }
             Err(e) => {
@@ -950,6 +1001,22 @@ impl GridTalkApp {
             .map(|inc| inc.revision != self.saved_revision || inc.pending_edits() > 0)
             .unwrap_or(false)
     }
+}
+
+/// Hover text for the save buttons: what an .xlsx save keeps.
+const SAVE_HOVER: &str =
+    "Saving .xlsx keeps values, formulas and defined names; formatting, merged cells, charts, images and tables are not kept";
+
+/// A status line for edits dropped since `before` (the dropped-edit
+/// count before a flush), or `None` when every edit was applied.
+fn dropped_edit_note(inc: &IncrementalSnapshot, before: usize) -> Option<String> {
+    let n = inc.dropped_edits().saturating_sub(before);
+    if n == 0 {
+        return None;
+    }
+    let what = if n == 1 { "edit was" } else { "edits were" };
+    let reason = inc.last_drop_reason().unwrap_or("unknown reason");
+    Some(format!("{n} {what} not applied: {reason}"))
 }
 
 /// A non-editable grid cell (read-only mode, or a formula result):
@@ -1055,7 +1122,15 @@ impl eframe::App for GridTalkApp {
         }
         // Apply debounced cell edits; rebuild graph+index on revision change.
         if let Some(inc) = &mut self.inc {
+            let before = inc.dropped_edits();
             if inc.poll(std::time::Instant::now()) {
+                if let Some(note) = dropped_edit_note(inc, before) {
+                    self.status = note;
+                }
+                // The rebuild below is whole-workbook, so the dirty
+                // ranges are not needed yet; drain them so they do
+                // not accumulate for the whole session.
+                inc.take_dirty_ranges();
                 let snapshot = inc.snapshot().clone();
                 let revision = inc.revision;
                 let violations = self.rebuild(snapshot);
@@ -1210,6 +1285,7 @@ impl eframe::App for GridTalkApp {
                 let save_label = if self.dirty() { "Save ●" } else { "Save" };
                 if ui
                     .add_enabled(!self.is_read_only(), egui::Button::new(save_label))
+                    .on_hover_text(SAVE_HOVER)
                     .on_disabled_hover_text("Read-only mode is on")
                     .clicked()
                 {
@@ -1217,6 +1293,7 @@ impl eframe::App for GridTalkApp {
                 }
                 if ui
                     .add_enabled(!self.is_read_only(), egui::Button::new("Save As…"))
+                    .on_hover_text(SAVE_HOVER)
                     .on_disabled_hover_text("Read-only mode is on")
                     .clicked()
                 {
@@ -2106,6 +2183,7 @@ mod tests {
                 ]],
             }],
             names: Vec::new(),
+            warnings: Vec::new(),
         };
         let back = parse_delimited("d", "Sheet1", &snapshot_to_delimited(&wb, ','), ',');
         assert_eq!(back.sheets[0].cells, wb.sheets[0].cells);
@@ -2213,6 +2291,67 @@ mod tests {
         };
         let back: UiPrefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         assert!(back.show_formulas && back.read_only);
+    }
+
+    #[test]
+    fn dropped_edits_get_a_status_note() {
+        let mut inc = IncrementalSnapshot::new(parse_delimited("d", "Sheet1", "A\n1\n", ','));
+        let now = std::time::Instant::now();
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 0,
+                col: 0,
+                value: CellValue::Number(2.0),
+            },
+            now,
+        );
+        assert_eq!(dropped_edit_note(&inc, inc.dropped_edits()), None);
+        inc.record_edit(
+            CellEdit {
+                sheet: "Gone".into(),
+                row: 0,
+                col: 0,
+                value: CellValue::Number(2.0),
+            },
+            now,
+        );
+        let before = inc.dropped_edits();
+        inc.flush();
+        let note = dropped_edit_note(&inc, before).unwrap();
+        assert!(note.starts_with("1 edit was not applied"), "{note}");
+        assert!(note.contains("unknown sheet Gone"), "{note}");
+    }
+
+    #[test]
+    fn saving_an_xlsx_sourced_workbook_as_xlsx_asks_once() {
+        let dir = std::env::temp_dir().join(format!("gt-ui-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.xlsx");
+        let wb = parse_delimited("in", "Sheet1", "A\n1\n", ',');
+        std::fs::write(&source, gridtalk_graph::to_xlsx_bytes(&wb).unwrap()).unwrap();
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
+        app.open(&source);
+        let out = dir.join("out.xlsx");
+        // The first .xlsx save only warns.
+        app.save_as(&out);
+        assert!(!out.exists());
+        assert!(
+            app.status.contains("Click Save to confirm"),
+            "status: {}",
+            app.status
+        );
+        // Save confirms it, writing where Save As pointed.
+        app.save();
+        assert!(out.exists(), "status: {}", app.status);
+        assert_eq!(app.current_path.as_deref(), Some(out.as_path()));
+        // Confirmed once per opened workbook; CSV never asks.
+        std::fs::remove_file(&out).unwrap();
+        app.save();
+        assert!(out.exists());
+        app.save_as(&dir.join("copy.csv"));
+        assert!(dir.join("copy.csv").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

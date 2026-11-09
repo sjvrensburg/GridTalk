@@ -25,8 +25,8 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Snapshot interchange type (`WorkbookSnapshot` / `SheetSnapshot`)
 - [x] CSV/TSV ingestion incl. quoted fields, type inference, formulas
 - [x] Typed `UnsupportedFormat` errors for XLSB/XLS/XLSM (explicit, not silent)
-- [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests). Known limits: ODS is data-only (Gridcraft imports formula results as constants, so what-if on `.ods` changes nothing), the reader's warnings are discarded, and XLSX save keeps only values, formulas and defined names (merges, styles, charts and tables are lost)
-- [x] Incremental dirty-range re-snapshot (`IncrementalSnapshot`: 500 ms debounce, dirty-range list, revision counter). Known limits: the UI never consumes the dirty ranges (each edit rebuilds the whole graph and index), and edits past row 10,000 or column 1,000 are dropped while the UI still reports clean
+- [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests). Known limits: ODS is data-only (Gridcraft imports formula results as constants, so what-if on `.ods` changes nothing; the reader's warning says so), and XLSX save keeps only values, formulas and defined names (merges, styles, charts and tables are lost)
+- [x] Incremental dirty-range re-snapshot (`IncrementalSnapshot`: 500 ms debounce, dirty-range list, revision counter). Known limits: the UI never consumes the dirty ranges (each edit rebuilds the whole graph and index), and an edit that cannot be applied is reported in the UI status
 - [x] egui grid+chat shell (`gridtalk-ui`: editable grid, chat pane, settings window) — on egui/eframe directly; Gridcraft `ui-egui` ribbon reuse remains a later swap
 
 ## Phase 3: Graph-RAG & inference — IN PROGRESS
@@ -40,7 +40,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Inference: single llama.cpp-over-Vulkan engine (decision 0004); `gridtalk spike <model.gguf>` validates a GGUF header (header-only, not a load test)
 - [x] Local embeddings + hybrid fusion: offline n-gram `EmbeddingModel` (bge-small ONNX remains an adapter swap behind the same trait), cosine vector index, Reciprocal Rank Fusion of lexical+vector rankings (`HybridIndex`, used by UI chat, investigate and MCP; CLI `ask` still builds the lexical-only `Index`)
 - [x] Model management: `~/.cache/gridtalk/models` (or `GRIDTALK_MODEL_CACHE`), GGUF metadata parser, `gridtalk models import|download|remove|list`, http/https download following up to 5 redirects (absolute or relative; never https→http), chunked or Content-Length bodies with truncation detected either way
-- [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → get_cells → list_formulas → what_if tools with a recorded trail and citations; formula evaluation and what-if recomputation through Gridcraft's calc engine (`gridcraft-calc`: its full function library incl. VLOOKUP/INDEX/MATCH/PV/SUMPRODUCT, defined names, 3D references, Excel rounding), so a what-if change flows through lookup tables instead of stopping at cached values; unparseable formulas are typed parse errors when queried directly (a cell that *depends on* one still reads its cached value). Gridcraft is the only evaluator
+- [x] Investigate tool-loop harness (Phase 3b): `gridtalk investigate` — search → expand → get_cells → list_formulas → what_if tools with a recorded trail and citations; formula evaluation and what-if recomputation through Gridcraft's calc engine (`gridcraft-calc`: its full function library incl. VLOOKUP/INDEX/MATCH/PV/SUMPRODUCT, defined names, 3D references, Excel rounding), so a what-if change flows through lookup tables instead of stopping at cached values; unparseable formulas are typed parse errors, and so are the cells that depend on them. Gridcraft is the only evaluator
 - [x] Bounded search passages: regions are indexed whole, but a hit returns at most 4,000 characters — header plus the rows matching the query, labelled with their sheet rows, flagged `truncated`, with a note counting rows shown, matching and total and naming a bounded range to read next
 
 ## Phase 4: Dual-view & polish — IN PROGRESS
@@ -98,11 +98,11 @@ From `docs/codebase-review.md`, after verifying its claims (see its
 
 Phase 0 — silent data loss and wrong numbers:
 
-- [ ] Edits past row 10,000 / column 1,000 are applied (grid-size cap only); `dropped_edits()` shown in the UI; dirty ranges consumed or removed
-- [ ] A formula Gridcraft cannot parse poisons its dependents with an error instead of feeding them its cached value; first direct `calc.rs` tests
-- [ ] One capped reader (regular files only, at most cap + 1 bytes) for `load_path`, MCP `load` and `hash_of`
-- [ ] Gridcraft `ReadReport` warnings surfaced in `open_workbook`, the CLI and the UI (incl. ODS "data-only import")
-- [ ] UI warns before an XLSX save that formatting, merges and charts are lost (until the next item lands)
+- [x] Edits anywhere in Excel's grid are applied unless they would push the workbook past `MAX_SNAPSHOT_CELLS`; dropped edits and their reason are shown in the UI status; the UI drains dirty ranges after each rebuild
+- [x] A formula Gridcraft cannot parse gets a `#NAME?` value before recalculation, so its dependents fail instead of using its cached value; first direct `calc.rs` tests
+- [x] One capped reader (`read_workbook_bytes`: regular files only, at most cap + 1 bytes) for `load_path`, MCP `load` and `hash_of`
+- [x] Gridcraft `ReadReport` warnings kept in `WorkbookSnapshot::warnings` and surfaced in `open_workbook`, CLI stderr and the UI status (incl. ODS "data-only import")
+- [x] UI asks once per opened .xlsx/.ods workbook before an .xlsx save drops formatting, merges, charts and tables (until the next item lands); the save buttons say so on hover
 
 Phase 1 — structural:
 

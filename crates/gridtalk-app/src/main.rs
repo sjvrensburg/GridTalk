@@ -943,8 +943,14 @@ fn load_named_adapter(name: &str) -> adapter::Adapter {
     adapter::load_adapter(&root, name)
 }
 
+/// Load a workbook, printing the reader's warnings (parts it skipped
+/// or could not import) to stderr so a partial import is never silent.
 fn load_workbook(file: &str) -> Result<WorkbookSnapshot, String> {
-    load_path(std::path::Path::new(file)).map_err(|e| e.to_string())
+    let wb = load_path(std::path::Path::new(file)).map_err(|e| e.to_string())?;
+    for w in &wb.warnings {
+        eprintln!("gridtalk: warning: {file}: {w}");
+    }
+    Ok(wb)
 }
 
 fn config_from_env() -> Config {

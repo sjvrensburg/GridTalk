@@ -12,9 +12,7 @@ use gridcraft_calc::Calc;
 use gridcraft_core::{CellError, CellRef, Value as GcValue};
 use gridcraft_model::{Cell, Workbook};
 
-/// Excel's grid: 1,048,576 rows by 16,384 columns.
-const MAX_ROWS: usize = 1 << 20;
-const MAX_COLS: usize = 1 << 14;
+use crate::{EXCEL_MAX_COLS as MAX_COLS, EXCEL_MAX_ROWS as MAX_ROWS};
 
 /// A snapshot converted to a Gridcraft workbook and fully
 /// recalculated.
@@ -26,6 +24,7 @@ pub(crate) struct Engine {
 impl Engine {
     pub(crate) fn new(snapshot: &WorkbookSnapshot) -> Self {
         let mut wb = to_gridcraft_workbook(snapshot);
+        poison_unparsed(&mut wb);
         let mut calc = Calc::new();
         calc.recalc_all(&mut wb);
         Engine { wb, calc }
@@ -81,6 +80,30 @@ impl Engine {
     }
 }
 
+/// Give every formula Gridcraft cannot parse a `#NAME?` value. Such a
+/// formula never enters the dependency graph, so recalculation leaves
+/// its cached value in place, and its dependents would silently
+/// compute with that stale number. As an error it propagates instead.
+fn poison_unparsed(wb: &mut Workbook) {
+    for i in 0..wb.sheets.len() {
+        let unparsed: Vec<(CellRef, Cell)> = wb.sheets[i]
+            .cells
+            .iter()
+            .filter(|(_, c)| c.formula.as_ref().is_some_and(|f| f.expr.is_none()))
+            .map(|(at, c)| (at, c.clone()))
+            .collect();
+        if unparsed.is_empty() {
+            continue;
+        }
+        if let Some(sheet) = wb.sheet_mut(i) {
+            for (at, mut cell) in unparsed {
+                cell.value = GcValue::Error(CellError::Name);
+                sheet.set_cell(at, cell);
+            }
+        }
+    }
+}
+
 fn addr(row: usize, col: usize) -> Result<CellRef, EvalError> {
     if row >= MAX_ROWS || col >= MAX_COLS {
         return Err(EvalError::Ref(format!(
@@ -121,7 +144,7 @@ fn describe(e: CellError) -> &'static str {
         CellError::Div0 => "division by zero",
         CellError::Value => "wrong type of argument or operand",
         CellError::Ref => "invalid cell reference",
-        CellError::Name => "unknown function or name",
+        CellError::Name => "unknown function or name, or a formula that cannot be parsed",
         CellError::Num => "invalid numeric value",
         CellError::NA => "value not available, e.g. a lookup with no match",
         CellError::GettingData => "data not yet available",
@@ -132,5 +155,87 @@ fn describe(e: CellError) -> &'static str {
         CellError::Busy => "a Python cell is waiting to run",
         CellError::Timeout => "a Python cell ran past the time limit",
         CellError::Blocked => "Python cannot run here",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CellValue, SheetSnapshot};
+
+    fn formula(expr: &str, cached: Option<f64>) -> CellValue {
+        CellValue::Formula {
+            expr: expr.into(),
+            cached: cached.map(|n| Box::new(CellValue::Number(n))),
+        }
+    }
+
+    fn workbook(cells: Vec<Vec<CellValue>>) -> WorkbookSnapshot {
+        WorkbookSnapshot {
+            name: "t".into(),
+            sheets: vec![SheetSnapshot {
+                name: "Sheet1".into(),
+                cells,
+            }],
+            names: vec![],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_unparseable_precedent_is_an_error_not_its_cached_value() {
+        let wb = workbook(vec![
+            vec![formula("1+(", Some(42.0)), formula("A1*1", None)],
+            vec![CellValue::Number(1.0), formula("SUM(A1:A2)", None)],
+        ]);
+        let engine = Engine::new(&wb);
+        assert!(matches!(engine.value(0, 0, 0), Err(EvalError::Parse(_))));
+        assert!(matches!(engine.value(0, 0, 1), Err(EvalError::Parse(_))));
+        assert!(matches!(engine.value(0, 1, 1), Err(EvalError::Parse(_))));
+    }
+
+    #[test]
+    fn parseable_formulas_ignore_stale_cached_values() {
+        let wb = workbook(vec![vec![
+            CellValue::Number(2.0),
+            formula("A1*10", Some(999.0)),
+        ]]);
+        let engine = Engine::new(&wb);
+        assert_eq!(engine.value(0, 0, 1).unwrap(), Value::Number(20.0));
+    }
+
+    #[test]
+    fn spreadsheet_errors_map_to_typed_eval_errors() {
+        let wb = workbook(vec![vec![
+            formula("1/0", None),
+            formula("NOSUCHFN(1)", None),
+            formula("C1", None),
+        ]]);
+        let engine = Engine::new(&wb);
+        assert!(matches!(engine.value(0, 0, 0), Err(EvalError::Type(_))));
+        assert!(matches!(engine.value(0, 0, 1), Err(EvalError::Parse(_))));
+        assert!(matches!(engine.value(0, 0, 2), Err(EvalError::Cycle(_))));
+    }
+
+    #[test]
+    fn set_number_recalculates_dependents_and_rejects_non_finite() {
+        let wb = workbook(vec![vec![CellValue::Number(1.0), formula("A1+1", None)]]);
+        let mut engine = Engine::new(&wb);
+        engine.set_number(0, 0, 0, 41.0).unwrap();
+        assert_eq!(engine.value(0, 0, 1).unwrap(), Value::Number(42.0));
+        assert!(engine.set_number(0, 0, 0, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn cells_outside_the_grid_are_ref_errors() {
+        let engine = Engine::new(&workbook(vec![]));
+        assert!(matches!(
+            engine.value(0, MAX_ROWS, 0),
+            Err(EvalError::Ref(_))
+        ));
+        assert!(matches!(
+            engine.value(0, 0, MAX_COLS),
+            Err(EvalError::Ref(_))
+        ));
     }
 }
