@@ -117,6 +117,7 @@ Phase 2 — agent-facing correctness:
 - [ ] Graph lineage: 3D refs (`Jan:Mar!A2` is currently misread as columns JAN:MAR), defined names, checked range-end sheet qualifiers, running totals within a column
 - [ ] `list_sheets`/`workbook_info` tool (sheets, defined names, load warnings); `readOnlyHint` annotations; A1 examples in tool descriptions
 - [ ] One typed MCP error envelope; `expand` capped with truncation fields; search limit clamp disclosed; re-opening a path reuses its session
+- [ ] Reader warnings reach the agent after a silent reload: when `fresh()` reloads a changed file, its new `warnings` are reported on the next tool response, not only by `open_workbook`
 
 Phase 3 — hardening:
 
