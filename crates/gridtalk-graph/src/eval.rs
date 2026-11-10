@@ -230,6 +230,10 @@ impl Evaluator {
         value: f64,
         target_ref: (&str, usize, usize),
     ) -> Result<(Value, Value), EvalError> {
+        // Reject a bad value before paying for the clone.
+        if !value.is_finite() {
+            return Err(EvalError::Type("what-if value must be finite".into()));
+        }
         let over = self.engine.sheet(override_ref.0)?;
         let target = self.engine.sheet(target_ref.0)?;
         let before = self.engine.value(target, target_ref.1, target_ref.2)?;
@@ -237,6 +241,18 @@ impl Evaluator {
         engine.set_number(over, override_ref.1, override_ref.2, value)?;
         let after = engine.value(target, target_ref.1, target_ref.2)?;
         Ok((before, after))
+    }
+
+    /// Like [`what_if`](Self::what_if), with both values as numbers
+    /// (see [`Value::to_number`]).
+    pub fn what_if_number(
+        &self,
+        override_ref: (&str, usize, usize),
+        value: f64,
+        target_ref: (&str, usize, usize),
+    ) -> Result<(f64, f64), EvalError> {
+        let (before, after) = self.what_if(override_ref, value, target_ref)?;
+        Ok((before.to_number()?, after.to_number()?))
     }
 }
 

@@ -8,7 +8,7 @@
 
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
-use gridtalk_graph::eval::Evaluator;
+use gridtalk_graph::eval::EvalCache;
 use gridtalk_graph::{formula_refs_qualified, sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
@@ -62,13 +62,18 @@ pub struct TaskGeneration {
 /// same workbook always yields the same tasks, ids and splits.
 #[allow(dead_code)] // convenience wrapper over generate_tasks_ex
 pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask> {
-    generate_tasks_ex(wb, max_tasks).tasks
+    generate_tasks_ex(wb, max_tasks, &EvalCache::new()).tasks
 }
 
-pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGeneration {
+/// [`generate_tasks`] with the skip count. `cache` must belong to `wb`;
+/// pass the cache a `Tools` for the same workbook holds, so the bench
+/// run reuses the recalculation task generation paid for.
+pub fn generate_tasks_ex(
+    wb: &WorkbookSnapshot,
+    max_tasks: usize,
+    cache: &EvalCache,
+) -> TaskGeneration {
     let mut skipped_formulas = 0usize;
-    // Built on the first formula: one recalculation for every task.
-    let mut evaluator: Option<Evaluator> = None;
     let mut drafts: Vec<(String, String, f64, String)> = Vec::new(); // kind, question, expected, citation
     for sheet in &wb.sheets {
         for (r, row) in sheet.cells.iter().enumerate() {
@@ -88,7 +93,9 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                         ));
                     }
                     CellValue::Formula { expr, .. } => {
-                        let calc = evaluator.get_or_insert_with(|| Evaluator::new(wb));
+                        // Built on the first formula: one
+                        // recalculation for every task.
+                        let calc = cache.get(wb);
                         let evaluated = calc.value(&sheet.name, r, c).and_then(|v| v.to_number());
                         if !matches!(evaluated, Ok(v) if v.is_finite()) {
                             skipped_formulas += 1;
@@ -141,13 +148,11 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                 if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
                                     attempts += 1;
                                     let new_value = orig + 10.0;
-                                    let trial = calc
-                                        .what_if(
-                                            (&osheet_name, q.row, q.col),
-                                            new_value,
-                                            (&sheet.name, r, c),
-                                        )
-                                        .and_then(|(b, a)| Ok((b.to_number()?, a.to_number()?)));
+                                    let trial = calc.what_if_number(
+                                        (&osheet_name, q.row, q.col),
+                                        new_value,
+                                        (&sheet.name, r, c),
+                                    );
                                     if let Ok((before, after)) = trial {
                                         // Trivial tasks (outcome
                                         // unchanged) teach nothing.

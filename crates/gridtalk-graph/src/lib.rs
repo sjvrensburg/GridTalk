@@ -3,6 +3,7 @@
 //! Ported in spirit from ExcelGRAG's eg-structure / eg-graph, retargeted
 //! to snapshots so downstream code never touches live grid cells.
 
+use gridcraft_core::{CellRef as GcRef, Value as GcValue};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
@@ -501,12 +502,11 @@ pub fn from_gridcraft_workbook(
 /// canonical text and cached value; an error value (constant or
 /// cached) reads as its display text, e.g. `#N/A`.
 fn snapshot_cell(cell: &gridcraft_model::Cell) -> CellValue {
-    use gridcraft_core::Value;
     let cached = match &cell.value {
-        Value::Empty => None,
-        Value::Number(n) => Some(Box::new(CellValue::Number(*n))),
-        Value::Text(t) => Some(Box::new(CellValue::Text(t.to_string()))),
-        Value::Bool(b) => Some(Box::new(CellValue::Bool(*b))),
+        GcValue::Empty => None,
+        GcValue::Number(n) => Some(Box::new(CellValue::Number(*n))),
+        GcValue::Text(t) => Some(Box::new(CellValue::Text(t.to_string()))),
+        GcValue::Bool(b) => Some(Box::new(CellValue::Bool(*b))),
         other => Some(Box::new(CellValue::Text(other.display()))),
     };
     match &cell.formula {
@@ -535,21 +535,26 @@ fn snapshot_names(wb: &gridcraft_model::Workbook) -> Vec<DefinedName> {
 
 /// A snapshot cell as Gridcraft content (value and formula) on top
 /// of `base`, which keeps its style. An empty cell clears the content.
+/// A formula whose text is unchanged keeps `base`'s formula, so its
+/// legacy-array range and dynamic-array mark survive.
 fn gridcraft_cell(cell: &CellValue, mut base: gridcraft_model::Cell) -> gridcraft_model::Cell {
-    use gridcraft_core::Value;
+    let old_formula = base.formula.take();
     base.clear_content();
     match cell {
         CellValue::Empty => {}
-        CellValue::Text(t) => base.value = Value::Text(t.as_str().into()),
-        CellValue::Number(n) => base.value = Value::Number(*n),
-        CellValue::Bool(b) => base.value = Value::Bool(*b),
+        CellValue::Text(t) => base.value = GcValue::Text(t.as_str().into()),
+        CellValue::Number(n) => base.value = GcValue::Number(*n),
+        CellValue::Bool(b) => base.value = GcValue::Bool(*b),
         CellValue::Formula { expr, cached } => {
-            base.formula = Some(std::sync::Arc::new(gridcraft_model::Formula::new(expr)));
+            base.formula = match old_formula {
+                Some(f) if f.text == *expr => Some(f),
+                _ => Some(std::sync::Arc::new(gridcraft_model::Formula::new(expr))),
+            };
             base.value = match cached.as_deref() {
-                Some(CellValue::Number(n)) => Value::Number(*n),
-                Some(CellValue::Bool(b)) => Value::Bool(*b),
-                Some(CellValue::Text(s)) => Value::Text(s.as_str().into()),
-                _ => Value::Empty,
+                Some(CellValue::Number(n)) => GcValue::Number(*n),
+                Some(CellValue::Bool(b)) => GcValue::Bool(*b),
+                Some(CellValue::Text(s)) => GcValue::Text(s.as_str().into()),
+                _ => GcValue::Empty,
             };
         }
     }
@@ -587,7 +592,6 @@ fn overlay_snapshot(
     wb: &WorkbookSnapshot,
     source: &gridcraft_model::Workbook,
 ) -> gridcraft_model::Workbook {
-    use gridcraft_core::CellRef as GcRef;
     let mut gc = source.clone();
     for (i, sheet) in wb.sheets.iter().enumerate() {
         let src = &source.sheets[i];
@@ -608,10 +612,7 @@ fn overlay_snapshot(
                 }
                 let at = GcRef::new(r as u32, c as u32);
                 if src.cell(at).is_none() {
-                    let base = gridcraft_model::Cell::styled(
-                        gridcraft_core::Value::Empty,
-                        src.style_id(at),
-                    );
+                    let base = gridcraft_model::Cell::styled(GcValue::Empty, src.style_id(at));
                     changed.push((at, gridcraft_cell(cell, base)));
                 }
             }
@@ -2103,6 +2104,26 @@ mod tests {
         assert!(s.merges.contains(&GcRange::parse("F1:G2").unwrap()));
         assert_eq!(back.date_system, DateSystem::D1904);
         assert_eq!(back.sheets[0].tables[0].name, "Sales");
+    }
+
+    #[test]
+    fn rewriting_a_cell_with_the_same_formula_keeps_its_array_range() {
+        let mut formula = gridcraft_model::Formula::new("A1:A2*2");
+        formula.array = Some(gridcraft_core::RangeRef::parse("B1:B2").unwrap());
+        let mut base = gridcraft_model::Cell::formula(formula);
+        base.value = GcValue::Number(4.0);
+        let same = CellValue::Formula {
+            expr: "A1:A2*2".into(),
+            cached: None,
+        };
+        let kept = gridcraft_cell(&same, base.clone());
+        assert!(kept.formula.as_ref().unwrap().array.is_some());
+        let other = CellValue::Formula {
+            expr: "A1*3".into(),
+            cached: None,
+        };
+        let replaced = gridcraft_cell(&other, base);
+        assert!(replaced.formula.as_ref().unwrap().array.is_none());
     }
 
     #[test]

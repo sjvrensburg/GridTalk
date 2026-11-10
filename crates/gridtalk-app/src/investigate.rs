@@ -175,11 +175,11 @@ pub fn investigate_with(
                                 }
                                 if let CellValue::Formula { .. } = sheet_obj.get(r, c) {
                                     tried += 1;
-                                    let trial = tools
-                                        .calc
-                                        .get(tools.wb)
-                                        .what_if((&osheet, orow, ocol), value, (&sheet, r, c))
-                                        .and_then(|(b, a)| Ok((b.to_number()?, a.to_number()?)));
+                                    let trial = tools.calc.get(tools.wb).what_if_number(
+                                        (&osheet, orow, ocol),
+                                        value,
+                                        (&sheet, r, c),
+                                    );
                                     if let Ok((before, after)) = trial {
                                         if (after - before).abs() > 1e-9 {
                                             return Some(format!(

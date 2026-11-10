@@ -354,7 +354,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 hybrid: &hybrid,
                 calc: &gridtalk_graph::eval::EvalCache::new(),
             };
-            let gen = bench::generate_tasks_ex(&wb, 100);
+            let gen = bench::generate_tasks_ex(&wb, 100, toolset.calc);
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
@@ -454,7 +454,8 @@ fn run(args: &[String]) -> Result<(), String> {
                     if !violations.is_empty() {
                         return Err(format!("graph invariants violated: {violations:?}"));
                     }
-                    let gen = bench::generate_tasks_ex(&wb, max);
+                    let gen =
+                        bench::generate_tasks_ex(&wb, max, &gridtalk_graph::eval::EvalCache::new());
                     let tasks = gen.tasks;
                     if gen.skipped_formulas > 0 {
                         eprintln!(
@@ -501,7 +502,7 @@ fn run(args: &[String]) -> Result<(), String> {
                                 .map_err(|e| format!("invalid tasks file {path}: {e}"))?
                         }
                         None => {
-                            let gen = bench::generate_tasks_ex(&wb, 100);
+                            let gen = bench::generate_tasks_ex(&wb, 100, toolset.calc);
                             skipped_formulas = gen.skipped_formulas;
                             gen.tasks
                         }
