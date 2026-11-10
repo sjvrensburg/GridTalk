@@ -274,7 +274,6 @@ pub struct VectorIndex {
     pub dim: usize,
     /// Per-doc chunk vectors (usually one per passage line).
     vectors: Vec<Vec<std::sync::Arc<Vec<f32>>>>,
-    texts: Vec<String>,
     /// The chunk texts behind `vectors`, for per-chunk caching.
     chunk_texts: Vec<Vec<String>>,
 }
@@ -287,50 +286,71 @@ impl VectorIndex {
             threshold: 0.15,
             dim: model.dim(),
             vectors: chunks.iter().map(|(v, _)| v.clone()).collect(),
-            texts: texts.to_vec(),
             chunk_texts: chunks.into_iter().map(|(_, t)| t).collect(),
         }
     }
 
-    /// Rebuild over `texts`, reusing the stored vector for any text
-    /// that is unchanged so a one-cell edit does not re-embed every
-    /// region.
-    pub fn rebuild(&mut self, texts: &[String], model: &dyn EmbeddingModel) {
+    /// Rebuild for a new document list in which `reuse[i]` names the
+    /// old document that new document `i` is unchanged from. Reused
+    /// documents keep their vectors without being looked at; the rest
+    /// are embedded from `text(i)`, reusing the vectors of any line
+    /// they share with the old documents that were not reused (the
+    /// edited regions).
+    pub fn rebuild_reusing(
+        &mut self,
+        reuse: &[Option<usize>],
+        text: impl Fn(usize) -> String,
+        model: &dyn EmbeddingModel,
+    ) {
         if model.name() != self.model_name || model.dim() != self.dim {
-            // Preserve a customised threshold across a model swap.
+            let texts: Vec<String> = (0..reuse.len()).map(&text).collect();
             let threshold = self.threshold;
-            *self = VectorIndex::build(texts, model);
+            *self = VectorIndex::build(&texts, model);
             self.threshold = threshold;
             return;
         }
-        // Per-chunk cache: unchanged *lines* keep their vectors
-        // even when their region changed around them.
-        let cache: std::collections::HashMap<&str, &std::sync::Arc<Vec<f32>>> = self
-            .chunk_texts
-            .iter()
-            .flatten()
-            .map(|t| t.as_str())
-            .zip(self.vectors.iter().flatten())
-            .collect();
-        let mut all_vectors = Vec::new();
-        let mut all_texts = Vec::new();
-        for t in texts {
-            // Only embed lines the cache misses — embedding first and
-            // swapping in the cached Arc saved nothing.
-            let lines = chunk_lines(t);
-            let vecs: Vec<std::sync::Arc<Vec<f32>>> = lines
+        let reused: std::collections::HashSet<usize> = reuse.iter().flatten().copied().collect();
+        let fresh: Vec<Option<ChunkSet>> = {
+            let cache: std::collections::HashMap<&str, &std::sync::Arc<Vec<f32>>> = self
+                .chunk_texts
                 .iter()
-                .map(|line| match cache.get(line.as_str()) {
-                    Some(cached) => (*cached).clone(),
-                    None => std::sync::Arc::new(model.embed(line)),
-                })
+                .zip(&self.vectors)
+                .enumerate()
+                .filter(|(j, _)| !reused.contains(j))
+                .flat_map(|(_, (texts, vecs))| texts.iter().map(|t| t.as_str()).zip(vecs))
                 .collect();
-            all_vectors.push(vecs);
-            all_texts.push(lines);
+            reuse
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    r.is_none().then(|| {
+                        let lines = chunk_lines(&text(i));
+                        let vecs = lines
+                            .iter()
+                            .map(|line| match cache.get(line.as_str()) {
+                                Some(cached) => (*cached).clone(),
+                                None => std::sync::Arc::new(model.embed(line)),
+                            })
+                            .collect();
+                        (vecs, lines)
+                    })
+                })
+                .collect()
+        };
+        let mut old_vectors = std::mem::take(&mut self.vectors);
+        let mut old_texts = std::mem::take(&mut self.chunk_texts);
+        for (r, fresh) in reuse.iter().zip(fresh) {
+            let (vecs, lines) = match (r, fresh) {
+                (_, Some(set)) => set,
+                (Some(j), None) => (
+                    std::mem::take(&mut old_vectors[*j]),
+                    std::mem::take(&mut old_texts[*j]),
+                ),
+                (None, None) => unreachable!("a document without reuse is embedded"),
+            };
+            self.vectors.push(vecs);
+            self.chunk_texts.push(lines);
         }
-        self.vectors = all_vectors;
-        self.chunk_texts = all_texts;
-        self.texts = texts.to_vec();
     }
 
     pub fn search(&self, query: &str, model: &dyn EmbeddingModel, limit: usize) -> Vec<VectorHit> {
