@@ -1518,7 +1518,17 @@ pub struct GraphCache {
     regions: Vec<Option<Vec<Region>>>,
     /// Per formula cell (sheet index, row, col): its precedent areas.
     areas: std::collections::HashMap<(usize, usize, usize), Vec<lineage::Area>>,
+    /// Where the next audit window starts, counted over the entries a
+    /// rebuild reuses (see [`CACHE_AUDIT_SAMPLE`]).
+    audit_cursor: usize,
 }
+
+/// How many reused precedent entries each cached rebuild re-parses
+/// from the cell's current text. The window rotates, so over
+/// successive rebuilds every entry is checked. A mismatch means the
+/// edit tracking missed a change: the cache is dropped and the graph
+/// rebuilt from scratch.
+pub const CACHE_AUDIT_SAMPLE: usize = 256;
 
 impl GraphCache {
     /// Drop what `dirty` can have changed, or everything when the
@@ -1534,7 +1544,7 @@ impl GraphCache {
                 *self = GraphCache {
                     context: Some(context),
                     regions: vec![None; wb.sheets.len()],
-                    areas: Default::default(),
+                    ..GraphCache::default()
                 };
                 return;
             }
@@ -1648,6 +1658,16 @@ pub fn build_graph_cached(
     // Each formula's areas, kept for the invariant check so formulas
     // are parsed once per build.
     let mut precedents = FormulaAreas::default();
+    // Audit window over the reused entries: CACHE_AUDIT_SAMPLE of them,
+    // starting where the last rebuild's window ended.
+    // The window runs over the entries the cache holds now (at most
+    // that many can be reused).
+    let window = cache.areas.len().max(1);
+    let audit_start = cache.audit_cursor % window;
+    let audited =
+        |ordinal: usize| (ordinal % window + window - audit_start) % window < CACHE_AUDIT_SAMPLE;
+    let mut reused = 0usize;
+    let mut stale: Vec<String> = Vec::new();
     for (si, sheet) in wb.sheets.iter().enumerate() {
         let Some(home) = locator.sheet(&sheet.name) else {
             continue;
@@ -1658,9 +1678,25 @@ pub fn build_graph_cached(
                     let Some(src) = locator.find(home, r, c) else {
                         continue;
                     };
+                    let key = (si, r, c);
+                    if let Some(cached) = cache.areas.get_mut(&key) {
+                        if audited(reused) {
+                            let now = lineage.areas(wb, si, expr);
+                            if *cached != now {
+                                stale.push(format!(
+                                    "{}!{}{}",
+                                    quote_sheet(&sheet.name),
+                                    col_name(c),
+                                    r + 1
+                                ));
+                                *cached = now;
+                            }
+                        }
+                        reused += 1;
+                    }
                     let areas = cache
                         .areas
-                        .entry((si, r, c))
+                        .entry(key)
                         .or_insert_with(|| lineage.areas(wb, si, expr));
                     precedents.push(src, areas);
                     for area in areas.iter() {
@@ -1680,6 +1716,17 @@ pub fn build_graph_cached(
             }
         }
     }
+    if !stale.is_empty() {
+        // The edit tracking missed these changes, so other entries may
+        // be stale too: start over rather than trust the cache.
+        eprintln!(
+            "gridtalk: graph cache held stale precedents for {}; rebuilding from scratch",
+            stale.join(", ")
+        );
+        *cache = GraphCache::default();
+        return build_graph_cached(wb, cache, None);
+    }
+    cache.audit_cursor = (audit_start + CACHE_AUDIT_SAMPLE) % window;
     let violations = check_invariants_with(wb, &g, &precedents);
     (g, violations)
 }
@@ -2992,6 +3039,58 @@ mod tests {
         let (cached, _) = build_graph_cached(&wb, &mut cache, Some(&[]));
         let (fresh, _) = build_graph(&wb);
         assert_eq!(cached.edges, fresh.edges);
+    }
+
+    #[test]
+    fn the_cache_audit_catches_a_change_the_edit_tracking_missed() {
+        // 600 formulas: more than one audit window.
+        let mut csv = String::from("Item,Qty,Price,Total\n");
+        for r in 2..=601 {
+            csv.push_str(&format!("I{r},{r},2,=B{r}*C{r}\n"));
+        }
+        let mut wb = parse_delimited("d", "Sheet1", &csv, ',');
+        let mut cache = GraphCache::default();
+        build_graph_cached(&wb, &mut cache, None);
+        let edges_to_item = |g: &Graph| {
+            let item = g.nodes.iter().find(|n| n.label == "Item").unwrap().id;
+            g.edges
+                .iter()
+                .any(|e| e.kind == "depends_on" && e.to == item)
+        };
+        // A formula changes behind the cache's back (no dirty range):
+        // D500 now reads Item, which no other formula does.
+        *wb.sheets[0].cell_mut(499, 3) = CellValue::Formula {
+            expr: "A500&B500".into(),
+            cached: None,
+        };
+        assert!(edges_to_item(&build_graph(&wb).0));
+        let windows = 600_usize.div_ceil(CACHE_AUDIT_SAMPLE);
+        let mut caught = None;
+        for i in 0..windows {
+            let (g, v) = build_graph_cached(&wb, &mut cache, Some(&[]));
+            if edges_to_item(&g) {
+                assert!(v.is_empty(), "{v:?}");
+                // Caught: the graph is a fresh build's.
+                assert_eq!(g.edges, build_graph(&wb).0.edges);
+                caught = Some(i);
+                break;
+            }
+        }
+        assert!(caught.is_some(), "not caught within {windows} rebuilds");
+        // The first window after a fresh build covers the start of the
+        // cache, not all of it.
+        let mut cache = GraphCache::default();
+        let mut wb2 = parse_delimited("d", "Sheet1", &csv, ',');
+        build_graph_cached(&wb2, &mut cache, None);
+        *wb2.sheets[0].cell_mut(599, 3) = CellValue::Formula {
+            expr: "A600&B600".into(),
+            cached: None,
+        };
+        let (g, _) = build_graph_cached(&wb2, &mut cache, Some(&[]));
+        assert!(
+            !edges_to_item(&g),
+            "one window audits {CACHE_AUDIT_SAMPLE} entries, not every one"
+        );
     }
 
     #[test]
