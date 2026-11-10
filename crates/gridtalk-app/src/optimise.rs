@@ -435,6 +435,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let tasks = crate::bench::generate_tasks(&wb, 100);
         assert!(tasks

@@ -288,6 +288,17 @@ impl SyncState {
     }
 }
 
+/// The node a selection highlights: the node whose range it is (a
+/// graph-side pick), else the most specific node holding its cell.
+fn node_for_selection(graph: &Graph, sel: &RangeRef) -> Option<usize> {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.range.as_ref() == Some(sel))
+        .or_else(|| graph.node_for_cell(&sel.sheet, sel.r0, sel.c0))
+        .map(|n| n.id)
+}
+
 struct ChatMsg {
     role: String,
     text: String,
@@ -339,15 +350,6 @@ pub struct GridTalkApp {
     chat_cancel: Option<Arc<AtomicBool>>,
     chat_workbook: String,
     pending_open: Option<std::path::PathBuf>,
-    /// The workbook came from an .xlsx/.ods package, whose styles,
-    /// merges, charts and tables the snapshot does not keep.
-    lossy_source: bool,
-    /// The user confirmed that saving this workbook as .xlsx drops
-    /// those features (asked once per opened workbook).
-    lossy_save_confirmed: bool,
-    /// An .xlsx save waiting for that confirmation; the next Save
-    /// click writes here.
-    pending_lossy_save: Option<std::path::PathBuf>,
     close_armed: bool,
     graph_version: u64,
     chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
@@ -431,9 +433,6 @@ impl GridTalkApp {
             chat_cancel: None,
             chat_workbook: String::new(),
             pending_open: None,
-            lossy_source: false,
-            lossy_save_confirmed: false,
-            pending_lossy_save: None,
             close_armed: false,
             graph_version: 0,
             chat_rx: None,
@@ -629,16 +628,7 @@ impl GridTalkApp {
                     .unwrap_or_default();
                 let inc = IncrementalSnapshot::new(wb);
                 self.saved_revision = inc.revision;
-                self.lossy_source = matches!(
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.to_ascii_lowercase())
-                        .as_deref(),
-                    Some("xlsx") | Some("ods")
-                );
-                self.lossy_save_confirmed = false;
-                self.pending_lossy_save = None;
-                let violations = self.rebuild(inc.snapshot().clone());
+                let violations = self.rebuild(inc.snapshot(), false);
                 self.inc = Some(inc);
                 self.current_path = Some(path.to_path_buf());
                 self.selected_sheet = 0;
@@ -677,31 +667,53 @@ impl GridTalkApp {
         }
     }
 
-    fn rebuild(&mut self, snapshot: gridtalk_graph::WorkbookSnapshot) -> Vec<String> {
-        let (graph, violations) = build_graph(&snapshot);
-        self.graph_version += 1;
-        self.positions.clear();
-        if let Some(worker) = &self.layout_worker {
-            worker.cancel();
+    /// Rebuild the graph and refresh the index from `snapshot`.
+    /// After an edit (`after_edit`) the selection is a cell range that
+    /// still means the same cells, so it is kept and its highlighted
+    /// node re-found; and when the edit left the graph's shape alone
+    /// (the usual case: a value changed inside a region) the layout
+    /// is kept too, instead of the graph view jumping to a fresh one.
+    fn rebuild(
+        &mut self,
+        snapshot: &gridtalk_graph::WorkbookSnapshot,
+        after_edit: bool,
+    ) -> Vec<String> {
+        let (graph, violations) = build_graph(snapshot);
+        let same_shape =
+            after_edit && graph.nodes == self.graph.nodes && graph.edges == self.graph.edges;
+        if !same_shape {
+            self.graph_version += 1;
+            self.positions.clear();
+            if let Some(worker) = &self.layout_worker {
+                worker.cancel();
+            }
+            self.layout_worker = None;
+            self.layout_revision = u64::MAX; // force fresh layout for the new graph
         }
-        self.layout_worker = None;
-        // Selection refers to the previous graph; drop it.
-        self.sync.selected_range = None;
-        self.sync.highlighted_node = None;
-        self.scrolled_for = None;
+        if after_edit {
+            self.sync.highlighted_node = self
+                .sync
+                .selected_range
+                .as_ref()
+                .and_then(|sel| node_for_selection(&graph, sel));
+        } else {
+            // Selection refers to the previous workbook; drop it.
+            self.sync.selected_range = None;
+            self.sync.highlighted_node = None;
+            self.scrolled_for = None;
+        }
         if violations.is_empty() {
             // Refresh incrementally when possible (unchanged regions
             // keep their embedding vectors).
             match &mut self.index {
-                Some(index) => index.update(&snapshot, &graph),
-                None => self.index = Some(Index::build(&snapshot, &graph)),
+                Some(index) => index.update(snapshot, &graph),
+                None => self.index = Some(Index::build(snapshot, &graph)),
             }
         } else {
             // Never keep serving a stale index for a broken graph.
             self.index = None;
         }
         self.graph = graph;
-        self.layout_revision = u64::MAX; // force fresh layout for the new graph
         violations
     }
 
@@ -895,15 +907,6 @@ impl GridTalkApp {
             self.status = "Read-only mode is on: saving is disabled.".into();
             return;
         }
-        // A Save click confirms a pending lossy .xlsx save, whether
-        // Save or Save As started it.
-        if let Some(path) = self.pending_lossy_save.take() {
-            self.lossy_save_confirmed = true;
-            if self.save_to(&path, false) {
-                self.current_path = Some(path);
-            }
-            return;
-        }
         let Some(path) = self.current_path.clone() else {
             self.status = "Nothing to save: open a workbook first, or use Save As.".into();
             return;
@@ -941,17 +944,6 @@ impl GridTalkApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        // Any other save attempt supersedes a pending confirmation, so
-        // a later Save never writes to a path the user moved away from.
-        self.pending_lossy_save = None;
-        if ext == "xlsx" && self.lossy_source && !self.lossy_save_confirmed {
-            self.pending_lossy_save = Some(path.to_path_buf());
-            self.status = format!(
-                "Saving {} keeps values, formulas and defined names only: formatting, merged cells, charts, images and tables from the original file are lost. Click Save to confirm.",
-                path.display()
-            );
-            return false;
-        }
         // An edit typed <500ms ago must be in the saved file.
         let mut dropped_note = None;
         let mut applied = 0;
@@ -969,7 +961,7 @@ impl GridTalkApp {
         let snapshot = inc.snapshot().clone();
         let revision = inc.revision;
         if applied > 0 {
-            let violations = self.rebuild(snapshot.clone());
+            let violations = self.rebuild(&snapshot, true);
             self.layout_revision = revision;
             if !violations.is_empty() {
                 self.status = format!("Graph invariants violated: {violations:?}");
@@ -1019,8 +1011,7 @@ impl GridTalkApp {
 }
 
 /// Hover text for the save buttons: what an .xlsx save keeps.
-const SAVE_HOVER: &str =
-    "Saving .xlsx keeps values, formulas and defined names; formatting, merged cells, charts, images and tables are not kept";
+const SAVE_HOVER: &str = "Saving .xlsx keeps what was read from the opened file (formatting, merges, tables, charts), with your edits applied; anything it could not read was listed when it opened. .csv and .tsv hold one sheet's cells";
 
 /// A status line for edits dropped since `before` (the dropped-edit
 /// count before a flush), or `None` when every edit was applied.
@@ -1136,27 +1127,28 @@ impl eframe::App for GridTalkApp {
             self.status = "Unsaved edits — close again to exit without saving.".into();
         }
         // Apply debounced cell edits; rebuild graph+index on revision change.
-        if let Some(inc) = &mut self.inc {
+        // The snapshot is moved out for the rebuild (which borrows
+        // self) rather than cloned on every edit.
+        if let Some(mut inc) = self.inc.take() {
             let before = inc.dropped_edits();
             if inc.poll(std::time::Instant::now()) {
-                if let Some(note) = dropped_edit_note(inc, before) {
+                if let Some(note) = dropped_edit_note(&inc, before) {
                     self.status = note;
                 }
-                // The rebuild below is whole-workbook, so the dirty
-                // ranges are not needed yet; drain them so they do
-                // not accumulate for the whole session.
+                // The graph rebuild is whole-workbook, so the dirty
+                // ranges are not needed; drain them so they do not
+                // accumulate for the whole session.
                 inc.take_dirty_ranges();
-                let snapshot = inc.snapshot().clone();
-                let revision = inc.revision;
-                let violations = self.rebuild(snapshot);
+                let violations = self.rebuild(inc.snapshot(), true);
                 if !violations.is_empty() {
                     self.status = format!("Graph invariants violated: {violations:?}");
                 }
-                self.layout_revision = revision;
+                self.layout_revision = inc.revision;
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             } else if inc.pending_edits() > 0 {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             }
+            self.inc = Some(inc);
         }
         // Watchdog: a worker that never sends (hung backend, lost
         // cancel flag) must not wedge chat forever.
@@ -2199,6 +2191,7 @@ mod tests {
             }],
             names: Vec::new(),
             warnings: Vec::new(),
+            source: None,
         };
         let back = parse_delimited("d", "Sheet1", &snapshot_to_delimited(&wb, ','), ',');
         assert_eq!(back.sheets[0].cells, wb.sheets[0].cells);
@@ -2339,8 +2332,8 @@ mod tests {
     }
 
     #[test]
-    fn saving_an_xlsx_sourced_workbook_as_xlsx_asks_once() {
-        let dir = std::env::temp_dir().join(format!("gt-ui-lossy-{}", std::process::id()));
+    fn saving_an_xlsx_sourced_workbook_writes_at_once() {
+        let dir = std::env::temp_dir().join(format!("gt-ui-xlsx-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("in.xlsx");
         let wb = parse_delimited("in", "Sheet1", "A\n1\n", ',');
@@ -2348,34 +2341,65 @@ mod tests {
         let mut app = GridTalkApp::with_prefs(UiPrefs::default());
         app.open(&source);
         let out = dir.join("out.xlsx");
-        // The first .xlsx save only warns.
         app.save_as(&out);
-        assert!(!out.exists());
-        assert!(
-            app.status.contains("Click Save to confirm"),
-            "status: {}",
-            app.status
-        );
-        // Save confirms it, writing where Save As pointed.
-        app.save();
         assert!(out.exists(), "status: {}", app.status);
         assert_eq!(app.current_path.as_deref(), Some(out.as_path()));
-        // Confirmed once per opened workbook; CSV never asks.
-        std::fs::remove_file(&out).unwrap();
-        app.save();
-        assert!(out.exists());
-        app.save_as(&dir.join("copy.csv"));
-        assert!(dir.join("copy.csv").exists());
-        // A different save in between cancels a pending confirmation.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_keeps_the_selection_and_an_unchanged_graph_keeps_its_layout() {
+        let dir = std::env::temp_dir().join(format!("gt-ui-keep-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.csv");
+        std::fs::write(&source, "Item,Qty\nApples,2\nPears,4\n").unwrap();
         let mut app = GridTalkApp::with_prefs(UiPrefs::default());
         app.open(&source);
-        let abandoned = dir.join("abandoned.xlsx");
-        app.save_as(&abandoned);
-        let csv = dir.join("instead.csv");
-        app.save_as(&csv);
-        app.save();
-        assert!(!abandoned.exists());
-        assert_eq!(app.current_path.as_deref(), Some(csv.as_path()));
+        app.sync.select_cell(&app.graph, "Sheet1", 1, 1);
+        let highlighted = app.sync.highlighted_node;
+        assert!(highlighted.is_some());
+        app.positions = app
+            .graph
+            .nodes
+            .iter()
+            .map(|n| (n.id, layout::Pos { x: 1.0, y: 2.0 }))
+            .collect();
+        let version = app.graph_version;
+        let edit = |app: &mut GridTalkApp, row, col, value| {
+            let inc = app.inc.as_mut().unwrap();
+            inc.record_edit(
+                CellEdit {
+                    sheet: "Sheet1".into(),
+                    row,
+                    col,
+                    value,
+                },
+                std::time::Instant::now(),
+            );
+            inc.flush();
+            let inc = app.inc.take().unwrap();
+            app.rebuild(inc.snapshot(), true);
+            app.inc = Some(inc);
+        };
+        // A value inside the region: same graph, same layout.
+        edit(&mut app, 1, 1, CellValue::Number(9.0));
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!B2:B2"
+        );
+        assert_eq!(app.sync.highlighted_node, highlighted);
+        assert_eq!(app.graph_version, version);
+        assert_eq!(app.positions.len(), app.graph.nodes.len());
+        // A renamed header changes the graph: fresh layout, but the
+        // selection stays.
+        edit(&mut app, 0, 1, CellValue::Text("Count".into()));
+        assert_ne!(app.graph_version, version);
+        assert!(app.positions.is_empty());
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!B2:B2"
+        );
+        assert!(app.sync.highlighted_node.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

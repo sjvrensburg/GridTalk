@@ -6,7 +6,7 @@
 //! previous result (or "…" if there is none), so an edit never stalls
 //! a frame or makes every formula flicker.
 
-use gridtalk_graph::eval::{eval_many_values_in_workbook, EvalError, Value};
+use gridtalk_graph::eval::{EvalCache, EvalError, Value};
 use gridtalk_graph::{CellValue, WorkbookSnapshot};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -46,8 +46,15 @@ struct Job {
 pub struct ValueCache {
     entries: HashMap<CellKey, Entry>,
     job: Option<Job>,
-    /// The snapshot shared with workers, cloned once per revision.
-    snapshot: Option<(u64, Arc<WorkbookSnapshot>)>,
+    /// The snapshot shared with workers, cloned once per revision,
+    /// with its calc engine: the first job of a revision recalculates
+    /// the workbook, later jobs reuse the result.
+    snapshot: Option<(u64, Arc<Shared>)>,
+}
+
+struct Shared {
+    wb: WorkbookSnapshot,
+    calc: EvalCache,
 }
 
 impl ValueCache {
@@ -123,11 +130,14 @@ impl ValueCache {
             return;
         }
         let shared = match &self.snapshot {
-            Some((rev, wb)) if *rev == revision => wb.clone(),
+            Some((rev, shared)) if *rev == revision => shared.clone(),
             _ => {
-                let wb = Arc::new(snapshot.clone());
-                self.snapshot = Some((revision, wb.clone()));
-                wb
+                let shared = Arc::new(Shared {
+                    wb: snapshot.clone(),
+                    calc: EvalCache::new(),
+                });
+                self.snapshot = Some((revision, shared.clone()));
+                shared
             }
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -160,11 +170,12 @@ impl ValueCache {
     }
 }
 
-fn evaluate(wb: &WorkbookSnapshot, sheet_idx: usize, coords: &[(usize, usize)]) -> Vec<CellResult> {
+fn evaluate(shared: &Shared, sheet_idx: usize, coords: &[(usize, usize)]) -> Vec<CellResult> {
+    let wb = &shared.wb;
     let Some(sheet) = wb.sheets.get(sheet_idx) else {
         return vec![Err("sheet no longer exists".to_string()); coords.len()];
     };
-    let results = eval_many_values_in_workbook(wb, &sheet.name, coords);
+    let results = shared.calc.get(wb).values(&sheet.name, coords);
     coords
         .iter()
         .zip(results)

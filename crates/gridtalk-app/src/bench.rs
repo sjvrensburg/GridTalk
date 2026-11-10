@@ -8,7 +8,7 @@
 
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
-use gridtalk_graph::eval::{eval_cell_in_workbook, what_if_in_workbook};
+use gridtalk_graph::eval::Evaluator;
 use gridtalk_graph::{formula_refs_qualified, sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,8 @@ pub fn generate_tasks(wb: &WorkbookSnapshot, max_tasks: usize) -> Vec<BenchTask>
 
 pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGeneration {
     let mut skipped_formulas = 0usize;
+    // Built on the first formula: one recalculation for every task.
+    let mut evaluator: Option<Evaluator> = None;
     let mut drafts: Vec<(String, String, f64, String)> = Vec::new(); // kind, question, expected, citation
     for sheet in &wb.sheets {
         for (r, row) in sheet.cells.iter().enumerate() {
@@ -86,7 +88,8 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                         ));
                     }
                     CellValue::Formula { expr, .. } => {
-                        let evaluated = eval_cell_in_workbook(wb, &sheet.name, r, c);
+                        let calc = evaluator.get_or_insert_with(|| Evaluator::new(wb));
+                        let evaluated = calc.value(&sheet.name, r, c).and_then(|v| v.to_number());
                         if !matches!(evaluated, Ok(v) if v.is_finite()) {
                             skipped_formulas += 1;
                         }
@@ -138,12 +141,14 @@ pub fn generate_tasks_ex(wb: &WorkbookSnapshot, max_tasks: usize) -> TaskGenerat
                                 if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
                                     attempts += 1;
                                     let new_value = orig + 10.0;
-                                    if let Ok((before, after)) = what_if_in_workbook(
-                                        wb,
-                                        (&osheet_name, q.row, q.col),
-                                        new_value,
-                                        (&sheet.name, r, c),
-                                    ) {
+                                    let trial = calc
+                                        .what_if(
+                                            (&osheet_name, q.row, q.col),
+                                            new_value,
+                                            (&sheet.name, r, c),
+                                        )
+                                        .and_then(|(b, a)| Ok((b.to_number()?, a.to_number()?)));
+                                    if let Ok((before, after)) = trial {
                                         // Trivial tasks (outcome
                                         // unchanged) teach nothing.
                                         // `v` is the pre-computed before
@@ -616,6 +621,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let tasks = generate_tasks(&wb, 100);
         let report = run_bench(&tasks, &tools, &EchoBackend, "all", 8).unwrap();

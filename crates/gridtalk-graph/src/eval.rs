@@ -6,6 +6,7 @@
 
 use crate::calc::Engine;
 use crate::{CellValue, WorkbookSnapshot};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalError {
@@ -51,17 +52,24 @@ impl Value {
     }
 }
 
-/// A numeric result for the numeric API: text results are a type
-/// error (they have no number), booleans are 1/0, empty is 0.
-fn numeric(result: Result<Value, EvalError>) -> Result<f64, EvalError> {
-    match result? {
-        Value::Number(n) => Ok(n),
-        Value::Bool(b) => Ok(f64::from(u8::from(b))),
-        Value::Empty => Ok(0.0),
-        Value::Text(s) => Err(EvalError::Type(format!(
-            "text result {s:?} is not a number"
-        ))),
+impl Value {
+    /// The value as a number, as the numeric API reports it: text is
+    /// a type error (it has no number), booleans are 1/0, empty is 0.
+    pub fn to_number(&self) -> Result<f64, EvalError> {
+        match self {
+            Value::Number(n) => Ok(*n),
+            Value::Bool(b) => Ok(f64::from(u8::from(*b))),
+            Value::Empty => Ok(0.0),
+            Value::Text(s) => Err(EvalError::Type(format!(
+                "text result {s:?} is not a number"
+            ))),
+        }
     }
+}
+
+/// A numeric result for the numeric API (see [`Value::to_number`]).
+fn numeric(result: Result<Value, EvalError>) -> Result<f64, EvalError> {
+    result?.to_number()
 }
 
 /// Evaluate a cell in a named sheet of a workbook (cross-sheet refs).
@@ -84,8 +92,7 @@ pub fn eval_cell_value_in_workbook(
     row: usize,
     col: usize,
 ) -> Result<Value, EvalError> {
-    let engine = Engine::new(wb);
-    engine.value(engine.sheet(sheet_name)?, row, col)
+    Evaluator::new(wb).value(sheet_name, row, col)
 }
 
 /// Evaluate a target cell with one simulated override applied.
@@ -137,17 +144,7 @@ pub fn eval_many_values_in_workbook(
     sheet_name: &str,
     coords: &[(usize, usize)],
 ) -> Vec<Result<Value, EvalError>> {
-    let engine = Engine::new(wb);
-    match engine.sheet(sheet_name) {
-        Ok(idx) => coords
-            .iter()
-            .map(|(r, c)| engine.value(idx, *r, *c))
-            .collect(),
-        Err(_) => coords
-            .iter()
-            .map(|_| Err(EvalError::Ref(format!("no sheet named {sheet_name}"))))
-            .collect(),
-    }
+    Evaluator::new(wb).values(sheet_name, coords)
 }
 
 /// Workbook what-if: the override and target may live on different
@@ -179,13 +176,94 @@ pub fn what_if_values_in_workbook(
     if !value.is_finite() {
         return Err(EvalError::Type("what-if value must be finite".into()));
     }
-    let mut engine = Engine::new(wb);
-    let over = engine.sheet(override_ref.0)?;
-    let target = engine.sheet(target_ref.0)?;
-    let before = engine.value(target, target_ref.1, target_ref.2)?;
-    engine.set_number(over, override_ref.1, override_ref.2, value)?;
-    let after = engine.value(target, target_ref.1, target_ref.2)?;
-    Ok((before, after))
+    Evaluator::new(wb).what_if(override_ref, value, target_ref)
+}
+
+/// A workbook recalculated once, answering any number of evaluations
+/// and what-ifs. The free functions above build one per call; a
+/// caller that evaluates the same snapshot repeatedly (a tool
+/// session, the UI) keeps one in an [`EvalCache`] instead, because
+/// building it recalculates the whole workbook.
+#[derive(Clone)]
+pub struct Evaluator {
+    engine: Engine,
+}
+
+impl Evaluator {
+    /// Convert `wb` to a Gridcraft workbook and recalculate it.
+    pub fn new(wb: &WorkbookSnapshot) -> Self {
+        Evaluator {
+            engine: Engine::new(wb),
+        }
+    }
+
+    /// The value of a cell in a named sheet (matched
+    /// case-insensitively).
+    pub fn value(&self, sheet_name: &str, row: usize, col: usize) -> Result<Value, EvalError> {
+        self.engine.value(self.engine.sheet(sheet_name)?, row, col)
+    }
+
+    /// The values of several cells of one named sheet.
+    pub fn values(
+        &self,
+        sheet_name: &str,
+        coords: &[(usize, usize)],
+    ) -> Vec<Result<Value, EvalError>> {
+        match self.engine.sheet(sheet_name) {
+            Ok(idx) => coords
+                .iter()
+                .map(|(r, c)| self.engine.value(idx, *r, *c))
+                .collect(),
+            Err(_) => coords
+                .iter()
+                .map(|_| Err(EvalError::Ref(format!("no sheet named {sheet_name}"))))
+                .collect(),
+        }
+    }
+
+    /// The target's value before and after setting the override cell
+    /// to `value`. The override is applied to a copy, recalculating
+    /// only its dependents; `self` is unchanged.
+    pub fn what_if(
+        &self,
+        override_ref: (&str, usize, usize),
+        value: f64,
+        target_ref: (&str, usize, usize),
+    ) -> Result<(Value, Value), EvalError> {
+        let over = self.engine.sheet(override_ref.0)?;
+        let target = self.engine.sheet(target_ref.0)?;
+        let before = self.engine.value(target, target_ref.1, target_ref.2)?;
+        let mut engine = self.engine.clone();
+        engine.set_number(over, override_ref.1, override_ref.2, value)?;
+        let after = engine.value(target, target_ref.1, target_ref.2)?;
+        Ok((before, after))
+    }
+}
+
+/// An [`Evaluator`] built on first use and reused after. One cache
+/// belongs to one snapshot: when the snapshot changes, replace the
+/// cache (or [`clear`](Self::clear) it), or it answers for the old
+/// workbook.
+#[derive(Default)]
+pub struct EvalCache {
+    evaluator: OnceLock<Evaluator>,
+}
+
+impl EvalCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The evaluator for `wb`, built (with a full recalculation) on
+    /// the first call. Later calls must pass the same snapshot.
+    pub fn get(&self, wb: &WorkbookSnapshot) -> &Evaluator {
+        self.evaluator.get_or_init(|| Evaluator::new(wb))
+    }
+
+    /// Forget the evaluator, after the snapshot changed.
+    pub fn clear(&mut self) {
+        self.evaluator = OnceLock::new();
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +278,7 @@ mod tests {
             sheets: vec![sheet.clone()],
             names: Vec::new(),
             warnings: Vec::new(),
+            source: None,
         };
         eval_cell_in_workbook(&wb, &sheet.name, row, col)
     }
@@ -216,6 +295,7 @@ mod tests {
             sheets: vec![sheet.clone()],
             names: Vec::new(),
             warnings: Vec::new(),
+            source: None,
         };
         what_if_in_workbook(
             &wb,
@@ -459,6 +539,7 @@ mod tests {
             sheets: vec![row_sheet(cells)],
             names: Vec::new(),
             warnings: Vec::new(),
+            source: None,
         };
         let coords: Vec<_> = (0..cells.len()).map(|c| (0, c)).collect();
         eval_many_values_in_workbook(&wb, "S", &coords)
@@ -592,6 +673,7 @@ mod tests {
             sheets: vec![sheet],
             names: Vec::new(),
             warnings: Vec::new(),
+            source: None,
         };
         assert_eq!(
             eval_many_values_in_workbook(&wb, "S", &[(0, 1)]),
@@ -667,6 +749,7 @@ mod tests {
                 formula: "Rates!$A$4".into(),
             }],
             warnings: Vec::new(),
+            source: None,
         }
     }
 
@@ -710,5 +793,29 @@ mod tests {
             eval_cell_in_workbook(&back, "Summary", 0, 1).unwrap(),
             640.5
         );
+    }
+
+    #[test]
+    fn an_evaluator_answers_what_ifs_without_changing_itself() {
+        let wb = crate::WorkbookSnapshot {
+            name: "w".into(),
+            sheets: vec![sheet()],
+            names: Vec::new(),
+            warnings: Vec::new(),
+            source: None,
+        };
+        let cache = EvalCache::new();
+        let calc = cache.get(&wb);
+        assert!(std::ptr::eq(calc, cache.get(&wb)), "built once");
+        let (before, after) = calc
+            .what_if(("Sheet1", 1, 1), 10.0, ("Sheet1", 3, 3))
+            .unwrap();
+        assert_eq!((before, after), (Value::Number(26.0), Value::Number(50.0)));
+        assert_eq!(calc.value("sheet1", 3, 3).unwrap(), Value::Number(26.0));
+        assert_eq!(
+            calc.values("Sheet1", &[(1, 3), (2, 3)]),
+            vec![Ok(Value::Number(6.0)), Ok(Value::Number(20.0))]
+        );
+        assert!(matches!(calc.value("Nope", 0, 0), Err(EvalError::Ref(_))));
     }
 }

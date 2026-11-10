@@ -352,6 +352,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 wb: &wb,
                 graph: &graph,
                 hybrid: &hybrid,
+                calc: &gridtalk_graph::eval::EvalCache::new(),
             };
             let gen = bench::generate_tasks_ex(&wb, 100);
             let cfg = config_from_env();
@@ -490,6 +491,7 @@ fn run(args: &[String]) -> Result<(), String> {
                         wb: &wb,
                         graph: &graph,
                         hybrid: &hybrid,
+                        calc: &gridtalk_graph::eval::EvalCache::new(),
                     };
                     let mut skipped_formulas = 0usize;
                     let tasks: Vec<bench::BenchTask> = match flag("--tasks") {
@@ -623,6 +625,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 wb: &wb,
                 graph: &graph,
                 hybrid: &hybrid,
+                calc: &gridtalk_graph::eval::EvalCache::new(),
             };
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
@@ -754,6 +757,7 @@ fn run(args: &[String]) -> Result<(), String> {
                         wb: &wb,
                         graph: &graph,
                         hybrid: &hybrid,
+                        calc: &gridtalk_graph::eval::EvalCache::new(),
                     };
                     let req: tools::ToolRequest = serde_json::from_str(json)
                         .map_err(|e| format!("invalid tool request JSON: {e}"))?;

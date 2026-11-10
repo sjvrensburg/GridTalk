@@ -25,7 +25,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 - [x] Snapshot interchange type (`WorkbookSnapshot` / `SheetSnapshot`)
 - [x] CSV/TSV ingestion incl. quoted fields, type inference, formulas
 - [x] Typed `UnsupportedFormat` errors for XLSB/XLS/XLSM (explicit, not silent)
-- [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests). Known limits: ODS is data-only (Gridcraft imports formula results as constants, so what-if on `.ods` changes nothing; the reader's warning says so), and XLSX save keeps only values, formulas and defined names (merges, styles, charts and tables are lost)
+- [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests). Known limits: ODS is data-only (Gridcraft imports formula results as constants, so what-if on `.ods` changes nothing; the reader's warning says so), and XLSX save writes the source Gridcraft workbook with the edits overlaid, so it keeps what Gridcraft read (decision 0005)
 - [x] Incremental dirty-range re-snapshot (`IncrementalSnapshot`: 500 ms debounce, dirty-range list, revision counter). Known limits: the UI never consumes the dirty ranges (each edit rebuilds the whole graph and index), and an edit that cannot be applied is reported in the UI status
 - [x] egui grid+chat shell (`gridtalk-ui`: editable grid, chat pane, settings window) — on egui/eframe directly; Gridcraft `ui-egui` ribbon reuse remains a later swap
 
@@ -106,9 +106,9 @@ Phase 0 — silent data loss and wrong numbers:
 
 Phase 1 — structural:
 
-- [ ] Keep the original Gridcraft workbook alongside the snapshot (decided 2026-11-04; record as decision 0005 and update CLAUDE.md): preserves styles, merges, tables/structured refs, array formulas, the date system and error cells on save and eval
-- [ ] One cached calc engine per workbook revision for MCP, investigate, bench and the UI eval worker; what-if as incremental recalc on a copy (today one eval of 5,000 `SUM(A:A)` rows takes ~0.9 s because every call rebuilds and fully recalculates)
-- [ ] UI rebuilds incrementally from dirty ranges and keeps the selection after an edit
+- [x] Keep the original Gridcraft workbook alongside the snapshot (decision 0005): `WorkbookSnapshot::source`; `to_gridcraft_workbook` overlays only changed cells (keeping their style), so styles, merges, tables/structured refs, array formulas, the date system and error cells survive save and eval. The UI's "XLSX save loses formatting" prompt is gone. Known limit: a snapshot whose sheets were renamed, added or removed falls back to snapshot-only conversion
+- [x] One cached calc engine per workbook revision (`eval::EvalCache`/`Evaluator`) for MCP sessions, `Tools` (investigate, `tools call`), bench task generation and the UI eval worker; what-if runs on a clone, recalculating only the override's dependents. Measured on 5,000 `SUM(A:A)` rows: the first evaluation still costs the full recalculation (~0.9 s), the next 100 cell reads take 17 µs together. A what-if whose override every row depends on still recalculates every row (Gridcraft's cost)
+- [ ] UI rebuilds incrementally from dirty ranges and keeps the selection after an edit. Done: the selection and its highlighted node survive an edit; an edit that leaves the graph's nodes and edges unchanged keeps the graph layout; the snapshot is no longer cloned per edit; the index re-embeds only changed regions. Not done: the graph itself is still rebuilt for the whole workbook, and the dirty ranges are drained unused
 
 Phase 2 — agent-facing correctness:
 

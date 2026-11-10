@@ -95,6 +95,15 @@ pub struct WorkbookSnapshot {
     /// Shown to users so a partial import is never silent.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The Gridcraft workbook an XLSX/ODS snapshot was read from
+    /// (decision 0005). It carries everything the snapshot does not
+    /// model: styles, merges, tables, array formulas, error values,
+    /// the date system, charts. [`to_gridcraft_workbook`] starts from
+    /// it and overlays only the cells the snapshot changed, so
+    /// evaluation and saving keep those features. `None` for CSV/TSV
+    /// and hand-built snapshots.
+    #[serde(skip)]
+    pub source: Option<std::sync::Arc<gridcraft_model::Workbook>>,
 }
 
 /// A workbook defined name. `formula` has no leading `=`.
@@ -426,6 +435,7 @@ pub fn load_gridcraft_bytes(
     .map_err(|e| IngestError::Parse(format!("gridcraft {ext} reader: {e}")))?;
     let mut snapshot = from_gridcraft_workbook(name, &wb)?;
     snapshot.warnings = report.warnings;
+    snapshot.source = Some(std::sync::Arc::new(wb));
     Ok(snapshot)
 }
 
@@ -445,7 +455,6 @@ pub fn from_gridcraft_workbook(
     name: &str,
     wb: &gridcraft_model::Workbook,
 ) -> Result<WorkbookSnapshot, IngestError> {
-    use gridcraft_core::Value;
     let mut sheets = Vec::new();
     let mut total_cells: u64 = 0;
     for sheet in &wb.sheets {
@@ -472,29 +481,46 @@ pub fn from_gridcraft_workbook(
             cells = Vec::new();
         }
         for (addr, cell) in sheet.cells.iter() {
-            let cached = match &cell.value {
-                Value::Empty => None,
-                Value::Number(n) => Some(Box::new(CellValue::Number(*n))),
-                Value::Text(t) => Some(Box::new(CellValue::Text(t.to_string()))),
-                Value::Bool(b) => Some(Box::new(CellValue::Bool(*b))),
-                other => Some(Box::new(CellValue::Text(other.display()))),
-            };
-            let value = match &cell.formula {
-                Some(f) => CellValue::Formula {
-                    expr: f.text.clone(),
-                    cached,
-                },
-                None => cached.map(|c| *c).unwrap_or(CellValue::Empty),
-            };
-            cells[addr.row as usize][addr.col as usize] = value;
+            cells[addr.row as usize][addr.col as usize] = snapshot_cell(cell);
         }
         sheets.push(SheetSnapshot {
             name: sheet.name.clone(),
             cells,
         });
     }
-    let names = wb
-        .names
+    Ok(WorkbookSnapshot {
+        name: name.into(),
+        sheets,
+        names: snapshot_names(wb),
+        warnings: Vec::new(),
+        source: None,
+    })
+}
+
+/// A Gridcraft cell as a snapshot cell. Formulas keep their
+/// canonical text and cached value; an error value (constant or
+/// cached) reads as its display text, e.g. `#N/A`.
+fn snapshot_cell(cell: &gridcraft_model::Cell) -> CellValue {
+    use gridcraft_core::Value;
+    let cached = match &cell.value {
+        Value::Empty => None,
+        Value::Number(n) => Some(Box::new(CellValue::Number(*n))),
+        Value::Text(t) => Some(Box::new(CellValue::Text(t.to_string()))),
+        Value::Bool(b) => Some(Box::new(CellValue::Bool(*b))),
+        other => Some(Box::new(CellValue::Text(other.display()))),
+    };
+    match &cell.formula {
+        Some(f) => CellValue::Formula {
+            expr: f.text.clone(),
+            cached,
+        },
+        None => cached.map(|c| *c).unwrap_or(CellValue::Empty),
+    }
+}
+
+/// A Gridcraft workbook's defined names as the snapshot keeps them.
+fn snapshot_names(wb: &gridcraft_model::Workbook) -> Vec<DefinedName> {
+    wb.names
         .iter()
         .map(|n| DefinedName {
             name: n.name.clone(),
@@ -504,45 +530,117 @@ pub fn from_gridcraft_workbook(
                 .map(|s| s.name.clone()),
             formula: n.formula.clone(),
         })
-        .collect();
-    Ok(WorkbookSnapshot {
-        name: name.into(),
-        sheets,
-        names,
-        warnings: Vec::new(),
-    })
+        .collect()
 }
 
-/// Build a Gridcraft workbook from a snapshot: values, formulas with
-/// their cached values, and defined names. Sheet indices match the
-/// snapshot's.
-pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
+/// A snapshot cell as Gridcraft content (value and formula) on top
+/// of `base`, which keeps its style. An empty cell clears the content.
+fn gridcraft_cell(cell: &CellValue, mut base: gridcraft_model::Cell) -> gridcraft_model::Cell {
     use gridcraft_core::Value;
+    base.clear_content();
+    match cell {
+        CellValue::Empty => {}
+        CellValue::Text(t) => base.value = Value::Text(t.as_str().into()),
+        CellValue::Number(n) => base.value = Value::Number(*n),
+        CellValue::Bool(b) => base.value = Value::Bool(*b),
+        CellValue::Formula { expr, cached } => {
+            base.formula = Some(std::sync::Arc::new(gridcraft_model::Formula::new(expr)));
+            base.value = match cached.as_deref() {
+                Some(CellValue::Number(n)) => Value::Number(*n),
+                Some(CellValue::Bool(b)) => Value::Bool(*b),
+                Some(CellValue::Text(s)) => Value::Text(s.as_str().into()),
+                _ => Value::Empty,
+            };
+        }
+    }
+    base
+}
+
+/// Build a Gridcraft workbook from a snapshot. Sheet indices match
+/// the snapshot's.
+///
+/// When the snapshot keeps its [`WorkbookSnapshot::source`] and still
+/// has the same sheets, the result is that workbook with only the
+/// changed cells rewritten (each keeping its style), so everything
+/// the snapshot does not model survives. Otherwise it is built from
+/// the snapshot alone: values, formulas with their cached values, and
+/// defined names.
+pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
+    match &wb.source {
+        Some(source) if same_sheets(wb, source) => overlay_snapshot(wb, source),
+        _ => build_from_snapshot(wb),
+    }
+}
+
+fn same_sheets(wb: &WorkbookSnapshot, source: &gridcraft_model::Workbook) -> bool {
+    wb.sheets.len() == source.sheets.len()
+        && wb
+            .sheets
+            .iter()
+            .zip(&source.sheets)
+            .all(|(a, b)| a.name == b.name)
+}
+
+/// `source` with every cell whose snapshot value differs rewritten.
+/// Untouched sheets stay shared with `source` (sheets are `Arc`s).
+fn overlay_snapshot(
+    wb: &WorkbookSnapshot,
+    source: &gridcraft_model::Workbook,
+) -> gridcraft_model::Workbook {
+    use gridcraft_core::CellRef as GcRef;
+    let mut gc = source.clone();
+    for (i, sheet) in wb.sheets.iter().enumerate() {
+        let src = &source.sheets[i];
+        let mut changed: Vec<(GcRef, gridcraft_model::Cell)> = Vec::new();
+        // Cells the source has: rewrite those the snapshot changed.
+        for (at, cell) in src.cells.iter() {
+            let now = sheet.get_ref(at.row as usize, at.col as usize);
+            if *now != snapshot_cell(cell) {
+                changed.push((at, gridcraft_cell(now, cell.clone())));
+            }
+        }
+        // Cells only the snapshot has: edits into empty cells, which
+        // take their row or column style as Gridcraft's own entry does.
+        for (r, row) in sheet.cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if cell.is_empty() {
+                    continue;
+                }
+                let at = GcRef::new(r as u32, c as u32);
+                if src.cell(at).is_none() {
+                    let base = gridcraft_model::Cell::styled(
+                        gridcraft_core::Value::Empty,
+                        src.style_id(at),
+                    );
+                    changed.push((at, gridcraft_cell(cell, base)));
+                }
+            }
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        if let Some(target) = gc.sheet_mut(i) {
+            for (at, cell) in changed {
+                target.set_cell(at, cell);
+            }
+        }
+    }
+    if wb.names != snapshot_names(source) {
+        gc.names = gridcraft_names(wb);
+    }
+    gc
+}
+
+fn build_from_snapshot(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
     let mut gc = gridcraft_model::Workbook::new();
     gc.sheets.clear();
     for sheet in &wb.sheets {
         let mut gs = gridcraft_model::Sheet::new(sheet.name.clone());
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
-                let addr = gridcraft_core::CellRef::new(r as u32, c as u32);
-                match cell {
-                    CellValue::Empty => {}
-                    CellValue::Text(t) => gs.set_value(addr, Value::Text(t.as_str().into())),
-                    CellValue::Number(n) => gs.set_value(addr, Value::Number(*n)),
-                    CellValue::Bool(b) => gs.set_value(addr, Value::Bool(*b)),
-                    CellValue::Formula { expr, cached } => {
-                        let mut cell =
-                            gridcraft_model::Cell::formula(gridcraft_model::Formula::new(expr));
-                        if let Some(cached) = cached {
-                            cell.value = match cached.as_ref() {
-                                CellValue::Number(n) => Value::Number(*n),
-                                CellValue::Bool(b) => Value::Bool(*b),
-                                CellValue::Text(s) => Value::Text(s.as_str().into()),
-                                _ => Value::Empty,
-                            };
-                        }
-                        gs.set_cell(addr, cell)
-                    }
+                if !cell.is_empty() {
+                    let addr = gridcraft_core::CellRef::new(r as u32, c as u32);
+                    gs.set_cell(addr, gridcraft_cell(cell, gridcraft_model::Cell::default()));
                 }
             }
         }
@@ -552,8 +650,12 @@ pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook
         gc.sheets
             .push(std::sync::Arc::new(gridcraft_model::Sheet::new("Sheet1")));
     }
-    gc.names = wb
-        .names
+    gc.names = gridcraft_names(wb);
+    gc
+}
+
+fn gridcraft_names(wb: &WorkbookSnapshot) -> Vec<gridcraft_model::DefinedName> {
+    wb.names
         .iter()
         .map(|n| gridcraft_model::DefinedName {
             name: n.name.clone(),
@@ -565,12 +667,13 @@ pub fn to_gridcraft_workbook(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook
             comment: String::new(),
             hidden: false,
         })
-        .collect();
-    gc
+        .collect()
 }
 
 /// Serialise a snapshot to XLSX bytes via Gridcraft (used for
-/// fixtures and Save-As). Formulas are written as formulas.
+/// fixtures and Save-As). Formulas are written as formulas; a
+/// snapshot read from XLSX/ODS keeps what its source workbook has
+/// beyond cells (see [`to_gridcraft_workbook`]).
 pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
     let gc = to_gridcraft_workbook(wb);
     gridcraft_xlsx::write_xlsx(&gc)
@@ -606,6 +709,7 @@ pub fn parse_delimited_strict(
         }],
         names: Vec::new(),
         warnings: Vec::new(),
+        source: None,
     })
 }
 
@@ -1880,6 +1984,135 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].a1(), "Sheet1!B2:B2");
         assert!(inc.take_dirty_ranges().is_empty());
+    }
+
+    /// An XLSX written by Gridcraft with what the snapshot cannot
+    /// model: a number format, a merge, a constant error value and
+    /// the 1904 date system.
+    fn featureful_xlsx() -> Vec<u8> {
+        use gridcraft_core::Value as GcValue;
+        use gridcraft_core::{CellError, CellRef as GcRef, DateSystem, RangeRef as GcRange};
+        use gridcraft_model::{Cell, Formula, NumFmt, Style};
+        let mut gc = gridcraft_model::Workbook::new();
+        let money = gc.styles.intern(Style {
+            num_fmt: NumFmt::new("0.00"),
+            ..Style::default()
+        });
+        gc.date_system = DateSystem::D1904;
+        let s = gc.sheet_mut(0).unwrap();
+        s.set_cell(GcRef::new(0, 0), Cell::styled(GcValue::Number(2.0), money));
+        s.set_cell(GcRef::new(0, 1), Cell::value(GcValue::Error(CellError::NA)));
+        s.set_cell(GcRef::new(0, 2), Cell::formula(Formula::new("ISERROR(B1)")));
+        s.set_cell(GcRef::new(0, 3), Cell::formula(Formula::new("A1*10")));
+        s.set_cell(GcRef::new(0, 4), Cell::styled(GcValue::Number(7.0), money));
+        s.merges.push(GcRange::parse("F1:G2").unwrap());
+        // A table J1:J3 ("Sales", column "Qty") read by a structured
+        // reference in L1.
+        s.set_value(GcRef::new(0, 9), GcValue::Text("Qty".into()));
+        s.set_value(GcRef::new(1, 9), GcValue::Number(2.0));
+        s.set_value(GcRef::new(2, 9), GcValue::Number(3.0));
+        s.set_cell(
+            GcRef::new(0, 11),
+            Cell::formula(Formula::new("SUM(Sales[Qty])")),
+        );
+        let column = |name: &str| gridcraft_model::TableColumn {
+            name: name.into(),
+            totals: Default::default(),
+            totals_label: None,
+            formula: None,
+            unique_name: None,
+            xml: None,
+        };
+        s.tables.push(gridcraft_model::Table {
+            id: 1,
+            name: "Sales".into(),
+            range: GcRange::parse("J1:J3").unwrap(),
+            header_row: true,
+            totals_row: false,
+            columns: vec![column("Qty")],
+            style: String::new(),
+            banded_rows: false,
+            banded_cols: false,
+            first_col: false,
+            last_col: false,
+            filter_button: false,
+            filter: Vec::new(),
+            table_type: None,
+            connection_id: None,
+        });
+        gridcraft_xlsx::write_xlsx(&gc).unwrap()
+    }
+
+    #[test]
+    fn a_gridcraft_source_keeps_what_the_snapshot_cannot_model() {
+        use crate::eval::{eval_cell_value_in_workbook, Value};
+        use gridcraft_core::Value as GcValue;
+        use gridcraft_core::{CellError, CellRef as GcRef, DateSystem, RangeRef as GcRange};
+        let mut wb = load_gridcraft_bytes("t", "xlsx", &featureful_xlsx()).unwrap();
+        assert!(wb.source.is_some());
+        // The constant #N/A reaches the engine as an error, not as
+        // the text the snapshot shows.
+        assert_eq!(wb.sheets[0].get(0, 1), CellValue::Text("#N/A".into()));
+        assert_eq!(
+            eval_cell_value_in_workbook(&wb, "Sheet1", 0, 2).unwrap(),
+            Value::Bool(true)
+        );
+        // The table survives, so its structured reference evaluates.
+        assert_eq!(
+            eval_cell_value_in_workbook(&wb, "Sheet1", 0, 11).unwrap(),
+            Value::Number(5.0)
+        );
+        // Edits overlay the source: A1 changes, E1 is cleared, H3 is
+        // new.
+        wb.sheets[0].cells[0][0] = CellValue::Number(5.0);
+        wb.sheets[0].cells[0][4] = CellValue::Empty;
+        wb.sheets[0].cells.resize(3, Vec::new());
+        wb.sheets[0].cells[2].resize(8, CellValue::Empty);
+        wb.sheets[0].cells[2][7] = CellValue::Formula {
+            expr: "D1+1".into(),
+            cached: None,
+        };
+        assert_eq!(
+            eval_cell_value_in_workbook(&wb, "Sheet1", 2, 7).unwrap(),
+            Value::Number(51.0)
+        );
+        let (back, _) = gridcraft_xlsx::read_xlsx(&to_xlsx_bytes(&wb).unwrap()).unwrap();
+        let s = &back.sheets[0];
+        let a1 = s.cell(GcRef::new(0, 0)).unwrap();
+        assert_eq!(a1.value, GcValue::Number(5.0));
+        assert_eq!(back.styles.get(a1.style).num_fmt.as_str(), "0.00");
+        assert_eq!(
+            s.cell(GcRef::new(0, 1)).unwrap().value,
+            GcValue::Error(CellError::NA)
+        );
+        // A cleared cell keeps its format but loses its value.
+        assert_eq!(s.value(GcRef::new(0, 4)), GcValue::Empty);
+        assert_eq!(
+            back.styles
+                .get(s.style_id(GcRef::new(0, 4)))
+                .num_fmt
+                .as_str(),
+            "0.00"
+        );
+        assert_eq!(
+            s.cell(GcRef::new(2, 7))
+                .and_then(|c| c.formula.as_ref())
+                .map(|f| f.text.as_str()),
+            Some("D1+1")
+        );
+        assert!(s.merges.contains(&GcRange::parse("F1:G2").unwrap()));
+        assert_eq!(back.date_system, DateSystem::D1904);
+        assert_eq!(back.sheets[0].tables[0].name, "Sales");
+    }
+
+    #[test]
+    fn a_snapshot_whose_sheets_changed_is_converted_on_its_own() {
+        let mut wb = load_gridcraft_bytes("t", "xlsx", &featureful_xlsx()).unwrap();
+        wb.sheets[0].name = "Renamed".into();
+        let gc = to_gridcraft_workbook(&wb);
+        assert_eq!(gc.sheets[0].name, "Renamed");
+        assert_eq!(gc.date_system, gridcraft_core::DateSystem::D1900);
+        assert!(gc.sheets[0].merges.is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! the `gridtalk tools call --json` CLI, and the MCP server —
 //! external harnesses never scrape human-formatted strings.
 
-use gridtalk_graph::eval::{eval_many_values_in_workbook, what_if_values_in_workbook, Value};
+use gridtalk_graph::eval::{EvalCache, Value};
 use gridtalk_graph::{sheet_name_eq, CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,9 @@ pub struct Tools<'a> {
     pub wb: &'a WorkbookSnapshot,
     pub graph: &'a Graph,
     pub hybrid: &'a HybridIndex,
+    /// The workbook's recalculated engine, built on the first
+    /// evaluating call and shared by the rest. It must belong to `wb`.
+    pub calc: &'a EvalCache,
 }
 
 impl<'a> Tools<'a> {
@@ -288,7 +291,7 @@ impl<'a> Tools<'a> {
                             .collect();
                         // One recalculation for the whole batch, not
                         // one per cell.
-                        let evaluated = eval_many_values_in_workbook(self.wb, &sheet.name, &coords);
+                        let evaluated = self.calc.get(self.wb).values(&sheet.name, &coords);
                         let mut eval_iter = coords.iter().zip(evaluated.iter());
                         let mut formulas = Vec::new();
                         let mut lines = Vec::new();
@@ -367,8 +370,7 @@ impl<'a> Tools<'a> {
                 // evaluator matches sheet names exactly.
                 let override_sheet = self.sheet(&override_sheet).unwrap().name.clone();
                 let target_sheet = self.sheet(&target_sheet).unwrap().name.clone();
-                match what_if_values_in_workbook(
-                    self.wb,
+                match self.calc.get(self.wb).what_if(
                     (&override_sheet, orow, ocol),
                     *value,
                     (&target_sheet, tr, tc),
@@ -686,6 +688,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let whole = tools.call(&ToolRequest::GetCells {
             range: g.regions[0].range.a1(),
@@ -744,6 +747,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let res = tools.call(&ToolRequest::ListFormulas {
             range: "Sheet1!A1:D3".into(),
@@ -801,6 +805,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let search = tools.call(&ToolRequest::Search {
             query: "provision".into(),
