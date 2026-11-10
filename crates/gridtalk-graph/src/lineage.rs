@@ -157,6 +157,10 @@ pub struct AreaNodes {
     /// Per snapshot sheet: every region and column node (id, is a
     /// column, bounds), for the invariant check's independent rule.
     flat: Vec<Vec<(usize, bool, Bounds)>>,
+    /// Per snapshot sheet, per sheet column: the nodes whose span holds
+    /// that column (indices into `flat`), so the coverage rule looks at
+    /// a column's few nodes instead of every node on the sheet.
+    by_column: Vec<Vec<Vec<usize>>>,
     /// Per snapshot sheet: whether two of its regions overlap (the
     /// bounding boxes of separate components can). There a column can
     /// hold cells a more specific node of another region also holds.
@@ -213,10 +217,24 @@ impl AreaNodes {
                     .any(|(i, a)| regs[i + 1..].iter().any(|b| intersects(a.bounds, b.bounds)))
             })
             .collect();
+        let by_column = flat
+            .iter()
+            .map(|nodes| {
+                let width = nodes.iter().map(|&(_, _, b)| b.3 + 1).max().unwrap_or(0);
+                let mut cols = vec![Vec::new(); width];
+                for (i, &(_, _, b)) in nodes.iter().enumerate() {
+                    for col in &mut cols[b.1..=b.3] {
+                        col.push(i);
+                    }
+                }
+                cols
+            })
+            .collect();
         AreaNodes {
             sheets,
             flat,
             overlapping,
+            by_column,
         }
     }
 
@@ -257,7 +275,8 @@ impl AreaNodes {
     /// overlap is not covered, across the overlap's rows, by a more
     /// specific node (smaller, or a column the size of its region).
     pub fn nodes_by_coverage(&self, area: &Area, out: &mut Vec<usize>) {
-        let Some(nodes) = self.flat.get(area.0) else {
+        let (Some(nodes), Some(by_column)) = (self.flat.get(area.0), self.by_column.get(area.0))
+        else {
             return;
         };
         let rect = area.1;
@@ -275,21 +294,125 @@ impl AreaNodes {
             let more_specific = |other_column: bool, ob: Bounds| {
                 size(ob) < size(b) || (size(ob) == size(b) && other_column && !column)
             };
-            let smaller: Vec<Bounds> = nodes
-                .iter()
-                .filter(|&&(other, oc, ob)| {
-                    other != id && more_specific(oc, ob) && intersects(ob, overlap)
-                })
-                .map(|&(_, _, ob)| ob)
-                .collect();
+            // A column of the overlap is covered when a more specific
+            // node spans it across all the overlap's rows; only the
+            // nodes on that column can.
             let uncovered = (overlap.1..=overlap.3).any(|col| {
-                !smaller
-                    .iter()
-                    .any(|ob| ob.1 <= col && col <= ob.3 && ob.0 <= overlap.0 && ob.2 >= overlap.2)
+                !by_column[col].iter().any(|&j| {
+                    let (other, oc, ob) = nodes[j];
+                    other != id && more_specific(oc, ob) && ob.0 <= overlap.0 && ob.2 >= overlap.2
+                })
             });
             if uncovered {
                 out.push(id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{build_graph, parse_delimited};
+
+    /// The coverage rule as first written: every node on the sheet is
+    /// scanned for each node the area touches.
+    fn coverage_by_scan(an: &AreaNodes, area: &Area) -> Vec<usize> {
+        let mut out = Vec::new();
+        let nodes = &an.flat[area.0];
+        let rect = area.1;
+        let size = |b: Bounds| (b.2 - b.0 + 1) as u128 * (b.3 - b.1 + 1) as u128;
+        for &(id, column, b) in nodes {
+            if !intersects(b, rect) {
+                continue;
+            }
+            let overlap = (
+                b.0.max(rect.0),
+                b.1.max(rect.1),
+                b.2.min(rect.2),
+                b.3.min(rect.3),
+            );
+            let more_specific =
+                |oc: bool, ob: Bounds| size(ob) < size(b) || (size(ob) == size(b) && oc && !column);
+            let smaller: Vec<Bounds> = nodes
+                .iter()
+                .filter(|&&(o, oc, ob)| o != id && more_specific(oc, ob) && intersects(ob, overlap))
+                .map(|&(_, _, ob)| ob)
+                .collect();
+            if (overlap.1..=overlap.3).any(|col| {
+                !smaller
+                    .iter()
+                    .any(|ob| ob.1 <= col && col <= ob.3 && ob.0 <= overlap.0 && ob.2 >= overlap.2)
+            }) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_column_index_gives_the_scans_answer_for_every_small_area() {
+        let layouts = [
+            // Two regions separated by a gap, one a single column.
+            "A,B,,D\n1,2,,4\n3,4,,5\n,,,\nX,,,\n7,,,\n",
+            // An inverted U around a lone value: overlapping boxes.
+            "H1,H2,H3,H4,H5\n1,,,,2\n3,,9,,4\n5,,,,6\n7,,,,8\n",
+            // A header-only row over ragged data.
+            "P,Q,R\n1\n2,3\n,,4\n",
+        ];
+        // One workbook, a layout per sheet in a different order from
+        // the list, and an empty sheet (no nodes) between them, so a
+        // per-sheet index mix-up would give one sheet another's nodes.
+        let mut wb = parse_delimited("d", "Overlap", layouts[1], ',');
+        wb.sheets
+            .push(crate::SheetSnapshot::new("Empty", Vec::new()));
+        for (name, csv) in [("Gaps", layouts[0]), ("Ragged", layouts[2])] {
+            wb.sheets
+                .extend(parse_delimited("d", name, csv, ',').sheets);
+        }
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let an = AreaNodes::new(&wb, &g);
+        assert!(an.flat[1].is_empty() && an.by_column[1].is_empty());
+        let node_sheet = |id: usize| {
+            g.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.range.as_ref())
+                .map(|r| r.sheet.clone())
+        };
+        let mut nonempty = 0;
+        for (sheet, snapshot) in wb.sheets.iter().enumerate() {
+            for r0 in 0..7 {
+                for r1 in r0..7 {
+                    for c0 in 0..6 {
+                        for c1 in c0..6 {
+                            let area = (sheet, (r0, c0, r1, c1));
+                            let mut fast = Vec::new();
+                            an.nodes_by_coverage(&area, &mut fast);
+                            assert_eq!(
+                                fast,
+                                coverage_by_scan(&an, &area),
+                                "{} {area:?}",
+                                snapshot.name
+                            );
+                            // Every node found lies on the area's sheet.
+                            for id in &fast {
+                                assert_eq!(
+                                    node_sheet(*id).as_deref(),
+                                    Some(snapshot.name.as_str())
+                                );
+                            }
+                            nonempty += usize::from(!fast.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(nonempty > 0);
+        // An area on a sheet past the end finds nothing.
+        let mut none = Vec::new();
+        an.nodes_by_coverage(&(wb.sheets.len(), (0, 0, 3, 3)), &mut none);
+        assert!(none.is_empty());
     }
 }
