@@ -85,7 +85,7 @@ impl SheetSnapshot {
     /// snapshot shares it.
     pub fn cell_mut(&mut self, row: usize, col: usize) -> &mut CellValue {
         if self.cells.len() <= row {
-            self.cells.resize_with(row + 1, Default::default);
+            self.cells.resize(row + 1, Row::default());
         }
         let cells = std::sync::Arc::make_mut(&mut self.cells[row]);
         if cells.len() <= col {

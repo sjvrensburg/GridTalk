@@ -1356,7 +1356,7 @@ impl eframe::App for GridTalkApp {
         // entry each, so prune value-equal entries when it grows.
         if self.edit_buffers.len() > 1024 {
             if let Some(inc) = &self.inc {
-                let snapshot = inc.snapshot().clone();
+                let snapshot = inc.snapshot();
                 self.edit_buffers.retain(|(sheet_idx, r, c), buffer| {
                     let current = snapshot
                         .sheets

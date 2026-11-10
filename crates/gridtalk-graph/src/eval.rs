@@ -677,10 +677,10 @@ mod tests {
     #[test]
     fn cached_text_is_the_fallback_for_unsupported_functions() {
         let mut sheet = row_sheet(&["1"]);
-        std::sync::Arc::make_mut(&mut sheet.cells[0]).push(CellValue::Formula {
+        *sheet.cell_mut(0, 1) = CellValue::Formula {
             expr: "TEXT(A1,\"0.00\")".into(),
             cached: Some(Box::new(CellValue::Text("1.00".into()))),
-        });
+        };
         let wb = crate::WorkbookSnapshot {
             name: "w".into(),
             sheets: vec![sheet],
