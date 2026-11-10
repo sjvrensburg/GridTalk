@@ -175,10 +175,7 @@ mod tests {
     fn workbook(cells: Vec<Vec<CellValue>>) -> WorkbookSnapshot {
         WorkbookSnapshot {
             name: "t".into(),
-            sheets: vec![SheetSnapshot {
-                name: "Sheet1".into(),
-                cells,
-            }],
+            sheets: vec![SheetSnapshot::new("Sheet1", cells)],
             names: vec![],
             warnings: Vec::new(),
             source: None,

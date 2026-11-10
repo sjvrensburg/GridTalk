@@ -854,7 +854,7 @@ mod tests {
         let (g, _) = build_graph(&wb);
         let mut hybrid = HybridIndex::build(&wb, &g);
         // Edit sheet A: its region is re-indexed, sheet B's reused.
-        wb.sheets[0].cells[1][0] = gridtalk_graph::CellValue::Text("quux".into());
+        *wb.sheets[0].cell_mut(1, 0) = gridtalk_graph::CellValue::Text("quux".into());
         let (g, _) = build_graph(&wb);
         let dirty = [RangeRef {
             sheet: "A".into(),
