@@ -291,6 +291,9 @@ impl SyncState {
 /// A graph rebuild running on a worker thread.
 struct RebuildJob {
     revision: u64,
+    /// Whether the job updates an existing index (else it builds one
+    /// from scratch, and a failure is not retried).
+    incremental: bool,
     rx: std::sync::mpsc::Receiver<RebuildResult>,
 }
 
@@ -787,6 +790,7 @@ impl GridTalkApp {
         self.values.share(revision, snapshot.clone());
         let dirty = std::mem::take(&mut self.pending_dirty);
         let index = self.index.take();
+        let incremental = index.is_some();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(compute_rebuild(&snapshot, index, Some(&dirty)));
@@ -794,7 +798,11 @@ impl GridTalkApp {
                 ctx.request_repaint();
             }
         });
-        self.rebuild_job = Some(RebuildJob { revision, rx });
+        self.rebuild_job = Some(RebuildJob {
+            revision,
+            incremental,
+            rx,
+        });
         self.rebuild_wanted = false;
     }
 
@@ -823,11 +831,16 @@ impl GridTalkApp {
                 }
             }
             None => {
-                // The worker panicked and took the index with it: the
-                // next rebuild builds a fresh one.
+                // The worker panicked and took the index with it. An
+                // incremental update is retried once as a fresh build;
+                // a failed fresh build is not retried on every frame.
                 self.index = None;
-                self.rebuild_wanted = true;
-                self.status = "Rebuilding the graph after an edit failed; retrying.".into();
+                if job.incremental {
+                    self.rebuild_wanted = true;
+                    self.status = "Rebuilding the graph after an edit failed; retrying.".into();
+                } else {
+                    self.status = "Rebuilding the graph after an edit failed.".into();
+                }
             }
         }
         true
@@ -873,11 +886,13 @@ impl GridTalkApp {
         }
         self.chat_input.clear();
         self.push_chat("you", question.clone());
-        // Search the index as of the latest edit.
-        if self.rebuild_wanted && self.rebuild_job.is_none() {
-            self.start_rebuild(None);
-        }
+        // Search the index as of the latest edit: land the rebuild in
+        // flight, then run one more for edits that arrived during it.
         self.poll_rebuild(true);
+        if self.rebuild_wanted {
+            self.start_rebuild(None);
+            self.poll_rebuild(true);
+        }
         let Some(index) = &self.index else {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;

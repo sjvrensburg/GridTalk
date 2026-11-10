@@ -294,6 +294,21 @@ impl Index {
             .into_iter()
             .map(Some)
             .collect();
+        // Old documents by exact range, in document order, so each
+        // lookup is a hash probe instead of a scan of every document.
+        let mut by_range: std::collections::HashMap<
+            (String, usize, usize, usize, usize),
+            std::collections::VecDeque<usize>,
+        > = std::collections::HashMap::new();
+        for (j, d) in old.iter().enumerate() {
+            if let Some(d) = d {
+                let r = &d.0;
+                by_range
+                    .entry((r.sheet.clone(), r.r0, r.c0, r.r1, r.c1))
+                    .or_default()
+                    .push_back(j);
+            }
+        }
         let mut reuse = Vec::new();
         self.dropped_regions = 0;
         let assignments = region_sheet_assignments(wb, graph);
@@ -303,9 +318,11 @@ impl Index {
                 continue;
             };
             let clean = !dirty.iter().any(|d| overlaps(d, &region.range));
+            let r = &region.range;
             let hit = if clean {
-                old.iter()
-                    .position(|d| d.as_ref().is_some_and(|d| d.0 == region.range))
+                by_range
+                    .get_mut(&(r.sheet.clone(), r.r0, r.c0, r.r1, r.c1))
+                    .and_then(|js| js.pop_front())
             } else {
                 None
             };
