@@ -329,9 +329,24 @@ pub fn judge_number(answer: &str, expected: f64) -> bool {
         .is_some_and(|v| (v - expected).abs() <= tol)
 }
 
-/// Whether an answer states the expected text: the text appears in
-/// it as a whole word or phrase, ignoring case (`TRUE` in "it becomes
-/// true.", not inside "untrue").
+/// Words that may follow the stated value: they introduce a
+/// citation, not another value ("big. Citation: Sheet1!C2").
+const CITATION_WORDS: [&str; 7] = [
+    "citation",
+    "citations",
+    "source",
+    "sources",
+    "see",
+    "cited",
+    "range",
+];
+
+/// Whether the answer's last stated value is the expected text, the
+/// way [`judge_number`] wants the final number: the text's last
+/// whole-word occurrence (ignoring case) may be followed only by
+/// citations, punctuation and citation words. So "It becomes big."
+/// passes, "It becomes big, not small" and "not TRUE, it is FALSE"
+/// (for TRUE) fail, and a one-letter "A" is not found in "a value".
 pub fn judge_text(answer: &str, expected: &str) -> bool {
     let answer = answer.to_lowercase();
     let expected = expected.trim().to_lowercase();
@@ -339,6 +354,8 @@ pub fn judge_text(answer: &str, expected: &str) -> bool {
         return false;
     }
     let word = |c: char| c.is_alphanumeric() || c == '_';
+    // The last whole-word occurrence.
+    let mut last = None;
     let mut from = 0;
     while let Some(pos) = answer[from..].find(&expected) {
         let start = from + pos;
@@ -346,11 +363,30 @@ pub fn judge_text(answer: &str, expected: &str) -> bool {
         let before_ok = answer[..start].chars().next_back().is_none_or(|c| !word(c));
         let after_ok = answer[end..].chars().next().is_none_or(|c| !word(c));
         if before_ok && after_ok {
-            return true;
+            last = Some(end);
         }
         from = start + answer[start..].chars().next().map_or(1, char::len_utf8);
     }
-    false
+    let Some(end) = last else {
+        return false;
+    };
+    only_citations_follow(&answer[end..])
+}
+
+/// Whether `rest` holds nothing but citations (any token with a `!`,
+/// quoted sheet names included), punctuation and citation words.
+fn only_citations_follow(rest: &str) -> bool {
+    let mut rest = rest.to_string();
+    // Collapse quoted sheet prefixes ('My Sheet'!A1 to !A1) before
+    // splitting on whitespace, which would cut them apart.
+    while let Some(bang) = rest.find("'!") {
+        let start = rest[..bang].rfind('\'').unwrap_or(bang);
+        rest.replace_range(start..bang + 2, "!");
+    }
+    rest.split_whitespace().all(|token| {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '!');
+        token.is_empty() || token.contains('!') || CITATION_WORDS.contains(&token)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -764,10 +800,22 @@ mod tests {
     }
 
     #[test]
-    fn judge_text_wants_the_whole_word() {
+    fn judge_text_wants_the_last_value_stated() {
         assert!(judge_text("It becomes big.", "big"));
         assert!(judge_text("The result: TRUE", "true"));
-        assert!(judge_text("North East region", "north east"));
+        assert!(judge_text("The region is North East", "north east"));
+        // Citations, punctuation and citation words may follow.
+        assert!(judge_text("big (Sheet1!C2).", "big"));
+        assert!(judge_text("big. Citation: Sheet1!C2", "big"));
+        assert!(judge_text("big, see 'My Sheet'!A1:B2", "big"));
+        // A later value wins, as the final number does.
+        assert!(!judge_text("It becomes big, not small", "big"));
+        assert!(judge_text("It becomes big, not small", "small"));
+        assert!(!judge_text("not TRUE, it is FALSE", "TRUE"));
+        assert!(!judge_text("big, because B2 exceeds 5", "big"));
+        // Short texts are not found inside ordinary words or ranges.
+        assert!(!judge_text("It is a value", "A"));
+        assert!(judge_text("The grade is A.", "A"));
         assert!(!judge_text("It becomes bigger.", "big"));
         assert!(!judge_text("untrue", "TRUE"));
         assert!(!judge_text("anything", ""));

@@ -61,9 +61,19 @@ def test_prepare_data_roundtrip_and_bad_id(tmp_path):
 
 
 def test_text_present_mirrors_judge_text():
+    # The same cases as bench.rs judge_text_wants_the_last_value_stated.
     assert mod._text_present("It becomes big.", "big")
     assert mod._text_present("The result: TRUE", "true")
-    assert mod._text_present("North East region", "north east")
+    assert mod._text_present("The region is North East", "north east")
+    assert mod._text_present("big (Sheet1!C2).", "big")
+    assert mod._text_present("big. Citation: Sheet1!C2", "big")
+    assert mod._text_present("big, see 'My Sheet'!A1:B2", "big")
+    assert not mod._text_present("It becomes big, not small", "big")
+    assert mod._text_present("It becomes big, not small", "small")
+    assert not mod._text_present("not TRUE, it is FALSE", "TRUE")
+    assert not mod._text_present("big, because B2 exceeds 5", "big")
+    assert not mod._text_present("It is a value", "A")
+    assert mod._text_present("The grade is A.", "A")
     assert not mod._text_present("It becomes bigger.", "big")
     assert not mod._text_present("untrue", "TRUE")
     assert not mod._text_present("anything", "")

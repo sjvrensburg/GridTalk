@@ -320,9 +320,30 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     return False
 
 
+# Mirror of bench.rs CITATION_WORDS.
+_CITATION_WORDS = {"citation", "citations", "source", "sources", "see", "cited", "range"}
+
+
+def _only_citations_follow(rest: str) -> bool:
+    """Mirror of bench.rs `only_citations_follow`."""
+    while "'!" in rest:
+        bang = rest.index("'!")
+        start = rest.rfind("'", 0, bang)
+        if start == -1:
+            start = bang
+        rest = rest[:start] + "!" + rest[bang + 2 :]
+    for token in rest.split():
+        token = token.strip("".join(c for c in token if not c.isalnum() and c != "!"))
+        if token and "!" not in token and token not in _CITATION_WORDS:
+            return False
+    return True
+
+
 def _text_present(answer: str, expected: str) -> bool:
-    """Mirror of bench.rs `judge_text`: the expected text appears as a
-    whole word or phrase, ignoring case."""
+    """Mirror of bench.rs `judge_text`: the expected text is the last
+    value the answer states. Its last whole-word occurrence (ignoring
+    case) may be followed only by citations, punctuation and citation
+    words."""
     answer = answer.lower()
     expected = expected.strip().lower()
     if not expected:
@@ -331,15 +352,18 @@ def _text_present(answer: str, expected: str) -> bool:
     def word(c: str) -> bool:
         return c.isalnum() or c == "_"
 
+    last = None
     start = answer.find(expected)
     while start != -1:
         end = start + len(expected)
         before_ok = start == 0 or not word(answer[start - 1])
         after_ok = end == len(answer) or not word(answer[end])
         if before_ok and after_ok:
-            return True
+            last = end
         start = answer.find(expected, start + 1)
-    return False
+    if last is None:
+        return False
+    return _only_citations_follow(answer[last:])
 
 
 def score(task: dict, output: RunOutput) -> JudgeResult:

@@ -45,8 +45,11 @@ Each task runs through the investigate harness with the
 configured backend (the echo backend when no model is
 configured — that score is the floor a real model must beat).
 Scoring is a number check against ground truth (or, for a task
-with `expected_text`, a check that the answer states that text as a
-whole word, ignoring case) plus citation precision (did the answer
+with `expected_text`, a check that the text is the last value the
+answer states: its last whole-word occurrence, ignoring case, may be
+followed only by citations, punctuation and words such as
+"Citation:"; so "It becomes big." passes and "big, not small"
+fails) plus citation precision (did the answer
 cite the expected range?).
 
 Bench runs execute sequentially: task order, trails and CARD
