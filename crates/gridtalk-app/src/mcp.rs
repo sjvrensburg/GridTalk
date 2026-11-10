@@ -12,6 +12,7 @@
 //! write tool in the list at all.
 
 use crate::tools::{ToolRequest, Tools};
+use gridtalk_graph::eval::EvalCache;
 use gridtalk_graph::{build_graph, load_bytes, read_workbook_bytes, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde_json::{json, Value};
@@ -29,6 +30,9 @@ struct OpenWorkbook {
     wb: WorkbookSnapshot,
     graph: gridtalk_graph::Graph,
     hybrid: HybridIndex,
+    /// Recalculated once per loaded revision of the file: a reload
+    /// replaces the whole session, cache included.
+    calc: EvalCache,
 }
 
 impl OpenWorkbook {
@@ -93,6 +97,7 @@ impl OpenWorkbook {
             wb,
             graph,
             hybrid,
+            calc: EvalCache::new(),
         })
     }
 
@@ -128,6 +133,7 @@ impl OpenWorkbook {
             wb: &self.wb,
             graph: &self.graph,
             hybrid: &self.hybrid,
+            calc: &self.calc,
         }
     }
 }

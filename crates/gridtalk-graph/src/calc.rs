@@ -15,7 +15,9 @@ use gridcraft_model::{Cell, Workbook};
 use crate::{EXCEL_MAX_COLS as MAX_COLS, EXCEL_MAX_ROWS as MAX_ROWS};
 
 /// A snapshot converted to a Gridcraft workbook and fully
-/// recalculated.
+/// recalculated. Cloning it is far cheaper than recalculating, so a
+/// what-if runs on a clone.
+#[derive(Clone)]
 pub(crate) struct Engine {
     wb: Workbook,
     calc: Calc,
@@ -179,6 +181,7 @@ mod tests {
             }],
             names: vec![],
             warnings: Vec::new(),
+            source: None,
         }
     }
 

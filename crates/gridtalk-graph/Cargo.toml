@@ -11,3 +11,4 @@ gridcraft-xlsx = { path = "../../vendor/gridcraft/crates/xlsx" }
 gridcraft-model = { path = "../../vendor/gridcraft/crates/model" }
 gridcraft-core = { path = "../../vendor/gridcraft/crates/core" }
 gridcraft-calc = { path = "../../vendor/gridcraft/crates/calc" }
+gridcraft-formula = { path = "../../vendor/gridcraft/crates/formula" }

@@ -175,14 +175,12 @@ pub fn investigate_with(
                                 }
                                 if let CellValue::Formula { .. } = sheet_obj.get(r, c) {
                                     tried += 1;
-                                    if let Ok((before, after)) =
-                                        gridtalk_graph::eval::what_if_in_workbook(
-                                            tools.wb,
-                                            (&osheet, orow, ocol),
-                                            value,
-                                            (&sheet, r, c),
-                                        )
-                                    {
+                                    let trial = tools.calc.get(tools.wb).what_if_number(
+                                        (&osheet, orow, ocol),
+                                        value,
+                                        (&sheet, r, c),
+                                    );
+                                    if let Ok((before, after)) = trial {
                                         if (after - before).abs() > 1e-9 {
                                             return Some(format!(
                                                 "{}!{}{}",
@@ -464,6 +462,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         assert!(tools.execute("search", "q=provision").contains("Sheet1!"));
         assert!(tools
@@ -509,6 +508,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         assert!(investigate("provision?", &tools, &FailBackend, 8).is_err());
     }
@@ -520,6 +520,7 @@ mod tests {
             wb: &wb,
             graph: &g,
             hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         let out = tools.execute("what_if", "cell=B2;value=10;target=Sheet1!D2");
         assert!(out.contains("6 -> 30"), "got: {out}");
