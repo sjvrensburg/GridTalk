@@ -54,14 +54,46 @@ impl CellValue {
     }
 }
 
+/// One row of a sheet. Rows are shared between copies of a snapshot:
+/// cloning a snapshot copies one pointer per row, not every cell, and
+/// an edit copies only the row it changes, and only while another copy
+/// still holds it (`Arc::make_mut`, see [`SheetSnapshot::cell_mut`]).
+/// So the UI can hand each revision to its worker threads without
+/// copying the workbook on every edit.
+pub type Row = std::sync::Arc<Vec<CellValue>>;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SheetSnapshot {
     pub name: String,
-    /// Row-major cells; rows may be ragged.
-    pub cells: Vec<Vec<CellValue>>,
+    /// Row-major cells; rows may be ragged. Read them as usual
+    /// (`cells[r][c]`, `cells.get(r)`); write through
+    /// [`cell_mut`](Self::cell_mut) or `Arc::make_mut`.
+    pub cells: Vec<Row>,
 }
 
 impl SheetSnapshot {
+    /// A sheet from row-major cells.
+    pub fn new(name: impl Into<String>, rows: Vec<Vec<CellValue>>) -> Self {
+        SheetSnapshot {
+            name: name.into(),
+            cells: rows.into_iter().map(std::sync::Arc::new).collect(),
+        }
+    }
+
+    /// The cell at (row, col) for writing, growing the sheet (with
+    /// empty cells) to reach it. Only this row is copied if another
+    /// snapshot shares it.
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> &mut CellValue {
+        if self.cells.len() <= row {
+            self.cells.resize_with(row + 1, Default::default);
+        }
+        let cells = std::sync::Arc::make_mut(&mut self.cells[row]);
+        if cells.len() <= col {
+            cells.resize(col + 1, CellValue::Empty);
+        }
+        &mut cells[col]
+    }
+
     pub fn get(&self, row: usize, col: usize) -> CellValue {
         self.cells
             .get(row)
@@ -547,10 +579,7 @@ pub fn from_gridcraft_workbook(
         for (addr, cell) in sheet.cells.iter() {
             cells[addr.row as usize][addr.col as usize] = snapshot_cell(cell);
         }
-        sheets.push(SheetSnapshot {
-            name: sheet.name.clone(),
-            cells,
-        });
+        sheets.push(SheetSnapshot::new(sheet.name.clone(), cells));
     }
     Ok(WorkbookSnapshot {
         name: name.into(),
@@ -898,10 +927,7 @@ pub fn parse_delimited_strict(
     }
     Ok(WorkbookSnapshot {
         name: name.into(),
-        sheets: vec![SheetSnapshot {
-            name: sheet.into(),
-            cells: rows,
-        }],
+        sheets: vec![SheetSnapshot::new(sheet, rows)],
         names: Vec::new(),
         warnings: Vec::new(),
         source: None,
@@ -1965,26 +1991,15 @@ impl IncrementalSnapshot {
                 if edit.value == CellValue::Empty {
                     // Clearing a cell past the sheet's edge is a no-op:
                     // padding up to it would grow the sheet unchecked.
-                    if let Some(cell) = sheet
-                        .cells
-                        .get_mut(edit.row)
-                        .and_then(|r| r.get_mut(edit.col))
-                    {
-                        *cell = CellValue::Empty;
+                    if !sheet.get_ref(edit.row, edit.col).is_empty() {
+                        *sheet.cell_mut(edit.row, edit.col) = CellValue::Empty;
                     }
                     continue;
                 }
                 let (rows, cols) = &mut extents[idx];
                 *rows = (*rows).max(edit.row as u64 + 1);
                 *cols = (*cols).max(edit.col as u64 + 1);
-                while sheet.cells.len() <= edit.row {
-                    sheet.cells.push(Vec::new());
-                }
-                let row = &mut sheet.cells[edit.row];
-                while row.len() <= edit.col {
-                    row.push(CellValue::Empty);
-                }
-                row[edit.col] = edit.value;
+                *sheet.cell_mut(edit.row, edit.col) = edit.value;
             }
         }
         if applied > 0 {
@@ -2259,11 +2274,9 @@ mod tests {
         );
         // Edits overlay the source: A1 changes, E1 is cleared, H3 is
         // new.
-        wb.sheets[0].cells[0][0] = CellValue::Number(5.0);
-        wb.sheets[0].cells[0][4] = CellValue::Empty;
-        wb.sheets[0].cells.resize(3, Vec::new());
-        wb.sheets[0].cells[2].resize(8, CellValue::Empty);
-        wb.sheets[0].cells[2][7] = CellValue::Formula {
+        *wb.sheets[0].cell_mut(0, 0) = CellValue::Number(5.0);
+        *wb.sheets[0].cell_mut(0, 4) = CellValue::Empty;
+        *wb.sheets[0].cell_mut(2, 7) = CellValue::Formula {
             expr: "D1+1".into(),
             cached: None,
         };
@@ -2304,7 +2317,7 @@ mod tests {
     fn editing_a_table_header_renames_the_column_and_its_references() {
         use crate::eval::{eval_cell_value_in_workbook, Value};
         let mut wb = load_gridcraft_bytes("t", "xlsx", &featureful_xlsx()).unwrap();
-        wb.sheets[0].cells[0][9] = CellValue::Text("Count".into());
+        *wb.sheets[0].cell_mut(0, 9) = CellValue::Text("Count".into());
         // The formula still reads SUM(Sales[Qty]) in the snapshot; it
         // follows the rename in Gridcraft, so it keeps evaluating.
         assert_eq!(
@@ -2322,7 +2335,7 @@ mod tests {
             Some("SUM(Sales[Count])")
         );
         // An emptied header gets a generated name, written into the cell.
-        wb.sheets[0].cells[0][9] = CellValue::Empty;
+        *wb.sheets[0].cell_mut(0, 9) = CellValue::Empty;
         let gc = to_gridcraft_workbook(&wb);
         assert_eq!(gc.sheets[0].tables[0].columns[0].name, "Column1");
         assert_eq!(
@@ -2359,6 +2372,42 @@ mod tests {
         assert_eq!(gc.sheets[0].name, "Renamed");
         assert_eq!(gc.date_system, gridcraft_core::DateSystem::D1900);
         assert!(gc.sheets[0].merges.is_empty());
+    }
+
+    #[test]
+    fn snapshot_copies_share_rows_and_an_edit_copies_only_its_row() {
+        let mut inc = IncrementalSnapshot::new(sample());
+        let held = inc.snapshot().clone();
+        let shared = |a: &WorkbookSnapshot, b: &WorkbookSnapshot, r: usize| {
+            std::sync::Arc::ptr_eq(&a.sheets[0].cells[r], &b.sheets[0].cells[r])
+        };
+        assert!((0..held.sheets[0].cells.len()).all(|r| shared(&held, inc.snapshot(), r)));
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 1,
+                col: 1,
+                value: CellValue::Number(7.0),
+            },
+            std::time::Instant::now(),
+        );
+        inc.flush();
+        assert!(
+            !shared(&held, inc.snapshot(), 1),
+            "the edited row was copied"
+        );
+        assert!(shared(&held, inc.snapshot(), 0) && shared(&held, inc.snapshot(), 2));
+        assert_eq!(
+            held.sheets[0].get(1, 1),
+            CellValue::Number(2.0),
+            "the held copy is unchanged"
+        );
+        assert_eq!(inc.snapshot().sheets[0].get(1, 1), CellValue::Number(7.0));
+        // A write past the edge grows the sheet.
+        let mut sheet = SheetSnapshot::new("S", vec![]);
+        *sheet.cell_mut(2, 3) = CellValue::Bool(true);
+        assert_eq!((sheet.cells.len(), sheet.cells[2].len()), (3, 4));
+        assert_eq!(sheet.get(2, 3), CellValue::Bool(true));
     }
 
     #[test]
@@ -2533,10 +2582,13 @@ mod tests {
         // A sheet already over the cap (e.g. a ragged CSV) still takes
         // edits that do not grow it.
         let mut wide = sample();
-        wide.sheets[0].cells.push(vec![CellValue::Empty; 5_000]);
         wide.sheets[0]
             .cells
-            .extend(std::iter::repeat_n(vec![CellValue::Number(0.0)], 1_000));
+            .push(Row::new(vec![CellValue::Empty; 5_000]));
+        wide.sheets[0].cells.extend(std::iter::repeat_n(
+            Row::new(vec![CellValue::Number(0.0)]),
+            1_000,
+        ));
         let mut inc = IncrementalSnapshot::new(wide);
         inc.record_edit(edit(500, 0), now);
         assert_eq!(inc.flush(), 1);
@@ -2589,13 +2641,13 @@ mod tests {
     #[test]
     fn cross_sheet_formula_lifts_to_other_sheet() {
         let mut wb = parse_delimited("d", "Sheet1", "A,B\n1,=Sheet2!A2\n", ',');
-        wb.sheets.push(SheetSnapshot {
-            name: "Sheet2".into(),
-            cells: vec![
+        wb.sheets.push(SheetSnapshot::new(
+            "Sheet2",
+            vec![
                 vec![CellValue::Text("X".into())],
                 vec![CellValue::Number(9.0)],
             ],
-        });
+        ));
         let (g, violations) = build_graph(&wb);
         assert!(violations.is_empty(), "{violations:?}");
         assert!(g.edges.iter().any(|e| e.kind == "depends_on"));

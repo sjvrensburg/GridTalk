@@ -45,3 +45,4 @@ The workspace crates form a strict pipeline. Dependencies only point down this l
 ## Conventions
 
 - Put `use` declarations at module scope and mark public API items `pub`.
+- Snapshot rows are `Arc`-shared (`gridtalk_graph::Row`) so copies are cheap: read cells as usual, write through `SheetSnapshot::cell_mut` (or `Arc::make_mut`), and build sheets with `SheetSnapshot::new`.

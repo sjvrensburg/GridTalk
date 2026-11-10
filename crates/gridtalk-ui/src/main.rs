@@ -2321,13 +2321,13 @@ mod tests {
         // CR and edge whitespace survive a CSV round trip.
         let wb = gridtalk_graph::WorkbookSnapshot {
             name: "d".into(),
-            sheets: vec![gridtalk_graph::SheetSnapshot {
-                name: "Sheet1".into(),
-                cells: vec![vec![
+            sheets: vec![gridtalk_graph::SheetSnapshot::new(
+                "Sheet1",
+                vec![vec![
                     gridtalk_graph::CellValue::Text("a\rb".into()),
                     gridtalk_graph::CellValue::Text("  pad ".into()),
                 ]],
-            }],
+            )],
             names: Vec::new(),
             warnings: Vec::new(),
             source: None,
@@ -2367,10 +2367,10 @@ mod tests {
         assert!(saved.contains("99"), "pending edit must be saved: {saved}");
         // Multi-sheet CSV save is an explicit error, never silent loss.
         let mut wb2 = parse_delimited("d", "Sheet1", "A\n1\n", ',');
-        wb2.sheets.push(gridtalk_graph::SheetSnapshot {
-            name: "Second".into(),
-            cells: vec![vec![CellValue::Number(7.0)]],
-        });
+        wb2.sheets.push(gridtalk_graph::SheetSnapshot::new(
+            "Second",
+            vec![vec![CellValue::Number(7.0)]],
+        ));
         app.inc = Some(IncrementalSnapshot::new(wb2));
         app.current_path = Some(path.clone());
         app.save();

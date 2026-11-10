@@ -411,10 +411,10 @@ mod tests {
     #[test]
     fn cross_sheet_refs_evaluate() {
         let mut wb = parse_delimited("d", "Sheet1", "A\n=Sheet2!A2*2\n", ',');
-        wb.sheets.push(crate::SheetSnapshot {
-            name: "Sheet2".into(),
-            cells: vec![vec![CellValue::Number(1.0)], vec![CellValue::Number(21.0)]],
-        });
+        wb.sheets.push(crate::SheetSnapshot::new(
+            "Sheet2",
+            vec![vec![CellValue::Number(1.0)], vec![CellValue::Number(21.0)]],
+        ));
         assert_eq!(eval_cell_in_workbook(&wb, "Sheet1", 1, 0).unwrap(), 42.0);
         let (before, after) =
             what_if_in_workbook(&wb, ("Sheet2", 1, 0), 10.0, ("Sheet1", 1, 0)).unwrap();
@@ -433,16 +433,16 @@ mod tests {
             expr: expr.into(),
             cached: Some(Box::new(CellValue::Number(value))),
         };
-        sh.cells[1][3] = cached("D2+1", 999.0);
+        *sh.cell_mut(1, 3) = cached("D2+1", 999.0);
         assert!(matches!(eval_cell(&sh, 1, 3), Err(EvalError::Cycle(_))));
-        sh.cells[1][3] = cached("MEDIAN(1/0)", 42.0);
+        *sh.cell_mut(1, 3) = cached("MEDIAN(1/0)", 42.0);
         assert!(matches!(eval_cell(&sh, 1, 3), Err(EvalError::Type(_))));
         // Neither is an unknown function: callers see the error and
         // can choose to show the cached value (the UI does).
-        sh.cells[1][3] = cached("NOSUCHFN(1)", 42.0);
+        *sh.cell_mut(1, 3) = cached("NOSUCHFN(1)", 42.0);
         assert!(matches!(eval_cell(&sh, 1, 3), Err(EvalError::Parse(_))));
         // MEDIAN is computed, not read from the cache (B2=2, C2=3).
-        sh.cells[1][3] = cached("MEDIAN(B2:C2)", 999.0);
+        *sh.cell_mut(1, 3) = cached("MEDIAN(B2:C2)", 999.0);
         assert_eq!(eval_cell(&sh, 1, 3).unwrap(), 2.5);
         let wb = parse_delimited("d", "S", "A\n=TRUE()+FALSE()\n", ',');
         assert_eq!(eval_cell(&wb.sheets[0], 1, 0).unwrap(), 1.0);
@@ -480,17 +480,17 @@ mod tests {
         // Start-only qualified ranges inherit the start sheet,
         // and sheet qualifiers resolve case-insensitively.
         let mut wb2 = parse_delimited("d", "Sheet1", "A\n=SUM(sheet2!A1:A2)\n", ',');
-        wb2.sheets.push(crate::SheetSnapshot {
-            name: "Sheet2".into(),
-            cells: vec![vec![CellValue::Number(3.0)], vec![CellValue::Number(4.0)]],
-        });
+        wb2.sheets.push(crate::SheetSnapshot::new(
+            "Sheet2",
+            vec![vec![CellValue::Number(3.0)], vec![CellValue::Number(4.0)]],
+        ));
         assert_eq!(eval_cell_in_workbook(&wb2, "Sheet1", 1, 0).unwrap(), 7.0);
         // Doubly-qualified range ends are a typed error.
         let mut wb = parse_delimited("d", "Sheet1", "A\n=SUM(Sheet2!A1:Sheet1!B1)\n", ',');
-        wb.sheets.push(crate::SheetSnapshot {
-            name: "Sheet2".into(),
-            cells: vec![vec![CellValue::Number(5.0)]],
-        });
+        wb.sheets.push(crate::SheetSnapshot::new(
+            "Sheet2",
+            vec![vec![CellValue::Number(5.0)]],
+        ));
         assert!(eval_cell_in_workbook(&wb, "Sheet1", 1, 0).is_err());
     }
 
@@ -501,13 +501,13 @@ mod tests {
         let (before, after) = what_if_in_workbook(&wb, ("S", 1, 0), 7.0, ("S", 1, 1)).unwrap();
         assert_eq!((before, after), (0.0, 7.0));
         // A stale cache never overrides the expression (1+2 != 999).
-        let sheet = crate::SheetSnapshot {
-            name: "S".into(),
-            cells: vec![vec![CellValue::Formula {
+        let sheet = crate::SheetSnapshot::new(
+            "S",
+            vec![vec![CellValue::Formula {
                 expr: "1+2".into(),
                 cached: Some(Box::new(CellValue::Number(999.0))),
             }]],
-        };
+        );
         assert_eq!(eval_cell(&sheet, 0, 0).unwrap(), 3.0);
         // with_override validates finiteness like what_if.
         assert!(eval_cell_with_override(&wb, ("S", 1, 0), f64::NAN, ("S", 1, 1)).is_err());
@@ -543,10 +543,7 @@ mod tests {
                 Err(_) => CellValue::Text(c.to_string()),
             },
         };
-        SheetSnapshot {
-            name: "S".into(),
-            cells: vec![cells.iter().map(cell).collect()],
-        }
+        SheetSnapshot::new("S", vec![cells.iter().map(cell).collect()])
     }
 
     fn values(cells: &[&str]) -> Vec<Result<Value, EvalError>> {
@@ -680,7 +677,7 @@ mod tests {
     #[test]
     fn cached_text_is_the_fallback_for_unsupported_functions() {
         let mut sheet = row_sheet(&["1"]);
-        sheet.cells[0].push(CellValue::Formula {
+        std::sync::Arc::make_mut(&mut sheet.cells[0]).push(CellValue::Formula {
             expr: "TEXT(A1,\"0.00\")".into(),
             cached: Some(Box::new(CellValue::Text("1.00".into()))),
         });
@@ -706,16 +703,18 @@ mod tests {
             cached: Some(Box::new(CellValue::Number(-1.0))),
         };
         let n = CellValue::Number;
-        let month = |name: &str, billed: f64| crate::SheetSnapshot {
-            name: name.into(),
-            cells: vec![vec![CellValue::Text("Billed".into())], vec![n(billed)]],
+        let month = |name: &str, billed: f64| {
+            crate::SheetSnapshot::new(
+                name,
+                vec![vec![CellValue::Text("Billed".into())], vec![n(billed)]],
+            )
         };
         crate::WorkbookSnapshot {
             name: "impairment".into(),
             sheets: vec![
-                crate::SheetSnapshot {
-                    name: "Debtors".into(),
-                    cells: vec![
+                crate::SheetSnapshot::new(
+                    "Debtors",
+                    vec![
                         vec![
                             CellValue::Text("Balance".into()),
                             CellValue::Text("Days".into()),
@@ -735,29 +734,29 @@ mod tests {
                             f("ROUND(A3*C3,2)"),
                         ],
                     ],
-                },
-                crate::SheetSnapshot {
-                    name: "Rates".into(),
-                    cells: vec![
+                ),
+                crate::SheetSnapshot::new(
+                    "Rates",
+                    vec![
                         vec![n(0.0), n(0.02)],
                         vec![n(31.0), n(0.1)],
                         vec![n(121.0), n(0.85)],
                         vec![n(0.15)],
                     ],
-                },
+                ),
                 month("Jan", 1.0),
                 month("Feb", 2.0),
                 month("Mar", 4.0),
-                crate::SheetSnapshot {
-                    name: "Summary".into(),
-                    cells: vec![vec![
+                crate::SheetSnapshot::new(
+                    "Summary",
+                    vec![vec![
                         f("SUM(Debtors!D2:D3)"),
                         f("ROUND(A1*Tax_Rate,2)"),
                         f("SUM(Jan:Mar!A2)"),
                         f("A1+"),
                         f("ROUND(4250.985,2)+ROUND(1.005,2)"),
                     ]],
-                },
+                ),
             ],
             names: vec![crate::DefinedName {
                 name: "Tax_Rate".into(),
