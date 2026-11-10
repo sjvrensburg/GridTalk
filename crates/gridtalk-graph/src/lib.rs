@@ -593,6 +593,7 @@ fn overlay_snapshot(
     source: &gridcraft_model::Workbook,
 ) -> gridcraft_model::Workbook {
     let mut gc = source.clone();
+    let mut renames: Vec<ColumnRename> = Vec::new();
     for (i, sheet) in wb.sheets.iter().enumerate() {
         let src = &source.sheets[i];
         let mut changed: Vec<(GcRef, gridcraft_model::Cell)> = Vec::new();
@@ -621,15 +622,145 @@ fn overlay_snapshot(
             continue;
         }
         if let Some(target) = gc.sheet_mut(i) {
-            for (at, cell) in changed {
-                target.set_cell(at, cell);
+            for (at, cell) in &changed {
+                target.set_cell(*at, cell.clone());
             }
         }
+        let edited: Vec<GcRef> = changed.iter().map(|(at, _)| *at).collect();
+        renames.extend(sync_table_headers(&mut gc, i, &edited));
     }
+    rename_structured_refs(&mut gc, &renames);
     if wb.names != snapshot_names(source) {
         gc.names = gridcraft_names(wb);
     }
     gc
+}
+
+/// A table column renamed by an edit to its header cell: (sheet,
+/// table name, table range, old column name, new column name).
+type ColumnRename = (usize, String, gridcraft_core::RangeRef, String, String);
+
+/// Rename the table columns whose header cells were edited, as Excel
+/// (and Gridcraft's engine) does: the header text names the column,
+/// and an empty or repeated header gets a unique generated name that
+/// is written back into the cell. Without this, Gridcraft's writer
+/// would put the old column name back into the header on save.
+fn sync_table_headers(
+    gc: &mut gridcraft_model::Workbook,
+    sheet: usize,
+    edited: &[GcRef],
+) -> Vec<ColumnRename> {
+    let mut renames = Vec::new();
+    let Some(sh) = gc.sheet_mut(sheet) else {
+        return renames;
+    };
+    for &at in edited {
+        let Some(ti) = sh
+            .tables
+            .iter()
+            .position(|t| t.header_row && at.row == t.range.start.row && t.range.contains(at))
+        else {
+            continue;
+        };
+        let col = (at.col - sh.tables[ti].range.start.col) as usize;
+        let Some(old) = sh.tables[ti].columns.get(col).map(|c| c.name.clone()) else {
+            continue;
+        };
+        let value = sh.value(at);
+        let is_text = value.is_text() && sh.cell(at).is_some_and(|c| c.formula.is_none());
+        let text = match value.as_text() {
+            Some(t) => t.to_string(),
+            None => value.display(),
+        };
+        if text == old && is_text {
+            continue;
+        }
+        let table = &sh.tables[ti];
+        let taken: std::collections::HashSet<String> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != col)
+            .map(|(_, c)| c.name.to_lowercase())
+            .collect();
+        let base = if text.trim().is_empty() {
+            format!("Column{}", col + 1)
+        } else {
+            text.clone()
+        };
+        let mut name = base.clone();
+        let mut k = 2;
+        while taken.contains(&name.to_lowercase()) {
+            name = format!("{base}{k}");
+            k += 1;
+        }
+        let (table_name, range) = (table.name.clone(), table.range);
+        sh.tables[ti].columns[col].name = name.clone();
+        // Headers hold constant text: a number, a formula or a
+        // generated name is written back as text.
+        if name != text || !is_text {
+            let style = sh.style_id(at);
+            sh.set_cell(
+                at,
+                gridcraft_model::Cell::styled(GcValue::Text(name.as_str().into()), style),
+            );
+        }
+        if !old.eq_ignore_ascii_case(&name) {
+            renames.push((sheet, table_name, range, old, name));
+        }
+    }
+    renames
+}
+
+/// Point structured references at renamed table columns.
+fn rename_structured_refs(gc: &mut gridcraft_model::Workbook, renames: &[ColumnRename]) {
+    if renames.is_empty() {
+        return;
+    }
+    for i in 0..gc.sheets.len() {
+        let formulas: Vec<(GcRef, std::sync::Arc<gridcraft_model::Formula>)> = gc.sheets[i]
+            .cells
+            .iter()
+            .filter_map(|(at, c)| c.formula.clone().map(|f| (at, f)))
+            .collect();
+        for (at, f) in formulas {
+            let Some(expr) = f.expr() else {
+                continue;
+            };
+            let mut hit = false;
+            let renamed = expr.map(&mut |x| match x {
+                gridcraft_formula::Expr::Struct(mut st) => {
+                    for (sheet, table, range, old, name) in renames {
+                        // `[@Col]` inside the table has no table name.
+                        let this = if st.table.is_empty() {
+                            i == *sheet && range.contains(at)
+                        } else {
+                            st.table.eq_ignore_ascii_case(table)
+                        };
+                        if this {
+                            for end in [&mut st.col_start, &mut st.col_end].into_iter().flatten() {
+                                if end.eq_ignore_ascii_case(old) {
+                                    *end = name.clone();
+                                    hit = true;
+                                }
+                            }
+                        }
+                    }
+                    gridcraft_formula::Expr::Struct(st)
+                }
+                other => other,
+            });
+            if !hit {
+                continue;
+            }
+            if let Some(cell) = gc.sheet_mut(i).and_then(|s| s.cells.get_mut(at)) {
+                let mut formula = gridcraft_model::Formula::from_expr(renamed);
+                formula.array = f.array;
+                formula.dynamic = f.dynamic;
+                cell.formula = Some(std::sync::Arc::new(formula));
+            }
+        }
+    }
 }
 
 fn build_from_snapshot(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
@@ -2104,6 +2235,37 @@ mod tests {
         assert!(s.merges.contains(&GcRange::parse("F1:G2").unwrap()));
         assert_eq!(back.date_system, DateSystem::D1904);
         assert_eq!(back.sheets[0].tables[0].name, "Sales");
+    }
+
+    #[test]
+    fn editing_a_table_header_renames_the_column_and_its_references() {
+        use crate::eval::{eval_cell_value_in_workbook, Value};
+        let mut wb = load_gridcraft_bytes("t", "xlsx", &featureful_xlsx()).unwrap();
+        wb.sheets[0].cells[0][9] = CellValue::Text("Count".into());
+        // The formula still reads SUM(Sales[Qty]) in the snapshot; it
+        // follows the rename in Gridcraft, so it keeps evaluating.
+        assert_eq!(
+            eval_cell_value_in_workbook(&wb, "Sheet1", 0, 11).unwrap(),
+            Value::Number(5.0)
+        );
+        let (back, _) = gridcraft_xlsx::read_xlsx(&to_xlsx_bytes(&wb).unwrap()).unwrap();
+        let s = &back.sheets[0];
+        assert_eq!(s.tables[0].columns[0].name, "Count");
+        assert_eq!(s.value(GcRef::new(0, 9)), GcValue::Text("Count".into()));
+        assert_eq!(
+            s.cell(GcRef::new(0, 11))
+                .and_then(|c| c.formula.as_ref())
+                .map(|f| f.text.as_str()),
+            Some("SUM(Sales[Count])")
+        );
+        // An emptied header gets a generated name, written into the cell.
+        wb.sheets[0].cells[0][9] = CellValue::Empty;
+        let gc = to_gridcraft_workbook(&wb);
+        assert_eq!(gc.sheets[0].tables[0].columns[0].name, "Column1");
+        assert_eq!(
+            gc.sheets[0].value(GcRef::new(0, 9)),
+            GcValue::Text("Column1".into())
+        );
     }
 
     #[test]

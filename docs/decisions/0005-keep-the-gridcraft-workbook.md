@@ -15,6 +15,13 @@ keeps its style, and a new cell takes its row or column style. If
 the snapshot's sheets no longer match the source's (count or
 names), the workbook is built from the snapshot alone, as before.
 
+An edited table header renames its column, as in Excel and
+Gridcraft's engine: an empty or repeated header gets a unique
+generated name, and structured references follow the rename.
+Without that, Gridcraft's writer would restore the old column name
+on save. The snapshot's own formula text keeps the old name; only
+the Gridcraft workbook is rewritten.
+
 ## Why
 
 - The snapshot models values, formulas, cached values and defined
