@@ -139,6 +139,35 @@ pub struct WorkbookSnapshot {
     pub source: Option<std::sync::Arc<gridcraft_model::Workbook>>,
 }
 
+impl WorkbookSnapshot {
+    /// An estimate of the heap this snapshot holds: every cell's slot
+    /// plus the text, formula text and cached value it owns. Rows
+    /// shared with another snapshot are counted in full. It does not
+    /// count the Gridcraft `source` workbook or anything built from
+    /// the snapshot (graph, index); callers that budget memory scale
+    /// it for those.
+    pub fn approx_bytes(&self) -> u64 {
+        fn cell(c: &CellValue) -> u64 {
+            match c {
+                CellValue::Text(t) => t.capacity() as u64,
+                CellValue::Formula { expr, cached } => {
+                    expr.capacity() as u64
+                        + cached
+                            .as_deref()
+                            .map_or(0, |v| std::mem::size_of::<CellValue>() as u64 + cell(v))
+                }
+                _ => 0,
+            }
+        }
+        let slot = std::mem::size_of::<CellValue>() as u64;
+        self.sheets
+            .iter()
+            .flat_map(|s| s.cells.iter())
+            .map(|row| row.capacity() as u64 * slot + row.iter().map(cell).sum::<u64>())
+            .sum()
+    }
+}
+
 /// A workbook defined name. `formula` has no leading `=`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DefinedName {
@@ -422,6 +451,47 @@ const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
 /// Ingestion cap for XLSX/ODS packages.
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Largest total unpacked size an XLSX/ODS package may declare: room
+/// for a sheet at [`MAX_SNAPSHOT_CELLS`] plus its strings and styles,
+/// and half of what Gridcraft's reader allows (1 GiB).
+pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
+/// Most zip entries a package may have (Gridcraft's own limit).
+const MAX_PACKAGE_ENTRIES: usize = 200_000;
+
+/// Reject a package whose zip directory declares more than
+/// [`MAX_UNPACKED_BYTES`] unpacked, before Gridcraft decompresses
+/// anything. This reads only the directory at the end of the file, so
+/// it costs no decompression. A package that understates its sizes
+/// passes this check, but Gridcraft's reader counts the bytes it
+/// actually unpacks and stops at 512 MiB per part and 1 GiB in all.
+/// Bytes that are not a zip archive are left to Gridcraft to report.
+fn check_package_unpacked(bytes: &[u8]) -> Result<(), IngestError> {
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return Ok(());
+    };
+    if zip.len() > MAX_PACKAGE_ENTRIES {
+        return Err(IngestError::Parse(format!(
+            "spreadsheet package has {} zip entries, over the {MAX_PACKAGE_ENTRIES}-entry cap",
+            zip.len()
+        )));
+    }
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let Ok(entry) = zip.by_index_raw(i) else {
+            continue;
+        };
+        total = total.saturating_add(entry.size());
+        if total > MAX_UNPACKED_BYTES {
+            return Err(IngestError::Parse(format!(
+                "spreadsheet package unpacks to more than {MAX_UNPACKED_BYTES} bytes (the cap was passed at {}, which declares {} bytes)",
+                entry.name(),
+                entry.size()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Lowercased extension and workbook name (file stem) of a path.
 fn ext_and_name(path: &std::path::Path) -> (String, String) {
     let ext = path
@@ -523,6 +593,7 @@ pub fn load_gridcraft_bytes(
     ext: &str,
     bytes: &[u8],
 ) -> Result<WorkbookSnapshot, IngestError> {
+    check_package_unpacked(bytes)?;
     let (wb, report) = if ext == "ods" {
         gridcraft_xlsx::read_ods(bytes)
     } else {
@@ -2325,6 +2396,39 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A package whose zip directory declares more than
+    /// `MAX_UNPACKED_BYTES` is refused before Gridcraft unpacks it.
+    /// The package is tiny: its directory states a size it never had.
+    #[test]
+    fn package_declaring_a_huge_unpacked_size_is_refused() {
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("xl/worksheets/sheet1.xml", options).unwrap();
+            zip.write_all(b"<worksheet/>").unwrap();
+            zip.finish().unwrap();
+        }
+        let honest = buf.into_inner();
+        assert!(check_package_unpacked(&honest).is_ok());
+        // Patch the central directory entry's uncompressed size
+        // (offset 24 of the 0x02014b50 header) to 1 GiB.
+        let mut bomb = honest.clone();
+        let at = bomb
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central directory header");
+        bomb[at + 24..at + 28].copy_from_slice(&(1u32 << 30).to_le_bytes());
+        let err = load_bytes(std::path::Path::new("bomb.xlsx"), &bomb).unwrap_err();
+        assert!(err.to_string().contains("unpacks to more than"), "{err}");
+        let err = load_bytes(std::path::Path::new("bomb.ods"), &bomb).unwrap_err();
+        assert!(err.to_string().contains("unpacks to more than"), "{err}");
+        // Bytes that are not a zip are Gridcraft's to report.
+        assert!(check_package_unpacked(b"not a zip").is_ok());
     }
 
     #[test]

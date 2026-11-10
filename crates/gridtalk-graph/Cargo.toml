@@ -12,3 +12,6 @@ gridcraft-model = { path = "../../vendor/gridcraft/crates/model" }
 gridcraft-core = { path = "../../vendor/gridcraft/crates/core" }
 gridcraft-calc = { path = "../../vendor/gridcraft/crates/calc" }
 gridcraft-formula = { path = "../../vendor/gridcraft/crates/formula" }
+# Only to read a package's zip directory before Gridcraft parses it;
+# the same version and features as Gridcraft's own.
+zip = { version = "3", default-features = false, features = ["deflate"] }

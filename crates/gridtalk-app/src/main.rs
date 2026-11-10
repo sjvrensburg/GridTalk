@@ -718,18 +718,49 @@ fn run(args: &[String]) -> Result<(), String> {
             // there are no write tools yet either way (what_if is
             // simulation-only), so it currently changes nothing.
             // Anything else is a typo and must not be silently ignored.
-            for extra in &args[2..] {
-                if extra == "--allow-write" {
-                    eprintln!(
+            let mut options = mcp::McpOptions::default();
+            let mut rest = args[2..].iter();
+            while let Some(arg) = rest.next() {
+                let mut value = |flag: &str| {
+                    rest.next()
+                        .ok_or_else(|| format!("{flag} needs a value"))
+                        .cloned()
+                };
+                match arg.as_str() {
+                    "--allow-write" => eprintln!(
                         "gridtalk: warning: --allow-write is a no-op (no write tools exist yet)"
-                    );
-                } else {
-                    return Err(format!(
-                        "unknown argument {extra} for `gridtalk mcp` (only --allow-write is recognised)"
-                    ));
+                    ),
+                    "--root" => options.add_root(std::path::Path::new(&value("--root")?))?,
+                    "--timeout" => {
+                        let secs = value("--timeout")?;
+                        let secs: u64 = secs
+                            .parse()
+                            .ok()
+                            .filter(|s| (1..=86_400).contains(s))
+                            .ok_or_else(|| {
+                                format!("--timeout must be 1 to 86400 seconds, got {secs}")
+                            })?;
+                        options.call_timeout = std::time::Duration::from_secs(secs);
+                    }
+                    "--memory-budget" => {
+                        let mib = value("--memory-budget")?;
+                        let mib: u64 = mib
+                            .parse()
+                            .ok()
+                            .filter(|m| (1..=1 << 30).contains(m))
+                            .ok_or_else(|| {
+                                format!("--memory-budget must be a positive number of MiB, got {mib}")
+                            })?;
+                        options.memory_budget = mib << 20;
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown argument {other} for `gridtalk mcp` (expected --root <dir>, --timeout <seconds>, --memory-budget <MiB> or --allow-write)"
+                        ))
+                    }
                 }
             }
-            mcp::serve_stdio()
+            mcp::serve_stdio(options)
         }
         "tools" => {
             // gridtalk tools list
@@ -871,7 +902,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
+            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp [--root <dir>]... [--timeout <seconds>] [--memory-budget <MiB>]  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
             Ok(())
         }
         _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),
@@ -927,6 +958,9 @@ fn warn_if_external(cfg: &Config) {
         eprintln!(
             "gridtalk: note: external backend {url} will receive spreadsheet passages (including cell values) verbatim. Use a local model or a redacting proxy if that is not acceptable."
         );
+    }
+    if let Some(warning) = gridtalk_infer::cleartext_warning(&cfg.inference) {
+        eprintln!("gridtalk: warning: {warning}");
     }
 }
 

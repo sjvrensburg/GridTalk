@@ -6,13 +6,30 @@ Cursor, or any MCP client can drive a workbook without the UI.
 ## Start it
 
 ```bash
-gridtalk mcp
+gridtalk mcp [--root <dir>]... [--timeout <seconds>] [--memory-budget <MiB>]
 ```
 
 Stdout is reserved for JSON-RPC frames; logs go to stderr. The
 server only opens paths your harness passes to `open_workbook`.
 All investigation tools are read-only (`what_if` simulates; it
 never writes the file). There is no write tool.
+
+- `--root <dir>` (repeatable) confines `open_workbook` to files under
+  these directories. Paths are canonicalised first, so `..` and
+  symlinks that lead out of a root are refused (`path_not_allowed`),
+  and the check runs again whenever a session reloads its file. A
+  missing file is reported as missing only when its directory is
+  inside a root. Without `--root` any readable path may be opened,
+  so pass one when the client is not fully trusted (a prompt-injected
+  agent can ask to open anything).
+- `--timeout <seconds>` (default 120) is how long one call may run.
+  Calls run on worker threads, so `ping` and other calls are answered
+  while one is busy; a call past the limit is answered with `timeout`.
+  Gridcraft cannot be interrupted, so the timed-out call keeps running
+  until it returns, and its result is dropped (a file reload it did
+  is kept).
+- `--memory-budget <MiB>` (default 4096) caps the estimated memory of
+  the open sessions together; see Sessions.
 
 ## Claude Code (`.mcp.json` in your project)
 
@@ -96,7 +113,11 @@ rather than on message text.
   deleted or became unreadable), `open_failed`, `invalid_range`
   (unparseable, over the cell limit, or outside the grid),
   `unknown_sheet`, `no_graph_node`, `evaluation_failed`,
-  `invalid_arguments` (e.g. a non-finite what-if value).
+  `invalid_arguments` (e.g. a non-finite what-if value),
+  `path_not_allowed` (outside every `--root`), `over_budget` (one
+  workbook's estimate is over `--memory-budget` on its own),
+  `timeout`, `busy` (four calls are already running, timed-out ones
+  included; retry later) and `internal` (a GridTalk bug).
   `gridtalk tools call` prints the same payload.
 
 ## Sessions
@@ -106,8 +127,16 @@ hash), so edits saved from the GridTalk UI or Gridcraft are picked
 up on the next call. That call's response then carries
 `reloaded: {"warnings": [...]}`, the new file's reader warnings, so
 a reload is never silent. Sessions are capped at 16 open workbooks
-(oldest evicted). Only regular files are read, and never more than
-the ingestion cap (32 MiB for CSV/TSV, 256 MiB for XLSX/ODS).
+and at the memory budget together; the oldest are evicted to make
+room, and `open_workbook` lists them in `evicted_workbook_ids`. A
+session's memory is estimated as 16 times its snapshot's cells and
+text: on generated workbooks of 5k to 1.2M cells, the session (the
+Gridcraft workbook, graph, index and recalculated engine) held 12 to
+25 times that, so the estimate is a middle, not a bound. Only
+regular files are read, and never more than the ingestion cap (32
+MiB for CSV/TSV, 256 MiB for XLSX/ODS); an XLSX/ODS package whose
+zip directory declares more than 512 MiB unpacked is refused before
+it is unpacked.
 
 ## Troubleshooting
 

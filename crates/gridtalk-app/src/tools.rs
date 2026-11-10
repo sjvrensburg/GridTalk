@@ -60,6 +60,17 @@ pub enum ErrorKind {
     OpenFailed,
     /// MCP: no tool of that name.
     UnknownTool,
+    /// MCP: the path lies outside every `--root` directory.
+    PathNotAllowed,
+    /// MCP: the workbook's estimated memory is over the server's
+    /// budget on its own.
+    OverBudget,
+    /// MCP: the call did not finish within the server's time limit.
+    Timeout,
+    /// MCP: too many calls are still running; retry later.
+    Busy,
+    /// MCP: the call failed inside GridTalk (a bug, not the input).
+    Internal,
 }
 
 /// The `{"error": {"kind", "message"}}` payload of a failed call.

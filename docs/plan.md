@@ -130,11 +130,11 @@ Phase 2 — agent-facing correctness:
 - [x] Invariant check's coverage rule without the quadratic scan: `AreaNodes` indexes each sheet's nodes by the columns they span, so `nodes_by_coverage` tests a column against the few nodes on it instead of every node on the sheet (a test checks it gives the old scan's answer for every small area over three layouts). A 250-column region with 2,000 row-total formulas: `build_graph` 175 → 16 ms
 - [x] Bench what-if tasks from Gridcraft lineage and typed values: `bench.rs` tries precedents from `lineage::Lineage` (names and 3D refs included, clipped to the cells a sheet has), and any typed change (`Value::differs_from`) makes a task. Text and boolean results become tasks with `expected_text`, judged by `judge_text` (the last value stated, as `judge_number` wants the final number: only citations may follow its last whole-word occurrence) in GridTalk and by the mirrored `_text_present` in `scripts/hermit`; numeric questions keep their wording, so their splits do not move. No bench scores are committed, so there is no baseline to redo in the repo; re-run any local CARDs, since the task set changed
 
-Phase 3 — hardening:
+Phase 3 — hardening (done 2026-11-10):
 
-- [ ] MCP `--root <dir>` allowlist (canonicalised); tool calls off the stdio thread with a time budget; a byte budget next to `MAX_WORKBOOKS`
-- [ ] Uncompressed-size pre-scan of XLSX packages before Gridcraft parses them
-- [ ] `create_new` temp files; model import size cap; cleartext-`http` warning to remote hosts even without an API key (UI and CLI); early GGUF header check during download
+- [x] MCP `--root <dir>` allowlist (canonicalised, rechecked on reload; a missing file outside the roots reads as not allowed); `open_workbook` and tool calls run on worker threads (at most 4) with a `--timeout` (default 120 s) answered as a `timeout` error; a `--memory-budget` (default 4 GiB) next to `MAX_WORKBOOKS`, estimated as 16 × `WorkbookSnapshot::approx_bytes` (measured 12–25× on 5k–1.2M-cell workbooks). A timed-out call cannot be interrupted: it holds its slot until Gridcraft returns
+- [x] Unpacked-size pre-scan of XLSX/ODS packages before Gridcraft parses them: the zip directory may declare at most 512 MiB. It reads only the directory, so a package that understates its sizes still passes; Gridcraft's reader then counts what it really unpacks (512 MiB per part, 1 GiB in all)
+- [x] `create_new` temp files (adapter files and version directories, UI prefs, config and saves); 64 GiB model import cap, also for a source that grows while copied; cleartext-`http` warning to remote hosts even without an API key (CLI, every UI chat answer, Settings and the first-run wizard); GGUF header checked while a download streams in (the magic and version on the first 8 bytes, the full header from 64 KiB, at each doubling)
 
 Phase 4 — tests and CI:
 
