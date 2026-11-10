@@ -37,7 +37,10 @@ args = ["mcp"]
 
 ## Tools
 
-`open_workbook` · `close_workbook` · `search` (hybrid lexical +
+`open_workbook` (returns `workbook_id`, `sheets`, `regions` and
+`warnings`: what the file reader skipped or could not import, e.g.
+an ODS file's formulas, which are imported as their saved results) ·
+`close_workbook` · `search` (hybrid lexical +
 embedding, ranges with `vector_only` flags; a passage longer than
 4,000 characters is cut to the header plus the rows matching the
 query, labelled with their sheet rows, and flagged `truncated`; a closing
@@ -58,7 +61,9 @@ stay for compatibility: booleans there are 1/0 and text results are
 Sessions are invalidated when the file's (mtime, length) stamp
 changes, so edits saved from the GridTalk UI or Gridcraft are
 picked up on the next call. Sessions are capped at 16 open
-workbooks (oldest evicted).
+workbooks (oldest evicted). Only regular files are read, and never
+more than the ingestion cap (32 MiB for CSV/TSV, 256 MiB for
+XLSX/ODS).
 
 ## Troubleshooting
 

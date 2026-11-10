@@ -199,6 +199,7 @@ mod tests {
             name: "w".into(),
             sheets: vec![sheet.clone()],
             names: Vec::new(),
+            warnings: Vec::new(),
         };
         eval_cell_in_workbook(&wb, &sheet.name, row, col)
     }
@@ -214,6 +215,7 @@ mod tests {
             name: "w".into(),
             sheets: vec![sheet.clone()],
             names: Vec::new(),
+            warnings: Vec::new(),
         };
         what_if_in_workbook(
             &wb,
@@ -456,6 +458,7 @@ mod tests {
             name: "w".into(),
             sheets: vec![row_sheet(cells)],
             names: Vec::new(),
+            warnings: Vec::new(),
         };
         let coords: Vec<_> = (0..cells.len()).map(|c| (0, c)).collect();
         eval_many_values_in_workbook(&wb, "S", &coords)
@@ -588,6 +591,7 @@ mod tests {
             name: "w".into(),
             sheets: vec![sheet],
             names: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(
             eval_many_values_in_workbook(&wb, "S", &[(0, 1)]),
@@ -662,6 +666,7 @@ mod tests {
                 scope: None,
                 formula: "Rates!$A$4".into(),
             }],
+            warnings: Vec::new(),
         }
     }
 

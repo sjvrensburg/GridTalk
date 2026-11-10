@@ -4,6 +4,7 @@
 //! to snapshots so downstream code never touches live grid cells.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 /// Sheet-name equality with Unicode case folding (ASCII-only
 /// folding never matches café vs CAFÉ).
@@ -89,6 +90,11 @@ pub struct WorkbookSnapshot {
     /// that use them evaluate.
     #[serde(default)]
     pub names: Vec<DefinedName>,
+    /// What the reader skipped or could not import (Gridcraft's
+    /// `ReadReport`, e.g. ODS formulas imported as their results).
+    /// Shown to users so a partial import is never silent.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A workbook defined name. `formula` has no leading `=`.
@@ -351,13 +357,41 @@ fn check_ingestible(ext: &str, len: u64) -> Result<(), IngestError> {
 /// Load a workbook snapshot from a path. CSV/TSV are fully supported.
 /// XLSX/ODS go through the Gridcraft engine. XLSB/XLS are explicitly
 /// out of scope (see plan Phase 2). Unsupported or oversized files
-/// are rejected from metadata, before the file is read.
+/// are rejected before more than the cap is read
+/// ([`read_workbook_bytes`]).
 pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError> {
-    let (ext, _) = ext_and_name(path);
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    check_ingestible(&ext, len)?;
-    let bytes = std::fs::read(path)?;
+    let bytes = read_workbook_bytes(path)?;
     load_bytes(path, &bytes)
+}
+
+/// Read a workbook file's bytes, never more than its format's
+/// ingestion cap. The format is checked first, the path must be a
+/// regular file (a FIFO or device such as `/dev/zero` reports length
+/// 0 and would otherwise be read without bound), and at most one byte
+/// past the cap is read, so a file that grows after the size check is
+/// still rejected.
+pub fn read_workbook_bytes(path: &std::path::Path) -> Result<Vec<u8>, IngestError> {
+    let (ext, _) = ext_and_name(path);
+    check_ingestible(&ext, 0)?;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(IngestError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        )));
+    }
+    check_ingestible(&ext, meta.len())?;
+    let cap = if ext == "csv" || ext == "tsv" {
+        MAX_DELIMITED_BYTES
+    } else {
+        MAX_PACKAGE_BYTES
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)?;
+    check_ingestible(&ext, bytes.len() as u64)?;
+    Ok(bytes)
 }
 
 /// Parse a workbook from bytes already read from `path`. The path
@@ -384,13 +418,15 @@ pub fn load_gridcraft_bytes(
     ext: &str,
     bytes: &[u8],
 ) -> Result<WorkbookSnapshot, IngestError> {
-    let (wb, _report) = if ext == "ods" {
+    let (wb, report) = if ext == "ods" {
         gridcraft_xlsx::read_ods(bytes)
     } else {
         gridcraft_xlsx::read_xlsx(bytes)
     }
     .map_err(|e| IngestError::Parse(format!("gridcraft {ext} reader: {e}")))?;
-    from_gridcraft_workbook(name, &wb)
+    let mut snapshot = from_gridcraft_workbook(name, &wb)?;
+    snapshot.warnings = report.warnings;
+    Ok(snapshot)
 }
 
 /// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
@@ -400,6 +436,10 @@ pub fn load_gridcraft_bytes(
 /// sparse XLSX with a single cell at XFD1048576 must not allocate a
 /// billion-cell grid.
 pub const MAX_SNAPSHOT_CELLS: usize = 4_000_000;
+
+/// Excel's grid: 1,048,576 rows by 16,384 columns.
+pub const EXCEL_MAX_ROWS: usize = 1 << 20;
+pub const EXCEL_MAX_COLS: usize = 1 << 14;
 
 pub fn from_gridcraft_workbook(
     name: &str,
@@ -469,6 +509,7 @@ pub fn from_gridcraft_workbook(
         name: name.into(),
         sheets,
         names,
+        warnings: Vec::new(),
     })
 }
 
@@ -564,6 +605,7 @@ pub fn parse_delimited_strict(
             cells: rows,
         }],
         names: Vec::new(),
+        warnings: Vec::new(),
     })
 }
 
@@ -1465,6 +1507,7 @@ pub struct IncrementalSnapshot {
     pub debounce: std::time::Duration,
     pub revision: u64,
     dropped: usize,
+    last_drop_reason: Option<String>,
 }
 
 impl IncrementalSnapshot {
@@ -1477,6 +1520,7 @@ impl IncrementalSnapshot {
             debounce: std::time::Duration::from_millis(500),
             revision: 0,
             dropped: 0,
+            last_drop_reason: None,
         }
     }
 
@@ -1516,63 +1560,124 @@ impl IncrementalSnapshot {
         }
     }
 
-    /// Edits dropped because their sheet does not exist (cumulative).
+    /// Edits dropped because their sheet does not exist, or because
+    /// applying them would grow the sheet past Excel's grid or the
+    /// [`MAX_SNAPSHOT_CELLS`] cap (cumulative).
     pub fn dropped_edits(&self) -> usize {
         self.dropped
     }
 
+    /// Why `edit` cannot be applied, or `None` when it can. `extents`
+    /// holds each sheet's densified `(rows, cols)`, computed once per
+    /// flush. Only an edit that grows its sheet can trip the cell cap,
+    /// so overwriting a cell inside a workbook that is already over
+    /// the cap (a large CSV has no cell cap at load) stays allowed.
+    fn rejection(&self, edit: &CellEdit, extents: &[(u64, u64)]) -> Option<String> {
+        let Some(idx) = self
+            .snapshot
+            .sheets
+            .iter()
+            .position(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
+        else {
+            return Some(format!("unknown sheet {}", edit.sheet));
+        };
+        if edit.row >= EXCEL_MAX_ROWS || edit.col >= EXCEL_MAX_COLS {
+            return Some(format!(
+                "row {} column {} is outside the sheet grid",
+                edit.row.saturating_add(1),
+                edit.col.saturating_add(1)
+            ));
+        }
+        // Clearing a cell never grows the sheet.
+        if edit.value == CellValue::Empty {
+            return None;
+        }
+        let (old_rows, old_cols) = extents[idx];
+        let rows = old_rows.max(edit.row as u64 + 1);
+        let cols = old_cols.max(edit.col as u64 + 1);
+        let old_area = old_rows.saturating_mul(old_cols);
+        let area = rows.saturating_mul(cols);
+        if area <= old_area {
+            return None;
+        }
+        let total: u64 = extents
+            .iter()
+            .map(|(r, c)| r.saturating_mul(*c))
+            .fold(0u64, u64::saturating_add);
+        if area > MAX_SNAPSHOT_CELLS as u64
+            || (total - old_area).saturating_add(area) > MAX_SNAPSHOT_CELLS as u64
+        {
+            return Some(format!(
+                "editing {} would grow the workbook past {MAX_SNAPSHOT_CELLS} cells",
+                CellRef {
+                    sheet: self.snapshot.sheets[idx].name.clone(),
+                    row: edit.row,
+                    col: edit.col,
+                }
+                .a1()
+            ));
+        }
+        None
+    }
+
+    /// The reason the most recent dropped edit was rejected.
+    pub fn last_drop_reason(&self) -> Option<&str> {
+        self.last_drop_reason.as_deref()
+    }
+
     /// Apply pending edits immediately, patching only edited cells.
-    /// Returns how many edits were applied; edits to unknown sheets
-    /// are counted in `dropped_edits` instead of vanishing silently.
+    /// Returns how many edits were applied; edits that cannot be
+    /// applied are counted in `dropped_edits` (with the reason in
+    /// `last_drop_reason`) instead of vanishing silently.
     pub fn flush(&mut self) -> usize {
         let edits = std::mem::take(&mut self.pending);
         let mut applied = 0usize;
-        let mut dropped_ranges: Vec<RangeRef> = Vec::new();
-        for edit in &edits {
-            if edit.row > 10_000
-                || edit.col > 1_000
-                || !self
-                    .snapshot
-                    .sheets
-                    .iter()
-                    .any(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
-            {
-                dropped_ranges.push(RangeRef {
+        let mut extents: Vec<(u64, u64)> = self
+            .snapshot
+            .sheets
+            .iter()
+            .map(|s| (s.cells.len() as u64, s.max_col() as u64))
+            .collect();
+        for edit in edits {
+            if let Some(reason) = self.rejection(&edit, &extents) {
+                self.dropped += 1;
+                self.last_drop_reason = Some(reason);
+                // A dropped edit changed nothing: unpublish its dirty range.
+                let range = RangeRef {
                     sheet: edit.sheet.clone(),
                     r0: edit.row,
                     c0: edit.col,
                     r1: edit.row,
                     c1: edit.col,
-                });
-            }
-        }
-        // Dropped edits changed nothing: unpublish their dirty ranges.
-        for dropped in &dropped_ranges {
-            if let Some(pos) = self.dirty.iter().position(|d| d == dropped) {
-                self.dirty.remove(pos);
-            }
-        }
-        for edit in edits {
-            if edit.row > 10_000 || edit.col > 1_000 {
-                self.dropped += 1;
-                continue;
-            }
-            let known = self
-                .snapshot
-                .sheets
-                .iter()
-                .any(|s| crate::sheet_name_eq(&s.name, &edit.sheet));
-            if !known {
-                self.dropped += 1;
+                };
+                if let Some(pos) = self.dirty.iter().position(|d| *d == range) {
+                    self.dirty.remove(pos);
+                }
                 continue;
             }
             applied += 1;
-            if let Some(sheet) = self
+            if let Some((idx, sheet)) = self
                 .snapshot
                 .sheets
                 .iter_mut()
-                .find(|s| crate::sheet_name_eq(&s.name, &edit.sheet))
+                .enumerate()
+                .find(|(_, s)| crate::sheet_name_eq(&s.name, &edit.sheet))
             {
+                if edit.value == CellValue::Empty {
+                    // Clearing a cell past the sheet's edge is a no-op:
+                    // padding up to it would grow the sheet unchecked.
+                    if let Some(cell) = sheet
+                        .cells
+                        .get_mut(edit.row)
+                        .and_then(|r| r.get_mut(edit.col))
+                    {
+                        *cell = CellValue::Empty;
+                    }
+                    continue;
+                }
+                let (rows, cols) = &mut extents[idx];
+                *rows = (*rows).max(edit.row as u64 + 1);
+                *cols = (*cols).max(edit.col as u64 + 1);
                 while sheet.cells.len() <= edit.row {
                     sheet.cells.push(Vec::new());
                 }
@@ -1638,6 +1743,50 @@ mod tests {
         assert_eq!(lines.len(), 4, "{passage}");
         assert_eq!(lines[2], "Apples | one two three four | 2");
         assert_eq!(lines[3], "Pears | plain | 3");
+    }
+
+    #[test]
+    fn workbook_reads_are_capped_and_need_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!("gt-read-capped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory with a workbook extension is not a regular file.
+        let not_file = dir.join("folder.csv");
+        std::fs::create_dir_all(&not_file).unwrap();
+        assert!(matches!(
+            read_workbook_bytes(&not_file),
+            Err(IngestError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        // A sparse file one byte over the cap is rejected unread.
+        let big = dir.join("big.csv");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_DELIMITED_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            read_workbook_bytes(&big),
+            Err(IngestError::Parse(_))
+        ));
+        // The format is checked before anything is opened.
+        assert!(matches!(
+            read_workbook_bytes(&dir.join("missing.xls")),
+            Err(IngestError::UnsupportedFormat { .. })
+        ));
+        // A FIFO reports length 0; it must be refused, not read forever.
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("pipe.csv");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .is_ok_and(|s| s.success());
+            if made {
+                assert!(matches!(
+                    read_workbook_bytes(&fifo),
+                    Err(IngestError::Io(_))
+                ));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1739,6 +1888,7 @@ mod tests {
         let bytes = to_xlsx_bytes(&wb).unwrap();
         assert_eq!(&bytes[0..2], b"PK"); // zip container
         let back = load_gridcraft_bytes("demo", "xlsx", &bytes).unwrap();
+        assert!(back.warnings.is_empty(), "{:?}", back.warnings);
         let sheet = &back.sheets[0];
         assert_eq!(sheet.get(0, 0), CellValue::Text("Item".into()));
         assert_eq!(sheet.get(1, 1), CellValue::Number(2.0));
@@ -1761,6 +1911,8 @@ mod tests {
         assert_eq!(wb.sheets[0].get(0, 0), CellValue::Text("Item".into()));
         assert_eq!(wb.sheets[0].get(1, 0), CellValue::Text("Apples".into()));
         assert_eq!(wb.sheets[0].get(1, 1), CellValue::Number(2.0));
+        // Gridcraft's ODS import is data-only; that must reach the user.
+        assert!(wb.warnings.iter().any(|w| w.contains("data-only")));
     }
 
     #[test]
@@ -1833,6 +1985,61 @@ mod tests {
         );
         assert_eq!(inc.flush(), 0);
         assert_eq!(inc.dropped_edits(), 1);
+    }
+
+    #[test]
+    fn edits_far_down_a_sheet_are_applied_and_oversized_edits_report_why() {
+        let edit = |row, col| CellEdit {
+            sheet: "Sheet1".into(),
+            row,
+            col,
+            value: CellValue::Number(1.0),
+        };
+        let now = std::time::Instant::now();
+        // Row 20,000 is well inside the grid and the cell cap.
+        let mut inc = IncrementalSnapshot::new(sample());
+        inc.record_edit(edit(19_999, 0), now);
+        assert_eq!(inc.flush(), 1);
+        assert_eq!(inc.revision, 1);
+        assert_eq!(
+            inc.snapshot().sheets[0].get(19_999, 0),
+            CellValue::Number(1.0)
+        );
+        assert_eq!(inc.dropped_edits(), 0);
+        // Outside Excel's grid.
+        inc.record_edit(edit(EXCEL_MAX_ROWS, 0), now);
+        assert_eq!(inc.flush(), 0);
+        assert!(inc
+            .last_drop_reason()
+            .unwrap()
+            .contains("outside the sheet grid"));
+        // Inside the grid, but the densified sheet would pass the cap.
+        inc.record_edit(edit(500_000, 100), now);
+        assert_eq!(inc.flush(), 0);
+        assert_eq!(inc.dropped_edits(), 2);
+        assert!(inc.last_drop_reason().unwrap().contains("Sheet1!CW500001"));
+        assert_eq!(inc.revision, 1);
+        // Clearing a far cell never grows the sheet, so it is allowed.
+        inc.record_edit(
+            CellEdit {
+                value: CellValue::Empty,
+                ..edit(500_000, 100)
+            },
+            now,
+        );
+        assert_eq!(inc.flush(), 1);
+        assert_eq!(inc.snapshot().sheets[0].cells.len(), 20_000);
+        // A sheet already over the cap (e.g. a ragged CSV) still takes
+        // edits that do not grow it.
+        let mut wide = sample();
+        wide.sheets[0].cells.push(vec![CellValue::Empty; 5_000]);
+        wide.sheets[0]
+            .cells
+            .extend(std::iter::repeat_n(vec![CellValue::Number(0.0)], 1_000));
+        let mut inc = IncrementalSnapshot::new(wide);
+        inc.record_edit(edit(500, 0), now);
+        assert_eq!(inc.flush(), 1);
+        assert_eq!(inc.dropped_edits(), 0);
     }
 
     #[test]

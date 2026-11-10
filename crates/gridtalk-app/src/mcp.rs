@@ -12,7 +12,7 @@
 //! write tool in the list at all.
 
 use crate::tools::{ToolRequest, Tools};
-use gridtalk_graph::{build_graph, load_bytes, IngestError, WorkbookSnapshot};
+use gridtalk_graph::{build_graph, load_bytes, read_workbook_bytes, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -66,8 +66,8 @@ impl OpenWorkbook {
         h
     }
 
-    fn hash_of(path: &PathBuf) -> Option<u64> {
-        std::fs::read(path)
+    fn hash_of(path: &std::path::Path) -> Option<u64> {
+        read_workbook_bytes(path)
             .ok()
             .map(|bytes| Self::hash_bytes(&bytes))
     }
@@ -78,7 +78,7 @@ impl OpenWorkbook {
         // stamp on stale content. The file is read once: the same
         // bytes are hashed and parsed.
         let stat = Self::stat_of(path);
-        let bytes = std::fs::read(path).map_err(|e| IngestError::from(e).to_string())?;
+        let bytes = read_workbook_bytes(path).map_err(|e| e.to_string())?;
         let stamp = stat.map(|(mtime, len, ctime)| (mtime, len, ctime, Self::hash_bytes(&bytes)));
         let wb = load_bytes(path, &bytes).map_err(|e| e.to_string())?;
         drop(bytes);
@@ -367,9 +367,10 @@ impl McpServer {
                             .iter()
                             .map(|r| json!({"range": r.range.a1(), "headers": r.headers}))
                             .collect();
+                        let warnings = open.wb.warnings.clone();
                         self.workbooks.insert(id.clone(), open);
                         structured_result(
-                            json!({"workbook_id": id, "sheets": sheets, "regions": regions, "evicted_workbook_ids": evicted}),
+                            json!({"workbook_id": id, "sheets": sheets, "regions": regions, "warnings": warnings, "evicted_workbook_ids": evicted}),
                             false,
                         )
                     }
