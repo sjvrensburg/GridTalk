@@ -320,7 +320,58 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     return False
 
 
+# Mirror of bench.rs CITATION_WORDS.
+_CITATION_WORDS = {"citation", "citations", "source", "sources", "see", "cited", "range"}
+
+
+def _only_citations_follow(rest: str) -> bool:
+    """Mirror of bench.rs `only_citations_follow`."""
+    while "'!" in rest:
+        bang = rest.index("'!")
+        start = rest.rfind("'", 0, bang)
+        if start == -1:
+            start = bang
+        rest = rest[:start] + "!" + rest[bang + 2 :]
+    for token in rest.split():
+        token = token.strip("".join(c for c in token if not c.isalnum() and c != "!"))
+        if token and "!" not in token and token not in _CITATION_WORDS:
+            return False
+    return True
+
+
+def _text_present(answer: str, expected: str) -> bool:
+    """Mirror of bench.rs `judge_text`: the expected text is the last
+    value the answer states. Its last whole-word occurrence (ignoring
+    case) may be followed only by citations, punctuation and citation
+    words."""
+    answer = answer.lower()
+    expected = expected.strip().lower()
+    if not expected:
+        return False
+
+    def word(c: str) -> bool:
+        return c.isalnum() or c == "_"
+
+    last = None
+    start = answer.find(expected)
+    while start != -1:
+        end = start + len(expected)
+        before_ok = start == 0 or not word(answer[start - 1])
+        after_ok = end == len(answer) or not word(answer[end])
+        if before_ok and after_ok:
+            last = end
+        start = answer.find(expected, start + 1)
+    if last is None:
+        return False
+    return _only_citations_follow(answer[last:])
+
+
 def score(task: dict, output: RunOutput) -> JudgeResult:
+    text = task.get("expected_text")
+    if isinstance(text, str) and text.strip():
+        # A text or boolean answer (bench.rs `expected_text`).
+        passed = _text_present(str(output.output), text)
+        return _judged(task, output, passed, f"expected text {text!r} {'found' if passed else 'missing'}")
     raw = task.get("expected")
     if isinstance(raw, bool):
         return JudgeResult(
@@ -352,14 +403,16 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
     got = _final_number(str(output.output))
     tol = max(abs(expected) * 0.001, 0.005)
     passed = got is not None and abs(got - expected) <= tol
+    return _judged(task, output, passed, f"expected {expected}, final number {got}")
+
+
+def _judged(task: dict, output: RunOutput, passed: bool, feedback: str) -> JudgeResult:
+    """The result for a judged answer, with its citation check."""
     extra = getattr(output, "extra", None) or {}
     cited = _citation_present(str(output.output), task, extra) if task.get("citation") else False
     return JudgeResult(
         score=1.0 if passed else 0.0,
-        feedback=(
-            f"expected {expected}, final number {got}; "
-            f"citation {'hit' if cited else 'miss'}"
-        ),
+        feedback=f"{feedback}; citation {'hit' if cited else 'miss'}",
         extra={"passed": passed, "citation_hit": cited, "kind": task.get("kind")},
     )
 
@@ -387,6 +440,10 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             raise ValueError(f"bench task id {row['id']!r} cannot round-trip hermit's split files")
         if not isinstance(row["question"], str) or not row["question"].strip():
             raise ValueError(f"task {row['id']}: question must be a non-empty string")
+        if row.get("expected_text") is not None and (
+            not isinstance(row["expected_text"], str) or not row["expected_text"].strip()
+        ):
+            raise ValueError(f"task {row['id']}: expected_text must be a non-empty string")
         exp = row["expected"]
         if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
             raise ValueError(f"task {row['id']}: expected must be a number or numeric string")

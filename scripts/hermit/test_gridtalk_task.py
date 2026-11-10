@@ -58,3 +58,30 @@ def test_prepare_data_roundtrip_and_bad_id(tmp_path):
         pass
     else:
         raise AssertionError("expected ValueError for #-prefixed id")
+
+
+def test_text_present_mirrors_judge_text():
+    # The same cases as bench.rs judge_text_wants_the_last_value_stated.
+    assert mod._text_present("It becomes big.", "big")
+    assert mod._text_present("The result: TRUE", "true")
+    assert mod._text_present("The region is North East", "north east")
+    assert mod._text_present("big (Sheet1!C2).", "big")
+    assert mod._text_present("big. Citation: Sheet1!C2", "big")
+    assert mod._text_present("big, see 'My Sheet'!A1:B2", "big")
+    assert not mod._text_present("It becomes big, not small", "big")
+    assert mod._text_present("It becomes big, not small", "small")
+    assert not mod._text_present("not TRUE, it is FALSE", "TRUE")
+    assert not mod._text_present("big, because B2 exceeds 5", "big")
+    assert not mod._text_present("It is a value", "A")
+    assert mod._text_present("The grade is A.", "A")
+    assert not mod._text_present("It becomes bigger.", "big")
+    assert not mod._text_present("untrue", "TRUE")
+    assert not mod._text_present("anything", "")
+
+
+def test_score_judges_text_tasks_by_expected_text():
+    task = {"id": "t1", "expected": 0.0, "expected_text": "big", "citation": "Sheet1!C2"}
+    hit = mod.score(task, mod.RunOutput(output="It becomes big (Sheet1!C2)."))
+    assert hit.extra["passed"] is True
+    miss = mod.score(task, mod.RunOutput(output="0"))
+    assert miss.extra["passed"] is False

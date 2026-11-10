@@ -8,8 +8,9 @@
 
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
-use gridtalk_graph::eval::EvalCache;
-use gridtalk_graph::{formula_refs_qualified_on, sheet_name_eq, CellValue, WorkbookSnapshot};
+use gridtalk_graph::eval::{EvalCache, Value};
+use gridtalk_graph::lineage::Lineage;
+use gridtalk_graph::{sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +22,53 @@ pub struct BenchTask {
     /// train | dev — dev is never optimised against directly.
     pub split: String,
     pub question: String,
-    /// Deterministic expected numeric answer.
+    /// Deterministic expected numeric answer (0 when the answer is
+    /// text; see `expected_text`).
     pub expected: f64,
     /// Range the answer must cite (e.g. Sheet1!D2).
     pub citation: String,
+    /// For a text or boolean answer, the value as the cell shows it
+    /// (`TRUE`, `big`); it is judged by [`judge_text`] instead of
+    /// `expected`. Absent in task files written before typed tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_text: Option<String>,
 }
+
+/// A task's ground truth: a number, or text as the cell displays it.
+#[derive(Debug, Clone, PartialEq)]
+enum Expected {
+    Number(f64),
+    Text(String),
+}
+
+impl Expected {
+    /// The answer a formula result or what-if outcome gives, if it is
+    /// one a task can ask for (a finite number, text or a boolean).
+    fn of(value: &Value) -> Option<Expected> {
+        match value {
+            Value::Number(n) if n.is_finite() => Some(Expected::Number(*n)),
+            Value::Number(_) => None,
+            Value::Empty => Some(Expected::Number(0.0)),
+            // Blank text has no answer to state: judge_text never
+            // passes it and hermit's prepare_data rejects it.
+            Value::Text(t) if t.trim().is_empty() => None,
+            Value::Text(_) | Value::Bool(_) => Some(Expected::Text(value.display())),
+        }
+    }
+
+    /// How the question asks for it.
+    fn ask(&self, what: &str) -> String {
+        match self {
+            Expected::Number(_) => format!("Answer with just the {what}number."),
+            Expected::Text(_) => format!("Answer with just the {what}value."),
+        }
+    }
+}
+
+/// Most precedent cells a what-if task tries per formula, and most
+/// cells of its precedent areas scanned looking for them.
+const WHAT_IF_ATTEMPTS: usize = 64;
+const WHAT_IF_SCAN: usize = 4096;
 
 fn a1(sheet: &str, row: usize, col: usize) -> String {
     format!(
@@ -74,8 +117,11 @@ pub fn generate_tasks_ex(
     cache: &EvalCache,
 ) -> TaskGeneration {
     let mut skipped_formulas = 0usize;
-    let mut drafts: Vec<(String, String, f64, String)> = Vec::new(); // kind, question, expected, citation
-    for sheet in &wb.sheets {
+    // kind, question, expected, citation
+    let mut drafts: Vec<(String, String, Expected, String)> = Vec::new();
+    // Built on the first formula, like the calc engine.
+    let mut lineage: Option<Lineage> = None;
+    for (si, sheet) in wb.sheets.iter().enumerate() {
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 match cell {
@@ -88,7 +134,7 @@ pub fn generate_tasks_ex(
                                 "What is the value of {}? Answer with just the number.",
                                 a1(&sheet.name, r, c)
                             ),
-                            *n,
+                            Expected::Number(*n),
                             a1(&sheet.name, r, c),
                         ));
                     }
@@ -96,85 +142,83 @@ pub fn generate_tasks_ex(
                         // Built on the first formula: one
                         // recalculation for every task.
                         let calc = cache.get(wb);
-                        let evaluated = calc.value(&sheet.name, r, c).and_then(|v| v.to_number());
-                        if !matches!(evaluated, Ok(v) if v.is_finite()) {
+                        // An error has no deterministic answer, and
+                        // no before value for a what-if.
+                        let Ok(before_value) = calc.value(&sheet.name, r, c) else {
                             skipped_formulas += 1;
-                        }
-                        if let Ok(v) = evaluated {
-                            if v.is_finite() {
-                                drafts.push((
-                                    "formula_result".into(),
-                                    format!(
-                                        "What does {} calculate to? Answer with just the number.",
-                                        a1(&sheet.name, r, c)
-                                    ),
-                                    v,
+                            continue;
+                        };
+                        // A non-finite number or blank text has no
+                        // answer to state, but a what-if can still
+                        // change it into one.
+                        match Expected::of(&before_value) {
+                            Some(expected) => drafts.push((
+                                "formula_result".into(),
+                                format!(
+                                    "What does {} calculate to? {}",
                                     a1(&sheet.name, r, c),
-                                ));
-                            }
-                            // One what-if task per formula: walk
-                            // deduplicated numeric precedents (range
-                            // expansion repeats cells) with a bounded
-                            // number of what-if attempts.
-                            let mut seen_prects: std::collections::BTreeSet<(usize, usize, usize)> =
-                                std::collections::BTreeSet::new();
-                            let mut attempts = 0usize;
-                            for q in formula_refs_qualified_on(expr, Some(&sheet.name)) {
-                                if attempts >= 64 {
-                                    break;
-                                }
-                                let sheet_idx_of = wb
-                                    .sheets
-                                    .iter()
-                                    .position(|s| {
-                                        sheet_name_eq(
-                                            &s.name,
-                                            q.sheet.as_deref().unwrap_or(&sheet.name),
-                                        )
-                                    })
-                                    .unwrap_or(usize::MAX);
-                                if !seen_prects.insert((sheet_idx_of, q.row, q.col)) {
-                                    continue;
-                                }
-                                let osheet_name =
-                                    q.sheet.clone().unwrap_or_else(|| sheet.name.clone());
-                                let Some(osheet) = wb
-                                    .sheets
-                                    .iter()
-                                    .find(|s| sheet_name_eq(&s.name, &osheet_name))
-                                else {
-                                    continue;
-                                };
-                                if let CellValue::Number(orig) = osheet.get(q.row, q.col) {
+                                    expected.ask("")
+                                ),
+                                expected,
+                                a1(&sheet.name, r, c),
+                            )),
+                            None => skipped_formulas += 1,
+                        }
+                        // One what-if task per formula: its precedent
+                        // cells as Gridcraft resolves them (names and
+                        // 3D references included), deduplicated, until
+                        // one changes the result. Any typed change
+                        // counts, so text and boolean outcomes too.
+                        let lineage = lineage.get_or_insert_with(|| Lineage::new(wb));
+                        let mut seen = std::collections::BTreeSet::new();
+                        let (mut attempts, mut scanned) = (0usize, 0usize);
+                        'areas: for (osi, (r0, c0, r1, c1)) in lineage.areas(wb, si, expr) {
+                            let Some(osheet) = wb.sheets.get(osi) else {
+                                continue;
+                            };
+                            // Only cells the sheet has: A:A stays cheap.
+                            let rows = osheet.cells.iter().enumerate().take(r1.saturating_add(1));
+                            for (qr, row) in rows.skip(r0) {
+                                let cols = row.iter().enumerate().take(c1.saturating_add(1));
+                                for (qc, cell) in cols.skip(c0) {
+                                    scanned += 1;
+                                    if attempts >= WHAT_IF_ATTEMPTS || scanned > WHAT_IF_SCAN {
+                                        break 'areas;
+                                    }
+                                    let CellValue::Number(orig) = cell else {
+                                        continue;
+                                    };
+                                    if !seen.insert((osi, qr, qc)) {
+                                        continue;
+                                    }
                                     attempts += 1;
                                     let new_value = orig + 10.0;
-                                    let trial = calc.what_if_number(
-                                        (&osheet_name, q.row, q.col),
-                                        new_value,
-                                        (&sheet.name, r, c),
-                                    );
-                                    if let Ok((before, after)) = trial {
-                                        // Trivial tasks (outcome
-                                        // unchanged) teach nothing.
-                                        // `v` is the pre-computed before
-                                        // value for this formula.
-                                        let _ = before;
-                                        if after.is_finite() && (after - v).abs() > 1e-9 {
-                                            drafts.push((
-                                                "what_if".into(),
-                                                format!(
-                                                    "What if {} becomes {new_value}? What happens to {}? Answer with just the resulting number.",
-                                                    a1(&osheet_name, q.row, q.col),
-                                                    a1(&sheet.name, r, c)
-                                                ),
-                                                after,
-                                                a1(&sheet.name, r, c),
-                                            ));
-                                            break;
-                                        }
+                                    let after = calc
+                                        .with_override((&osheet.name, qr, qc), new_value)
+                                        .and_then(|e| e.value(&sheet.name, r, c));
+                                    let Ok(after) = after else {
+                                        continue;
+                                    };
+                                    // Trivial tasks (outcome unchanged)
+                                    // teach nothing.
+                                    if !after.differs_from(&before_value) {
+                                        continue;
                                     }
-                                    // Failed/trivial precedent: try
-                                    // the next one.
+                                    let Some(outcome) = Expected::of(&after) else {
+                                        continue;
+                                    };
+                                    drafts.push((
+                                        "what_if".into(),
+                                        format!(
+                                            "What if {} becomes {new_value}? What happens to {}? {}",
+                                            a1(&osheet.name, qr, qc),
+                                            a1(&sheet.name, r, c),
+                                            outcome.ask("resulting ")
+                                        ),
+                                        outcome,
+                                        a1(&sheet.name, r, c),
+                                    ));
+                                    break 'areas;
                                 }
                             }
                         }
@@ -195,13 +239,20 @@ pub fn generate_tasks_ex(
     let tasks = drafts
         .into_iter()
         .enumerate()
-        .map(|(i, (kind, question, expected, citation))| BenchTask {
-            id: format!("t{:04}", i + 1),
-            split: split_for(&kind, &question).into(),
-            kind,
-            question,
-            expected,
-            citation,
+        .map(|(i, (kind, question, expected, citation))| {
+            let (expected, expected_text) = match expected {
+                Expected::Number(n) => (n, None),
+                Expected::Text(t) => (0.0, Some(t)),
+            };
+            BenchTask {
+                id: format!("t{:04}", i + 1),
+                split: split_for(&kind, &question).into(),
+                kind,
+                question,
+                expected,
+                citation,
+                expected_text,
+            }
         })
         .collect();
     TaskGeneration {
@@ -278,6 +329,66 @@ pub fn judge_number(answer: &str, expected: f64) -> bool {
     extract_numbers(answer)
         .last()
         .is_some_and(|v| (v - expected).abs() <= tol)
+}
+
+/// Words that may follow the stated value: they introduce a
+/// citation, not another value ("big. Citation: Sheet1!C2").
+const CITATION_WORDS: [&str; 7] = [
+    "citation",
+    "citations",
+    "source",
+    "sources",
+    "see",
+    "cited",
+    "range",
+];
+
+/// Whether the answer's last stated value is the expected text, the
+/// way [`judge_number`] wants the final number: the text's last
+/// whole-word occurrence (ignoring case) may be followed only by
+/// citations, punctuation and citation words. So "It becomes big."
+/// passes, "It becomes big, not small" and "not TRUE, it is FALSE"
+/// (for TRUE) fail, and a one-letter "A" is not found in "a value".
+pub fn judge_text(answer: &str, expected: &str) -> bool {
+    let answer = answer.to_lowercase();
+    let expected = expected.trim().to_lowercase();
+    if expected.is_empty() {
+        return false;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    // The last whole-word occurrence.
+    let mut last = None;
+    let mut from = 0;
+    while let Some(pos) = answer[from..].find(&expected) {
+        let start = from + pos;
+        let end = start + expected.len();
+        let before_ok = answer[..start].chars().next_back().is_none_or(|c| !word(c));
+        let after_ok = answer[end..].chars().next().is_none_or(|c| !word(c));
+        if before_ok && after_ok {
+            last = Some(end);
+        }
+        from = start + answer[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    let Some(end) = last else {
+        return false;
+    };
+    only_citations_follow(&answer[end..])
+}
+
+/// Whether `rest` holds nothing but citations (any token with a `!`,
+/// quoted sheet names included), punctuation and citation words.
+fn only_citations_follow(rest: &str) -> bool {
+    let mut rest = rest.to_string();
+    // Collapse quoted sheet prefixes ('My Sheet'!A1 to !A1) before
+    // splitting on whitespace, which would cut them apart.
+    while let Some(bang) = rest.find("'!") {
+        let start = rest[..bang].rfind('\'').unwrap_or(bang);
+        rest.replace_range(start..bang + 2, "!");
+    }
+    rest.split_whitespace().all(|token| {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '!');
+        token.is_empty() || token.contains('!') || CITATION_WORDS.contains(&token)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -422,7 +533,12 @@ pub fn run_bench_with(
         let (passed, cited, steps, error) =
             match investigate_with(&task.question, tools, backend, max_steps, adapter, None) {
                 Ok(inv) => (
-                    judge_number(&inv.answer, task.expected),
+                    // Blank text falls back to the number, as
+                    // hermit's score() does.
+                    match task.expected_text.as_deref() {
+                        Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
+                        _ => judge_number(&inv.answer, task.expected),
+                    },
                     citation_hit(&inv.citations, &task.citation, &inv.answer),
                     inv.trail.len(),
                     None,
@@ -541,7 +657,7 @@ mod tests {
         ));
     }
     use super::*;
-    use gridtalk_graph::{build_graph, parse_delimited};
+    use gridtalk_graph::{build_graph, parse_delimited, DefinedName, SheetSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::EchoBackend;
 
@@ -584,6 +700,137 @@ mod tests {
             .find(|t| t.kind == "cell_value" && t.citation == "Sheet1!B2")
             .expect("value task for B2");
         assert_eq!(v.expected, 2.0);
+    }
+
+    #[test]
+    fn what_if_tasks_follow_names_3d_refs_and_text_outcomes() {
+        let month = |name: &str, n: f64| {
+            SheetSnapshot::new(
+                name,
+                vec![
+                    vec![CellValue::Text("Billed".into())],
+                    vec![CellValue::Number(n)],
+                ],
+            )
+        };
+        let f = |e: &str| CellValue::Formula {
+            expr: e.into(),
+            cached: None,
+        };
+        let summary = SheetSnapshot::new(
+            "Summary",
+            vec![
+                vec![
+                    CellValue::Text("Q1".into()),
+                    CellValue::Text("Tax".into()),
+                    CellValue::Text("Size".into()),
+                    CellValue::Text("Flag".into()),
+                ],
+                vec![
+                    f("SUM(Jan:Mar!A2)"),
+                    f("Tax_Rate*100"),
+                    f("IF(Jan!A2>5,\"big\",\"small\")"),
+                    f("IF(Jan!A2>5,\"big\",\"\")"),
+                ],
+            ],
+        );
+        let rates = SheetSnapshot::new(
+            "Rates",
+            vec![
+                vec![CellValue::Text("Rate".into())],
+                vec![CellValue::Number(0.15)],
+            ],
+        );
+        let wb = WorkbookSnapshot {
+            name: "w".into(),
+            sheets: vec![
+                month("Jan", 1.0),
+                month("Feb", 2.0),
+                month("Mar", 3.0),
+                summary,
+                rates,
+            ],
+            names: vec![DefinedName {
+                name: "Tax_Rate".into(),
+                scope: None,
+                formula: "Rates!$A$2".into(),
+            }],
+            warnings: Vec::new(),
+            source: None,
+        };
+        let tasks = generate_tasks(&wb, 100);
+        let what_if = |cell: &str| {
+            tasks
+                .iter()
+                .find(|t| t.kind == "what_if" && t.citation == cell)
+                .unwrap_or_else(|| panic!("no what-if task for {cell}: {tasks:#?}"))
+        };
+        // 3D: Jan!A2 1 -> 11 makes the Q1 total 1+2+3 = 6 into 16.
+        let q1 = what_if("Summary!A2");
+        assert!(q1.question.contains("Jan!A2"), "{}", q1.question);
+        assert_eq!((q1.expected, q1.expected_text.as_deref()), (16.0, None));
+        // A defined name: Tax_Rate 0.15 -> 10.15.
+        let tax = what_if("Summary!B2");
+        assert!(tax.question.contains("Rates!A2"), "{}", tax.question);
+        assert!((tax.expected - 1015.0).abs() < 1e-9);
+        // Text: Jan!A2 -> 11 turns "small" into "big".
+        let size = what_if("Summary!C2");
+        assert_eq!(size.expected_text.as_deref(), Some("big"));
+        assert!(size
+            .question
+            .ends_with("Answer with just the resulting value."));
+        let result = tasks
+            .iter()
+            .find(|t| t.kind == "formula_result" && t.citation == "Summary!C2")
+            .expect("a text formula-result task");
+        assert_eq!(result.expected_text.as_deref(), Some("small"));
+        // A blank result has no formula-result task, but a what-if
+        // can still turn it into an answer.
+        assert_eq!(what_if("Summary!D2").expected_text.as_deref(), Some("big"));
+        assert!(!tasks
+            .iter()
+            .any(|t| t.kind == "formula_result" && t.citation == "Summary!D2"));
+        // Task files written before typed tasks still load.
+        let old: BenchTask = serde_json::from_str(
+            r#"{"id":"t0001","kind":"cell_value","split":"dev","question":"q","expected":2.0,"citation":"Sheet1!B2"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.expected_text, None);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("expected_text"));
+    }
+
+    #[test]
+    fn blank_text_results_make_no_task() {
+        assert_eq!(Expected::of(&Value::Text(String::new())), None);
+        assert_eq!(Expected::of(&Value::Text("  ".into())), None);
+        assert_eq!(
+            Expected::of(&Value::Bool(true)),
+            Some(Expected::Text("TRUE".into()))
+        );
+    }
+
+    #[test]
+    fn judge_text_wants_the_last_value_stated() {
+        assert!(judge_text("It becomes big.", "big"));
+        assert!(judge_text("The result: TRUE", "true"));
+        assert!(judge_text("The region is North East", "north east"));
+        // Citations, punctuation and citation words may follow.
+        assert!(judge_text("big (Sheet1!C2).", "big"));
+        assert!(judge_text("big. Citation: Sheet1!C2", "big"));
+        assert!(judge_text("big, see 'My Sheet'!A1:B2", "big"));
+        // A later value wins, as the final number does.
+        assert!(!judge_text("It becomes big, not small", "big"));
+        assert!(judge_text("It becomes big, not small", "small"));
+        assert!(!judge_text("not TRUE, it is FALSE", "TRUE"));
+        assert!(!judge_text("big, because B2 exceeds 5", "big"));
+        // Short texts are not found inside ordinary words or ranges.
+        assert!(!judge_text("It is a value", "A"));
+        assert!(judge_text("The grade is A.", "A"));
+        assert!(!judge_text("It becomes bigger.", "big"));
+        assert!(!judge_text("untrue", "TRUE"));
+        assert!(!judge_text("anything", ""));
     }
 
     #[test]
