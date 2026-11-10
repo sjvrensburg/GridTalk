@@ -253,6 +253,69 @@ pub fn specificity_index(g: &Graph) -> Vec<usize> {
     idx
 }
 
+/// Cell → node lookups for a built graph: its region and column
+/// nodes grouped by sheet, most specific (smallest area) first. The
+/// answers match [`node_for_cell_in`], but each lookup scans one
+/// sheet's nodes with integer range checks instead of every node with
+/// a case-folded sheet-name comparison, which dominated graph builds
+/// and invariant checks on large workbooks. It owns its data, so the
+/// graph can keep growing edges while it is in use.
+pub struct NodeLocator {
+    /// (sheet name, its nodes in specificity order).
+    sheets: Vec<(String, Vec<LocatedNode>)>,
+}
+
+/// A node id and its range bounds: (id, r0, c0, r1, c1).
+type LocatedNode = (usize, usize, usize, usize, usize);
+
+impl NodeLocator {
+    pub fn new(g: &Graph) -> Self {
+        let mut sheets: Vec<(String, Vec<LocatedNode>)> = Vec::new();
+        for id in specificity_index(g) {
+            let Some(r) = g
+                .nodes
+                .get(id)
+                .filter(|n| n.id == id)
+                .or_else(|| g.nodes.iter().find(|n| n.id == id))
+                .and_then(|n| n.range.as_ref())
+            else {
+                continue;
+            };
+            let entry = (id, r.r0, r.c0, r.r1, r.c1);
+            match sheets
+                .iter_mut()
+                .find(|(name, _)| sheet_name_eq(name, &r.sheet))
+            {
+                Some((_, nodes)) => nodes.push(entry),
+                None => sheets.push((r.sheet.clone(), vec![entry])),
+            }
+        }
+        NodeLocator { sheets }
+    }
+
+    /// The slot of a sheet (matched case-insensitively), for repeated
+    /// lookups on it with [`find`](Self::find).
+    pub fn sheet(&self, name: &str) -> Option<usize> {
+        self.sheets.iter().position(|(n, _)| sheet_name_eq(n, name))
+    }
+
+    /// The most specific node holding (row, col) on a sheet slot.
+    pub fn find(&self, slot: usize, row: usize, col: usize) -> Option<usize> {
+        self.sheets
+            .get(slot)?
+            .1
+            .iter()
+            .find_map(|&(id, r0, c0, r1, c1)| {
+                (r0 <= row && row <= r1 && c0 <= col && col <= c1).then_some(id)
+            })
+    }
+
+    /// The most specific node holding a cell of a named sheet.
+    pub fn node_for_cell(&self, sheet: &str, row: usize, col: usize) -> Option<usize> {
+        self.find(self.sheet(sheet)?, row, col)
+    }
+}
+
 /// Index-based lookup: node ids are assigned sequentially, so
 /// `g.nodes[id]` is the node with that id.
 pub fn node_for_cell_in(
@@ -1448,16 +1511,19 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
     // Lifted dependency edges, re-derived from formulas. Targets are
     // resolved on their own sheet (Sheet2!A1 does not mean this sheet),
     // using a pre-sorted specificity index instead of rescanning nodes.
-    let specificity = specificity_index(&g);
+    let locator = NodeLocator::new(&g);
     let mut seen = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
+        let home = locator.sheet(&sheet.name);
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    let src = node_for_cell_in(&g, &specificity, &sheet.name, r, c);
+                    let src = home.and_then(|h| locator.find(h, r, c));
                     for q in formula_refs_qualified(expr) {
-                        let target_sheet = q.sheet.as_deref().unwrap_or(&sheet.name);
-                        let dst = node_for_cell_in(&g, &specificity, target_sheet, q.row, q.col);
+                        let dst = match q.sheet.as_deref() {
+                            None => home.and_then(|h| locator.find(h, q.row, q.col)),
+                            Some(other) => locator.node_for_cell(other, q.row, q.col),
+                        };
                         if let (Some(s), Some(t)) = (src, dst) {
                             if s != t && seen.insert((s, t)) {
                                 g.edges.push(Edge {
@@ -1555,16 +1621,22 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
         .filter(|e| e.kind == "depends_on")
         .map(|e| (e.from, e.to))
         .collect();
-    let specificity = specificity_index(g);
+    let locator = NodeLocator::new(g);
     let mut expected = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
+        let Some(home) = locator.sheet(&sheet.name) else {
+            continue;
+        };
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    if let Some(s) = node_for_cell_in(g, &specificity, &sheet.name, r, c) {
+                    if let Some(s) = locator.find(home, r, c) {
                         for q in formula_refs_qualified(expr) {
-                            let ts = q.sheet.as_deref().unwrap_or(&sheet.name);
-                            if let Some(t) = node_for_cell_in(g, &specificity, ts, q.row, q.col) {
+                            let t = match q.sheet.as_deref() {
+                                None => locator.find(home, q.row, q.col),
+                                Some(other) => locator.node_for_cell(other, q.row, q.col),
+                            };
+                            if let Some(t) = t {
                                 if s != t {
                                     expected.insert((s, t));
                                 }
@@ -1580,10 +1652,13 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
     // cannot hide by re-deriving the same wrong expected set.
     let mut independent = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
+        let Some(home) = locator.sheet(&sheet.name) else {
+            continue;
+        };
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    if let Some(src) = node_for_cell_in(g, &specificity, &sheet.name, r, c) {
+                    if let Some(src) = locator.find(home, r, c) {
                         // Blank out string literals ("B2" is text,
                         // not a reference) before tokenising.
                         let mut scrubbed = String::with_capacity(expr.len());
@@ -1645,13 +1720,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                         let mut cc = c0;
                                         while cc <= c1 {
                                             // (stepping is checked below)
-                                            if let Some(t) = node_for_cell_in(
-                                                g,
-                                                &specificity,
-                                                &sheet.name,
-                                                rr,
-                                                cc,
-                                            ) {
+                                            if let Some(t) = locator.find(home, rr, cc) {
                                                 if src != t {
                                                     independent.insert((src, t));
                                                 }
@@ -1683,13 +1752,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                             (digits.parse::<usize>(), col_from_letters(letters))
                                         {
                                             if row1 >= 1 {
-                                                if let Some(t) = node_for_cell_in(
-                                                    g,
-                                                    &specificity,
-                                                    &sheet.name,
-                                                    row1 - 1,
-                                                    col,
-                                                ) {
+                                                if let Some(t) = locator.find(home, row1 - 1, col) {
                                                     if src != t {
                                                         independent.insert((src, t));
                                                     }
@@ -2296,6 +2359,28 @@ mod tests {
         assert_eq!(gc.sheets[0].name, "Renamed");
         assert_eq!(gc.date_system, gridcraft_core::DateSystem::D1900);
         assert!(gc.sheets[0].merges.is_empty());
+    }
+
+    #[test]
+    fn the_node_locator_agrees_with_the_linear_lookup() {
+        let mut wb = sample();
+        let mut other = parse_delimited("d", "Café", "A,B\n1,=Sheet1!D2\n\nX,Y\n2,3\n", ',');
+        wb.sheets.append(&mut other.sheets);
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let spec = specificity_index(&g);
+        let locator = NodeLocator::new(&g);
+        for sheet in ["Sheet1", "sheet1", "CAFÉ", "Nope"] {
+            for r in 0..8 {
+                for c in 0..6 {
+                    assert_eq!(
+                        locator.node_for_cell(sheet, r, c),
+                        node_for_cell_in(&g, &spec, sheet, r, c),
+                        "{sheet} {r} {c}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

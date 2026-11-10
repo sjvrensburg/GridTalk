@@ -53,7 +53,7 @@ pub struct ValueCache {
 }
 
 struct Shared {
-    wb: WorkbookSnapshot,
+    wb: Arc<WorkbookSnapshot>,
     calc: EvalCache,
 }
 
@@ -133,7 +133,7 @@ impl ValueCache {
             Some((rev, shared)) if *rev == revision => shared.clone(),
             _ => {
                 let shared = Arc::new(Shared {
-                    wb: snapshot.clone(),
+                    wb: Arc::new(snapshot.clone()),
                     calc: EvalCache::new(),
                 });
                 self.snapshot = Some((revision, shared.clone()));
@@ -157,6 +157,21 @@ impl ValueCache {
             coords,
             rx,
         });
+    }
+
+    /// Use `snapshot` as revision `revision`'s copy, so a caller that
+    /// already copied the snapshot for its own worker (the graph
+    /// rebuild) does not make the next request copy it again.
+    pub fn share(&mut self, revision: u64, snapshot: Arc<WorkbookSnapshot>) {
+        if !matches!(&self.snapshot, Some((rev, _)) if *rev == revision) {
+            self.snapshot = Some((
+                revision,
+                Arc::new(Shared {
+                    wb: snapshot,
+                    calc: EvalCache::new(),
+                }),
+            ));
+        }
     }
 
     /// Wait for the running job (tests only).

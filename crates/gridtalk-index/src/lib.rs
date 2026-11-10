@@ -238,31 +238,104 @@ fn region_sheet_assignments<'a>(
         .collect()
 }
 
+/// A region's document: its rendered passage and the term counts of
+/// its body (the passage without the "Range Sheet1!A1:B2" header,
+/// which is citation boilerplate, not content).
+fn doc_entry(sheet: &gridtalk_graph::SheetSnapshot, region: &gridtalk_graph::Region) -> DocEntry {
+    let passage = render_passage(sheet, region);
+    let body: String = passage.lines().skip(1).collect::<Vec<_>>().join("\n");
+    let mut tf: BTreeMap<String, usize> = BTreeMap::new();
+    for t in tokenize(&body) {
+        *tf.entry(t).or_default() += 1;
+    }
+    let doc_len: usize = tf.values().sum();
+    (region.range.clone(), passage, tf, body, doc_len)
+}
+
+/// Whether two ranges share a cell.
+fn overlaps(a: &RangeRef, b: &RangeRef) -> bool {
+    gridtalk_graph::sheet_name_eq(&a.sheet, &b.sheet)
+        && a.r0 <= b.r1
+        && b.r0 <= a.r1
+        && a.c0 <= b.c1
+        && b.c0 <= a.c1
+}
+
 impl Index {
     pub fn build(wb: &WorkbookSnapshot, graph: &Graph) -> Self {
         let mut idx = Index::default();
         let assignments = region_sheet_assignments(wb, graph);
         for (region, assigned) in graph.regions.iter().zip(assignments) {
             if let Some(sheet) = assigned {
-                let passage = render_passage(sheet, region);
-                // Index the body only: the "Range Sheet1!A1:B2" header
-                // is citation boilerplate, not content.
-                let body: String = passage.lines().skip(1).collect::<Vec<_>>().join("\n");
-                let mut tf: BTreeMap<String, usize> = BTreeMap::new();
-                for t in tokenize(&body) {
-                    *tf.entry(t).or_default() += 1;
-                }
-                for t in tf.keys() {
+                let doc = doc_entry(sheet, region);
+                for t in doc.2.keys() {
                     *idx.df.entry(t.clone()).or_default() += 1;
                 }
-                let doc_len: usize = tf.values().sum();
-                idx.docs
-                    .push((region.range.clone(), passage, tf, body, doc_len));
+                idx.docs.push(doc);
             } else {
                 idx.dropped_regions += 1;
             }
         }
         idx
+    }
+
+    /// Re-index for a new graph after edits to `dirty`. A region that
+    /// kept its exact range and that no dirty range touches has the
+    /// same passage (a passage shows only its region's cells), so its
+    /// document is reused without rendering it. Returns, per new
+    /// document, the old document it reuses.
+    fn rebuild_dirty(
+        &mut self,
+        wb: &WorkbookSnapshot,
+        graph: &Graph,
+        dirty: &[RangeRef],
+    ) -> Vec<Option<usize>> {
+        let mut old: Vec<Option<DocEntry>> = std::mem::take(&mut self.docs)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut reuse = Vec::new();
+        self.dropped_regions = 0;
+        let assignments = region_sheet_assignments(wb, graph);
+        for (region, assigned) in graph.regions.iter().zip(assignments) {
+            let Some(sheet) = assigned else {
+                self.dropped_regions += 1;
+                continue;
+            };
+            let clean = !dirty.iter().any(|d| overlaps(d, &region.range));
+            let hit = if clean {
+                old.iter()
+                    .position(|d| d.as_ref().is_some_and(|d| d.0 == region.range))
+            } else {
+                None
+            };
+            match hit.and_then(|j| old[j].take().map(|d| (j, d))) {
+                Some((j, doc)) => {
+                    self.docs.push(doc);
+                    reuse.push(Some(j));
+                }
+                None => {
+                    let doc = doc_entry(sheet, region);
+                    for t in doc.2.keys() {
+                        *self.df.entry(t.clone()).or_default() += 1;
+                    }
+                    self.docs.push(doc);
+                    reuse.push(None);
+                }
+            }
+        }
+        // Retire the replaced documents' terms.
+        for doc in old.into_iter().flatten() {
+            for t in doc.2.keys() {
+                if let Some(n) = self.df.get_mut(t) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.df.remove(t);
+                    }
+                }
+            }
+        }
+        reuse
     }
 
     /// TF-IDF ranked lexical search. Returns hits with the rendered
@@ -418,6 +491,20 @@ impl HybridIndex {
             .map(|i| self.lexical.doc_body(i).unwrap().to_string())
             .collect();
         self.vector.rebuild(&texts, &self.model);
+    }
+
+    /// Incremental refresh after edits to the `dirty` ranges: regions
+    /// that kept their range and that no edit touched keep their
+    /// lexical document and vectors untouched; only the edited regions
+    /// are re-rendered, re-counted and (line by line) re-embedded.
+    pub fn update_dirty(&mut self, wb: &WorkbookSnapshot, graph: &Graph, dirty: &[RangeRef]) {
+        let reuse = self.lexical.rebuild_dirty(wb, graph, dirty);
+        let lexical = &self.lexical;
+        self.vector.rebuild_reusing(
+            &reuse,
+            |i| lexical.doc_body(i).unwrap_or_default().to_string(),
+            &self.model,
+        );
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
@@ -751,5 +838,45 @@ mod tests {
         // via n-gram embeddings.
         let hits = hybrid.search("provisions", 5);
         assert_eq!(hits.len(), 1, "vector ranker must rescue the variant");
+    }
+
+    #[test]
+    fn a_dirty_update_matches_a_full_rebuild() {
+        let mut wb = parse_delimited("d", "A", "Name,Qty\nfoo,1\nbar,2\n", ',');
+        let other = parse_delimited("d", "B", "City,Pop\nOslo,7\nRome,9\n", ',');
+        wb.sheets.extend(other.sheets);
+        let (g, _) = build_graph(&wb);
+        let mut hybrid = HybridIndex::build(&wb, &g);
+        // Edit sheet A: its region is re-indexed, sheet B's reused.
+        wb.sheets[0].cells[1][0] = gridtalk_graph::CellValue::Text("quux".into());
+        let (g, _) = build_graph(&wb);
+        let dirty = [RangeRef {
+            sheet: "A".into(),
+            r0: 1,
+            c0: 0,
+            r1: 1,
+            c1: 0,
+        }];
+        hybrid.update_dirty(&wb, &g, &dirty);
+        let full = HybridIndex::build(&wb, &g);
+        assert_eq!(hybrid.lexical.docs, full.lexical.docs);
+        assert_eq!(hybrid.lexical.df, full.lexical.df);
+        for q in ["quux", "foo", "Oslo", "Qty"] {
+            let a: Vec<_> = hybrid
+                .search(q, 5)
+                .into_iter()
+                .map(|h| (h.range, h.score))
+                .collect();
+            let b: Vec<_> = full
+                .search(q, 5)
+                .into_iter()
+                .map(|h| (h.range, h.score))
+                .collect();
+            assert_eq!(a, b, "query {q}");
+        }
+        assert!(hybrid
+            .search("foo", 5)
+            .iter()
+            .all(|h| !h.matched_terms.contains(&"foo".to_string())));
     }
 }

@@ -288,6 +288,38 @@ impl SyncState {
     }
 }
 
+/// A graph rebuild running on a worker thread.
+struct RebuildJob {
+    revision: u64,
+    rx: std::sync::mpsc::Receiver<RebuildResult>,
+}
+
+/// A rebuilt graph, its invariant violations, and the index.
+type RebuildResult = (Graph, Vec<String>, Option<Index>);
+
+/// Build the graph for `snapshot` and bring `index` up to date with
+/// it: incrementally from the edited `dirty` ranges when there is an
+/// index to update, else from scratch. A graph with invariant
+/// violations gets no index (never serve a stale one).
+fn compute_rebuild(
+    snapshot: &gridtalk_graph::WorkbookSnapshot,
+    index: Option<Index>,
+    dirty: Option<&[RangeRef]>,
+) -> RebuildResult {
+    let (graph, violations) = build_graph(snapshot);
+    if !violations.is_empty() {
+        return (graph, violations, None);
+    }
+    let index = match (index, dirty) {
+        (Some(mut index), Some(dirty)) => {
+            index.update_dirty(snapshot, &graph, dirty);
+            index
+        }
+        _ => Index::build(snapshot, &graph),
+    };
+    (graph, violations, Some(index))
+}
+
 /// The node a selection highlights: the node whose range it is (a
 /// graph-side pick), else the most specific node holding its cell.
 fn node_for_selection(graph: &Graph, sel: &RangeRef) -> Option<usize> {
@@ -313,6 +345,14 @@ pub struct GridTalkApp {
     workbook_name: String,
     positions: BTreeMap<usize, Pos>,
     layout_worker: Option<LayoutWorker>,
+    /// The graph and index rebuild after an edit, running off the UI
+    /// thread (on a large workbook it takes a noticeable fraction of
+    /// a second). The index is moved into it and comes back updated.
+    rebuild_job: Option<RebuildJob>,
+    /// Ranges edited since the index was last updated.
+    pending_dirty: Vec<RangeRef>,
+    /// Edits landed that no rebuild has picked up yet.
+    rebuild_wanted: bool,
     layout_revision: u64,
     chat_input: String,
     chat: Vec<ChatMsg>,
@@ -426,6 +466,9 @@ impl GridTalkApp {
             frame_sheet: None,
             frame_sheet_idx: usize::MAX,
             values: ValueCache::default(),
+            rebuild_job: None,
+            pending_dirty: Vec::new(),
+            rebuild_wanted: false,
             read_only_locked: false,
             frame_revision: u64::MAX,
             scrolled_for: None,
@@ -628,7 +671,11 @@ impl GridTalkApp {
                     .unwrap_or_default();
                 let inc = IncrementalSnapshot::new(wb);
                 self.saved_revision = inc.revision;
-                let violations = self.rebuild(inc.snapshot(), false);
+                // A rebuild in flight belongs to the old workbook.
+                self.rebuild_job = None;
+                self.pending_dirty.clear();
+                self.rebuild_wanted = false;
+                let violations = self.rebuild(inc.snapshot(), None);
                 self.inc = Some(inc);
                 self.current_path = Some(path.to_path_buf());
                 self.selected_sheet = 0;
@@ -667,18 +714,39 @@ impl GridTalkApp {
         }
     }
 
-    /// Rebuild the graph and refresh the index from `snapshot`.
-    /// After an edit (`after_edit`) the selection is a cell range that
-    /// still means the same cells, so it is kept and its highlighted
-    /// node re-found; and when the edit left the graph's shape alone
-    /// (the usual case: a value changed inside a region) the layout
-    /// is kept too, instead of the graph view jumping to a fresh one.
+    /// Rebuild the graph and refresh the index from `snapshot`, on
+    /// this thread. `dirty` is `None` for a newly opened workbook
+    /// (fresh index, selection dropped) and the edited ranges after an
+    /// edit (see [`apply_rebuild`](Self::apply_rebuild)).
     fn rebuild(
         &mut self,
         snapshot: &gridtalk_graph::WorkbookSnapshot,
+        dirty: Option<Vec<RangeRef>>,
+    ) -> Vec<String> {
+        let after_edit = dirty.is_some();
+        let index = if after_edit {
+            self.index.take()
+        } else {
+            self.index = None;
+            None
+        };
+        let (graph, violations, index) = compute_rebuild(snapshot, index, dirty.as_deref());
+        self.apply_rebuild(graph, violations, index, after_edit)
+    }
+
+    /// Install a rebuilt graph and index. After an edit
+    /// (`after_edit`) the selection is a cell range that still means
+    /// the same cells, so it is kept and its highlighted node
+    /// re-found; and when the edit left the graph's shape alone (the
+    /// usual case: a value changed inside a region) the layout is kept
+    /// too, instead of the graph view jumping to a fresh one.
+    fn apply_rebuild(
+        &mut self,
+        graph: Graph,
+        violations: Vec<String>,
+        index: Option<Index>,
         after_edit: bool,
     ) -> Vec<String> {
-        let (graph, violations) = build_graph(snapshot);
         let same_shape =
             after_edit && graph.nodes == self.graph.nodes && graph.edges == self.graph.edges;
         if !same_shape {
@@ -702,19 +770,67 @@ impl GridTalkApp {
             self.sync.highlighted_node = None;
             self.scrolled_for = None;
         }
-        if violations.is_empty() {
-            // Refresh incrementally when possible (unchanged regions
-            // keep their embedding vectors).
-            match &mut self.index {
-                Some(index) => index.update(snapshot, &graph),
-                None => self.index = Some(Index::build(snapshot, &graph)),
-            }
-        } else {
-            // Never keep serving a stale index for a broken graph.
-            self.index = None;
-        }
+        self.index = index;
         self.graph = graph;
         violations
+    }
+
+    /// Start rebuilding for the current snapshot on a worker thread,
+    /// with the edits gathered in `pending_dirty`.
+    fn start_rebuild(&mut self, ctx: Option<egui::Context>) {
+        let Some(inc) = &self.inc else {
+            return;
+        };
+        let revision = inc.revision;
+        let snapshot = Arc::new(inc.snapshot().clone());
+        // The formula worker needs the same copy for this revision.
+        self.values.share(revision, snapshot.clone());
+        let dirty = std::mem::take(&mut self.pending_dirty);
+        let index = self.index.take();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(compute_rebuild(&snapshot, index, Some(&dirty)));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.rebuild_job = Some(RebuildJob { revision, rx });
+        self.rebuild_wanted = false;
+    }
+
+    /// Install a finished rebuild, waiting for it when `block`.
+    /// Returns true when one landed.
+    fn poll_rebuild(&mut self, block: bool) -> bool {
+        let Some(job) = &self.rebuild_job else {
+            return false;
+        };
+        let result = if block {
+            job.rx.recv().ok()
+        } else {
+            match job.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        let job = self.rebuild_job.take().expect("job checked above");
+        match result {
+            Some((graph, violations, index)) => {
+                let violations = self.apply_rebuild(graph, violations, index, true);
+                self.layout_revision = job.revision;
+                if !violations.is_empty() {
+                    self.status = format!("Graph invariants violated: {violations:?}");
+                }
+            }
+            None => {
+                // The worker panicked and took the index with it: the
+                // next rebuild builds a fresh one.
+                self.index = None;
+                self.rebuild_wanted = true;
+                self.status = "Rebuilding the graph after an edit failed; retrying.".into();
+            }
+        }
+        true
     }
 
     /// Adapter prompt text for chat, built by the same
@@ -757,6 +873,11 @@ impl GridTalkApp {
         }
         self.chat_input.clear();
         self.push_chat("you", question.clone());
+        // Search the index as of the latest edit.
+        if self.rebuild_wanted && self.rebuild_job.is_none() {
+            self.start_rebuild(None);
+        }
+        self.poll_rebuild(true);
         let Some(index) = &self.index else {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
@@ -944,6 +1065,8 @@ impl GridTalkApp {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // A rebuild in flight holds the index; let it land first.
+        self.poll_rebuild(true);
         // An edit typed <500ms ago must be in the saved file.
         let mut dropped_note = None;
         let mut applied = 0;
@@ -957,11 +1080,13 @@ impl GridTalkApp {
         };
         // The flush empties the pending queue, so poll() will not see
         // these edits: rebuild the graph and index here instead.
-        inc.take_dirty_ranges();
+        self.pending_dirty.extend(inc.take_dirty_ranges());
         let snapshot = inc.snapshot().clone();
         let revision = inc.revision;
         if applied > 0 {
-            let violations = self.rebuild(&snapshot, true);
+            let dirty = std::mem::take(&mut self.pending_dirty);
+            self.rebuild_wanted = false;
+            let violations = self.rebuild(&snapshot, Some(dirty));
             self.layout_revision = revision;
             if !violations.is_empty() {
                 self.status = format!("Graph invariants violated: {violations:?}");
@@ -1127,28 +1252,27 @@ impl eframe::App for GridTalkApp {
             self.status = "Unsaved edits — close again to exit without saving.".into();
         }
         // Apply debounced cell edits; rebuild graph+index on revision change.
-        // The snapshot is moved out for the rebuild (which borrows
-        // self) rather than cloned on every edit.
-        if let Some(mut inc) = self.inc.take() {
+        // Applied edits are rebuilt into the graph and index on a
+        // worker thread, one rebuild at a time; edits landing while one
+        // runs are gathered for the next.
+        let mut note = None;
+        if let Some(inc) = &mut self.inc {
             let before = inc.dropped_edits();
             if inc.poll(std::time::Instant::now()) {
-                if let Some(note) = dropped_edit_note(&inc, before) {
-                    self.status = note;
-                }
-                // The graph rebuild is whole-workbook, so the dirty
-                // ranges are not needed; drain them so they do not
-                // accumulate for the whole session.
-                inc.take_dirty_ranges();
-                let violations = self.rebuild(inc.snapshot(), true);
-                if !violations.is_empty() {
-                    self.status = format!("Graph invariants violated: {violations:?}");
-                }
-                self.layout_revision = inc.revision;
+                note = dropped_edit_note(inc, before);
+                self.pending_dirty.extend(inc.take_dirty_ranges());
+                self.rebuild_wanted = true;
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             } else if inc.pending_edits() > 0 {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
             }
-            self.inc = Some(inc);
+        }
+        if let Some(note) = note {
+            self.status = note;
+        }
+        self.poll_rebuild(false);
+        if self.rebuild_wanted && self.rebuild_job.is_none() {
+            self.start_rebuild(Some(ctx.clone()));
         }
         // Watchdog: a worker that never sends (hung backend, lost
         // cancel flag) must not wedge chat forever.
@@ -2348,6 +2472,40 @@ mod tests {
     }
 
     #[test]
+    fn edits_are_rebuilt_on_a_worker_and_reach_the_index() {
+        let dir = std::env::temp_dir().join(format!("gt-ui-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.csv");
+        std::fs::write(&source, "Item,Qty\nApples,2\nPears,4\n").unwrap();
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
+        app.open(&source);
+        app.sync.select_cell(&app.graph, "Sheet1", 1, 1);
+        let inc = app.inc.as_mut().unwrap();
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 2,
+                col: 0,
+                value: CellValue::Text("Zebrafruit".into()),
+            },
+            std::time::Instant::now(),
+        );
+        inc.flush();
+        app.pending_dirty.extend(inc.take_dirty_ranges());
+        app.start_rebuild(None);
+        assert!(app.index.is_none(), "the index travels with the job");
+        assert!(app.poll_rebuild(true));
+        assert!(app.rebuild_job.is_none() && app.pending_dirty.is_empty());
+        let hits = app.index.as_ref().unwrap().search("Zebrafruit", 3);
+        assert!(!hits.is_empty() && !hits[0].vector_only);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!B2:B2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_edit_keeps_the_selection_and_an_unchanged_graph_keeps_its_layout() {
         let dir = std::env::temp_dir().join(format!("gt-ui-keep-sel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2377,8 +2535,9 @@ mod tests {
                 std::time::Instant::now(),
             );
             inc.flush();
-            let inc = app.inc.take().unwrap();
-            app.rebuild(inc.snapshot(), true);
+            let mut inc = app.inc.take().unwrap();
+            let dirty = inc.take_dirty_ranges();
+            app.rebuild(inc.snapshot(), Some(dirty));
             app.inc = Some(inc);
         };
         // A value inside the region: same graph, same layout.

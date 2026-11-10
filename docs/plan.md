@@ -108,13 +108,21 @@ Phase 1 — structural:
 
 - [x] Keep the original Gridcraft workbook alongside the snapshot (decision 0005): `WorkbookSnapshot::source`; `to_gridcraft_workbook` overlays only changed cells (keeping their style), so styles, merges, tables/structured refs, array formulas, the date system and error cells survive save and eval. The UI's "XLSX save loses formatting" prompt is gone. Editing a table header renames the column and its structured references. Known limit: a snapshot whose sheets were renamed, added or removed falls back to snapshot-only conversion
 - [x] One cached calc engine per workbook revision (`eval::EvalCache`/`Evaluator`) for MCP sessions, `Tools` (investigate, `tools call`), bench task generation and the UI eval worker; what-if runs on a clone, recalculating only the override's dependents. Measured on 5,000 `SUM(A:A)` rows: the first evaluation still costs the full recalculation (~0.9 s), the next 100 cell reads take 17 µs together. A what-if whose override every row depends on still recalculates every row (Gridcraft's cost)
-- [ ] UI rebuilds incrementally from dirty ranges and keeps the selection after an edit. Done: the selection and its highlighted node survive an edit; an edit that leaves the graph's nodes and edges unchanged keeps the graph layout; the snapshot is no longer cloned per edit; the index re-embeds only changed regions. Not done: the graph itself is still rebuilt for the whole workbook, and the dirty ranges are drained unused
+- [x] UI keeps the selection after an edit, and the graph layout when the edit leaves the graph's nodes and edges unchanged; no snapshot clone per edit
+- The incremental-rebuild item was split on 2026-11-10 after measuring (release build, one cell edited; test workbooks of 30k, 300k and 1.2M cells across 1–4 sheets). Before Phase 1b, each edit cost 29 ms, 0.58 s and 2.7 s, all on the UI thread, so a large workbook froze for seconds per edit. `check_invariants` was ~60% of `build_graph`, and the index update cost as much as a full index build
+
+Phase 1b — edit latency (independent of the lineage rules):
+
+- [x] Rebuild the graph and index on a worker thread after an edit (`RebuildJob`): the UI never blocks; chat and Save wait for a rebuild in flight; the rebuild's snapshot copy is shared with the formula worker
+- [x] Cheaper graph build and invariant check: `NodeLocator` groups region/column nodes by sheet, so a cell lookup is an integer scan of one sheet's nodes instead of a case-folded name comparison against every node. `build_graph` per edit: 17→4.6 ms, 413→54 ms, 1.73→0.33 s
+- [x] Incremental index from dirty ranges (`HybridIndex::update_dirty`): a region that kept its range and that no edit touched keeps its lexical document and vectors without being re-rendered. Index update per edit: 162→43 ms (300k cells), 0.96→0.29 s (1.2M). Total per edit, now off the UI thread: 18 ms, 97 ms, 0.63 s
 
 Phase 2 — agent-facing correctness:
 
 - [ ] `get_cells` returns the evaluated value plus the typed cached value; cell parsing rejects refs outside the sheet grid
 - [ ] CLI `ask` uses `HybridIndex`; investigate's what-if discovery finds text dependents
 - [ ] Graph lineage: 3D refs (`Jan:Mar!A2` is currently misread as columns JAN:MAR), defined names, checked range-end sheet qualifiers, running totals within a column
+- [ ] Incremental graph rebuild from dirty ranges, after the lineage item (it depends on the final edge rules): re-detect regions and re-lift edges only for the sheets an edit touched, and check invariants for those sheets. The edited region is still re-indexed whole, which matters when one region spans most of a sheet
 - [ ] `list_sheets`/`workbook_info` tool (sheets, defined names, load warnings); `readOnlyHint` annotations; A1 examples in tool descriptions
 - [ ] One typed MCP error envelope; `expand` capped with truncation fields; search limit clamp disclosed; re-opening a path reuses its session
 - [ ] Reader warnings reach the agent after a silent reload: when `fresh()` reloads a changed file, its new `warnings` are reported on the next tool response, not only by `open_workbook`
