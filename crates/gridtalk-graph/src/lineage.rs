@@ -157,6 +157,10 @@ pub struct AreaNodes {
     /// Per snapshot sheet: every region and column node (id, is a
     /// column, bounds), for the invariant check's independent rule.
     flat: Vec<Vec<(usize, bool, Bounds)>>,
+    /// Per snapshot sheet: whether two of its regions overlap (the
+    /// bounding boxes of separate components can). There a column can
+    /// hold cells a more specific node of another region also holds.
+    overlapping: Vec<bool>,
 }
 
 impl AreaNodes {
@@ -201,14 +205,32 @@ impl AreaNodes {
                 }),
             }
         }
-        AreaNodes { sheets, flat }
+        let overlapping = sheets
+            .iter()
+            .map(|regs| {
+                regs.iter()
+                    .enumerate()
+                    .any(|(i, a)| regs[i + 1..].iter().any(|b| intersects(a.bounds, b.bounds)))
+            })
+            .collect();
+        AreaNodes {
+            sheets,
+            flat,
+            overlapping,
+        }
     }
 
     /// The nodes an area reads: every column node it touches, and a
     /// region it touches through none of its columns. A region's
     /// columns partition it, so a column is the most specific node of
-    /// the cells it holds.
+    /// the cells it holds. On a sheet whose regions overlap, a cell can
+    /// lie in columns of two regions; there the most specific node
+    /// wins, by the coverage rule.
     pub fn nodes(&self, area: &Area, out: &mut Vec<usize>) {
+        if self.overlapping.get(area.0).copied().unwrap_or(false) {
+            self.nodes_by_coverage(area, out);
+            return;
+        }
         let Some(regions) = self.sheets.get(area.0) else {
             return;
         };

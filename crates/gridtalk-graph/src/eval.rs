@@ -240,11 +240,8 @@ impl Evaluator {
         value: f64,
         target_ref: (&str, usize, usize),
     ) -> Result<(Value, Value), EvalError> {
-        // Reject a bad value before paying for the clone.
-        if !value.is_finite() {
-            return Err(EvalError::Type("what-if value must be finite".into()));
-        }
-        self.engine.sheet(override_ref.0)?;
+        // with_override rejects a bad value or sheet before paying for
+        // the clone.
         let before = self.value(target_ref.0, target_ref.1, target_ref.2)?;
         let after = self.with_override(override_ref, value)?.value(
             target_ref.0,

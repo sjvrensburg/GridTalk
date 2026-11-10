@@ -1690,18 +1690,14 @@ pub fn build_graph_cached(
                         continue;
                     };
                     let key = (si, r, c);
-                    if let Some(cached) = cache.areas.get_mut(&key) {
-                        if audited(reused) {
-                            let now = lineage.areas(wb, si, expr);
-                            if cached[..] != now[..] {
-                                stale.push(format!(
-                                    "{}!{}{}",
-                                    quote_sheet(&sheet.name),
-                                    col_name(c),
-                                    r + 1
-                                ));
-                                *cached = now.into();
-                            }
+                    if let Some(cached) = cache.areas.get(&key) {
+                        if audited(reused) && cached[..] != lineage.areas(wb, si, expr)[..] {
+                            stale.push(format!(
+                                "{}!{}{}",
+                                quote_sheet(&sheet.name),
+                                col_name(c),
+                                r + 1
+                            ));
                         }
                         reused += 1;
                     }
@@ -1738,7 +1734,7 @@ pub fn build_graph_cached(
         return build_graph_cached(wb, cache, None);
     }
     cache.audit_cursor = (audit_start + CACHE_AUDIT_SAMPLE) % window;
-    let violations = check_invariants_with(wb, &g, &precedents);
+    let violations = check_invariants_with(wb, &g, &precedents, &area_nodes);
     (g, violations)
 }
 
@@ -1777,7 +1773,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             }
         }
     }
-    check_invariants_with(wb, g, &precedents)
+    check_invariants_with(wb, g, &precedents, &lineage::AreaNodes::new(wb, g))
 }
 
 /// Every formula's precedent areas, keyed by the node of its cell,
@@ -1802,6 +1798,7 @@ fn check_invariants_with(
     wb: &WorkbookSnapshot,
     g: &Graph,
     precedents: &FormulaAreas,
+    area_nodes: &lineage::AreaNodes,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     // Structural invariants, independent of how edges were derived:
@@ -1867,7 +1864,6 @@ fn check_invariants_with(
     let locator = NodeLocator::new(g);
     // Expected edges: the precedent areas mapped onto nodes by an
     // independent rule (`nodes_by_coverage`).
-    let area_nodes = lineage::AreaNodes::new(wb, g);
     let mut expected = std::collections::BTreeSet::new();
     let mut targets = Vec::new();
     for (s, areas) in precedents.iter() {
@@ -1880,6 +1876,27 @@ fn check_invariants_with(
     // Independent cross-check with a second, deliberately simple
     // tokeniser, so a systematic miss in formula_refs_qualified
     // cannot hide by re-deriving the same wrong expected set.
+    // A region and a column with the same bounds (a one-column
+    // region) are equally specific; the lifted edges name the column,
+    // so the locator's region answer maps to it.
+    let same_bounds_column: std::collections::HashMap<usize, usize> = {
+        let mut columns = std::collections::HashMap::new();
+        for n in g.nodes.iter().filter(|n| n.kind == NodeKind::Column) {
+            if let Some(r) = &n.range {
+                columns.insert((r.sheet.to_lowercase(), r.r0, r.c0, r.r1, r.c1), n.id);
+            }
+        }
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Region)
+            .filter_map(|n| {
+                let r = n.range.as_ref()?;
+                let key = (r.sheet.to_lowercase(), r.r0, r.c0, r.r1, r.c1);
+                columns.get(&key).map(|&c| (n.id, c))
+            })
+            .collect()
+    };
+    let canon = |t: usize| same_bounds_column.get(&t).copied().unwrap_or(t);
     let mut independent = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
         let Some(home) = locator.sheet(&sheet.name) else {
@@ -1950,7 +1967,7 @@ fn check_invariants_with(
                                         let mut cc = c0;
                                         while cc <= c1 {
                                             // (stepping is checked below)
-                                            if let Some(t) = locator.find(home, rr, cc) {
+                                            if let Some(t) = locator.find(home, rr, cc).map(canon) {
                                                 if src != t {
                                                     independent.insert((src, t));
                                                 }
@@ -1982,7 +1999,9 @@ fn check_invariants_with(
                                             (digits.parse::<usize>(), col_from_letters(letters))
                                         {
                                             if row1 >= 1 {
-                                                if let Some(t) = locator.find(home, row1 - 1, col) {
+                                                if let Some(t) =
+                                                    locator.find(home, row1 - 1, col).map(canon)
+                                                {
                                                     if src != t {
                                                         independent.insert((src, t));
                                                     }
@@ -3095,6 +3114,25 @@ mod tests {
             !edges_to_item(&g),
             "one window audits {CACHE_AUDIT_SAMPLE} entries, not every one"
         );
+    }
+
+    #[test]
+    fn overlapping_regions_lift_to_the_most_specific_node() {
+        // The inverted U A1:E5's bounding box holds the lone C3, its
+        // own region: G1 reads C3 (and B2:D4) through C3's node only.
+        // A lone one-column region (region and column alike) read
+        // from elsewhere on its sheet.
+        let wb = parse_delimited("d", "Sheet1", "A,,=C3\n1,,\n,,9\n", ',');
+        let (_, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        for formula in ["=C3", "=SUM(B2:D4)"] {
+            let csv =
+                format!("H1,H2,H3,H4,H5,,{formula}\n1,,,,2,,\n3,,9,,4,,\n5,,,,6,,\n7,,,,8,,\n");
+            let wb = parse_delimited("d", "Sheet1", &csv, ',');
+            let (g, violations) = build_graph(&wb);
+            assert!(violations.is_empty(), "{formula}: {violations:?}");
+            assert!(g.regions.iter().any(|r| r.range.a1() == "Sheet1!C3:C3"));
+        }
     }
 
     #[test]

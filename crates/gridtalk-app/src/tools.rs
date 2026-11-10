@@ -474,7 +474,7 @@ impl<'a> Tools<'a> {
                     return ToolResult::err(
                         "what_if",
                         ErrorKind::InvalidRange,
-                        cell_error("target", target),
+                        cell_error("target", target, target),
                     );
                 };
                 // The override may name its own sheet (Other!B2);
@@ -488,7 +488,7 @@ impl<'a> Tools<'a> {
                     return ToolResult::err(
                         "what_if",
                         ErrorKind::InvalidRange,
-                        cell_error("cell", cell),
+                        cell_error("cell", cell, &qualified),
                     );
                 };
                 if self.sheet(&override_sheet).is_none() {
@@ -783,16 +783,18 @@ fn range_error(range: &str) -> String {
     }
 }
 
-/// Why a what-if cell or target did not parse.
-fn cell_error(what: &str, a1: &str) -> String {
-    let outside = split_sheet_prefix(a1)
-        .or_else(|| Some((String::new(), a1)))
+/// Why a what-if cell or target did not parse. `shown` is the
+/// caller's spelling; `qualified` the sheet-qualified reference that
+/// was parsed (a reference with no sheet is unparseable, not outside
+/// the grid).
+fn cell_error(what: &str, shown: &str, qualified: &str) -> String {
+    let outside = split_sheet_prefix(qualified)
         .and_then(|(sheet, cell)| parse_a1(&sheet, cell))
         .is_some();
     if outside {
-        format!("{what} {a1} is outside the sheet grid, which ends at XFD1048576")
+        format!("{what} {shown} is outside the sheet grid, which ends at XFD1048576")
     } else {
-        format!("cannot parse {what} {a1}")
+        format!("cannot parse {what} {shown}")
     }
 }
 
@@ -1120,6 +1122,17 @@ mod tests {
             what_if.text.contains("outside the sheet grid"),
             "{}",
             what_if.text
+        );
+        // A target with no sheet does not parse; it is not off-grid.
+        let unqualified = tools.call(&ToolRequest::WhatIf {
+            cell: "B2".into(),
+            value: 1.0,
+            target: "D2".into(),
+        });
+        assert!(
+            unqualified.text.contains("cannot parse target D2"),
+            "{}",
+            unqualified.text
         );
     }
 

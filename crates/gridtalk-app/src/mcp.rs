@@ -454,6 +454,14 @@ impl McpServer {
                 // checks every field and type.
                 let mut fields = obj.clone();
                 fields.remove("workbook_id");
+                // Like req_str: an empty string is a missing argument,
+                // never a silent empty query or range.
+                if let Some(key) = fields.iter().find(|(_, v)| v.as_str() == Some("")) {
+                    return Err(invalid(format!(
+                        "missing or non-string argument: {}",
+                        key.0
+                    )));
+                }
                 if let Some(limit) = fields.get("limit") {
                     if limit.as_u64().is_none_or(|n| n < 1) {
                         return Err(invalid("limit must be a positive integer".to_string()));
