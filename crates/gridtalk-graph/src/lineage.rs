@@ -10,7 +10,7 @@
 //! lexical extractor, so it still contributes the edges it did before.
 
 use crate::{
-    formula_refs_qualified, gridcraft_names, sheet_name_eq, Graph, NodeKind, WorkbookSnapshot,
+    formula_refs_qualified_on, gridcraft_names, sheet_name_eq, Graph, NodeKind, WorkbookSnapshot,
 };
 use gridcraft_core::RangeRef as GcRange;
 use gridcraft_formula::Expr;
@@ -50,7 +50,8 @@ impl Lineage {
             Ok(e) => self.collect(sheet, &e, 0, &mut HashSet::new(), &mut out),
             Err(_) => {
                 // Unparseable: keep the lexical extractor's cells.
-                for q in formula_refs_qualified(expr) {
+                let home = snapshot.sheets.get(sheet).map(|s| s.name.as_str());
+                for q in formula_refs_qualified_on(expr, home) {
                     let target = match &q.sheet {
                         None => Some(sheet),
                         Some(name) => snapshot

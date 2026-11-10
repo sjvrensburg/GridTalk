@@ -1218,6 +1218,15 @@ fn parse_whole_range_at(chars: &[char], at: usize) -> Option<(usize, usize, usiz
 }
 
 pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
+    formula_refs_qualified_on(expr, None)
+}
+
+/// [`formula_refs_qualified`] for a formula on sheet `home`: a range
+/// whose start is unqualified and whose end names `home`
+/// (`A1:Sheet1!B2` on Sheet1) is the rectangle it means. Without a
+/// home sheet such an end cannot be checked, so the two cells are
+/// kept apart.
+pub fn formula_refs_qualified_on(expr: &str, home: Option<&str>) -> Vec<QualifiedRef> {
     let chars: Vec<char> = expr.chars().collect();
     let mut refs = Vec::new();
     let mut i = 0;
@@ -1372,7 +1381,7 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                     let same_sheet = match (&end_sheet, &sheet) {
                         (None, _) => true,
                         (Some(e), Some(s)) => sheet_name_eq(e, s),
-                        (Some(_), None) => false,
+                        (Some(e), None) => home.is_some_and(|h| sheet_name_eq(e, h)),
                     };
                     if !same_sheet {
                         refs.push(QualifiedRef {
@@ -1517,7 +1526,9 @@ pub struct GraphCache {
     /// Per sheet index: its detected regions.
     regions: Vec<Option<Vec<Region>>>,
     /// Per formula cell (sheet index, row, col): its precedent areas.
-    areas: std::collections::HashMap<(usize, usize, usize), Vec<lineage::Area>>,
+    /// Shared with each build's invariant check, so passing them on
+    /// copies a pointer, not the areas.
+    areas: std::collections::HashMap<(usize, usize, usize), std::sync::Arc<[lineage::Area]>>,
     /// Where the next audit window starts, counted over the entries a
     /// rebuild reuses (see [`CACHE_AUDIT_SAMPLE`]).
     audit_cursor: usize,
@@ -1682,14 +1693,14 @@ pub fn build_graph_cached(
                     if let Some(cached) = cache.areas.get_mut(&key) {
                         if audited(reused) {
                             let now = lineage.areas(wb, si, expr);
-                            if *cached != now {
+                            if cached[..] != now[..] {
                                 stale.push(format!(
                                     "{}!{}{}",
                                     quote_sheet(&sheet.name),
                                     col_name(c),
                                     r + 1
                                 ));
-                                *cached = now;
+                                *cached = now.into();
                             }
                         }
                         reused += 1;
@@ -1697,8 +1708,8 @@ pub fn build_graph_cached(
                     let areas = cache
                         .areas
                         .entry(key)
-                        .or_insert_with(|| lineage.areas(wb, si, expr));
-                    precedents.push(src, areas);
+                        .or_insert_with(|| lineage.areas(wb, si, expr).into());
+                    precedents.push(src, areas.clone());
                     for area in areas.iter() {
                         targets.clear();
                         area_nodes.nodes(area, &mut targets);
@@ -1760,7 +1771,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
                     if let Some(src) = locator.find(home, r, c) {
-                        precedents.push(src, &lineage.areas(wb, si, expr));
+                        precedents.push(src, lineage.areas(wb, si, expr).into());
                     }
                 }
             }
@@ -1773,24 +1784,17 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
 /// stored flat.
 #[derive(Default)]
 struct FormulaAreas {
-    /// (source node, end of its areas in `areas`).
-    formulas: Vec<(usize, usize)>,
-    areas: Vec<lineage::Area>,
+    /// (source node, its areas), sharing the graph cache's entries.
+    formulas: Vec<(usize, std::sync::Arc<[lineage::Area]>)>,
 }
 
 impl FormulaAreas {
-    fn push(&mut self, src: usize, areas: &[lineage::Area]) {
-        self.areas.extend_from_slice(areas);
-        self.formulas.push((src, self.areas.len()));
+    fn push(&mut self, src: usize, areas: std::sync::Arc<[lineage::Area]>) {
+        self.formulas.push((src, areas));
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, &[lineage::Area])> {
-        let mut start = 0;
-        self.formulas.iter().map(move |&(src, end)| {
-            let slice = &self.areas[start..end];
-            start = end;
-            (src, slice)
-        })
+        self.formulas.iter().map(|(src, areas)| (*src, &areas[..]))
     }
 }
 
@@ -3091,6 +3095,23 @@ mod tests {
             !edges_to_item(&g),
             "one window audits {CACHE_AUDIT_SAMPLE} entries, not every one"
         );
+    }
+
+    #[test]
+    fn a_range_end_naming_the_home_sheet_is_a_rectangle() {
+        let cells = |home: Option<&str>| -> Vec<(Option<String>, usize, usize)> {
+            formula_refs_qualified_on("SUM(A1:Sheet1!B2)", home)
+                .into_iter()
+                .map(|q| (q.sheet, q.row, q.col))
+                .collect()
+        };
+        // On Sheet1 the end names the home sheet: all of A1:B2.
+        assert_eq!(cells(Some("sheet1")).len(), 4);
+        // On another sheet, or with no home, the two cells stay apart,
+        // the end on the sheet it names.
+        let apart = vec![(None, 0, 0), (Some("Sheet1".to_string()), 1, 1)];
+        assert_eq!(cells(Some("Sheet2")), apart);
+        assert_eq!(cells(None), apart);
     }
 
     #[test]
