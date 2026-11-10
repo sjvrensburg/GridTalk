@@ -13,7 +13,8 @@ use gridtalk_adapter::{
     valid_adapter_name,
 };
 use gridtalk_graph::{
-    build_graph, load_path, CellEdit, CellValue, Graph, IncrementalSnapshot, NodeKind, RangeRef,
+    build_graph_cached, load_path, CellEdit, CellValue, Graph, GraphCache, IncrementalSnapshot,
+    NodeKind, RangeRef,
 };
 use gridtalk_index::HybridIndex as Index;
 use gridtalk_infer::config::Config;
@@ -297,21 +298,23 @@ struct RebuildJob {
     rx: std::sync::mpsc::Receiver<RebuildResult>,
 }
 
-/// A rebuilt graph, its invariant violations, and the index.
-type RebuildResult = (Graph, Vec<String>, Option<Index>);
+/// A rebuilt graph, its invariant violations, the index, and the
+/// graph cache for the next rebuild.
+type RebuildResult = (Graph, Vec<String>, Option<Index>, GraphCache);
 
 /// Build the graph for `snapshot` and bring `index` up to date with
 /// it: incrementally from the edited `dirty` ranges when there is an
-/// index to update, else from scratch. A graph with invariant
-/// violations gets no index (never serve a stale one).
+/// index to update and a cache to reuse, else from scratch. A graph
+/// with invariant violations gets no index (never serve a stale one).
 fn compute_rebuild(
     snapshot: &gridtalk_graph::WorkbookSnapshot,
     index: Option<Index>,
+    mut cache: GraphCache,
     dirty: Option<&[RangeRef]>,
 ) -> RebuildResult {
-    let (graph, violations) = build_graph(snapshot);
+    let (graph, violations) = build_graph_cached(snapshot, &mut cache, dirty);
     if !violations.is_empty() {
-        return (graph, violations, None);
+        return (graph, violations, None, cache);
     }
     let index = match (index, dirty) {
         (Some(mut index), Some(dirty)) => {
@@ -320,7 +323,7 @@ fn compute_rebuild(
         }
         _ => Index::build(snapshot, &graph),
     };
-    (graph, violations, Some(index))
+    (graph, violations, Some(index), cache)
 }
 
 /// The node a selection highlights: the node whose range it is (a
@@ -356,6 +359,9 @@ pub struct GridTalkApp {
     pending_dirty: Vec<RangeRef>,
     /// Edits landed that no rebuild has picked up yet.
     rebuild_wanted: bool,
+    /// Region and formula-precedent work kept between graph rebuilds
+    /// (travels with a rebuild job, like the index).
+    graph_cache: GraphCache,
     layout_revision: u64,
     chat_input: String,
     chat: Vec<ChatMsg>,
@@ -472,6 +478,7 @@ impl GridTalkApp {
             rebuild_job: None,
             pending_dirty: Vec::new(),
             rebuild_wanted: false,
+            graph_cache: GraphCache::default(),
             read_only_locked: false,
             frame_revision: u64::MAX,
             scrolled_for: None,
@@ -678,6 +685,7 @@ impl GridTalkApp {
                 self.rebuild_job = None;
                 self.pending_dirty.clear();
                 self.rebuild_wanted = false;
+                self.graph_cache = GraphCache::default();
                 let violations = self.rebuild(inc.snapshot(), None);
                 self.inc = Some(inc);
                 self.current_path = Some(path.to_path_buf());
@@ -727,13 +735,15 @@ impl GridTalkApp {
         dirty: Option<Vec<RangeRef>>,
     ) -> Vec<String> {
         let after_edit = dirty.is_some();
-        let index = if after_edit {
-            self.index.take()
+        let (index, cache) = if after_edit {
+            (self.index.take(), std::mem::take(&mut self.graph_cache))
         } else {
             self.index = None;
-            None
+            (None, GraphCache::default())
         };
-        let (graph, violations, index) = compute_rebuild(snapshot, index, dirty.as_deref());
+        let (graph, violations, index, cache) =
+            compute_rebuild(snapshot, index, cache, dirty.as_deref());
+        self.graph_cache = cache;
         self.apply_rebuild(graph, violations, index, after_edit)
     }
 
@@ -790,10 +800,11 @@ impl GridTalkApp {
         self.values.share(revision, snapshot.clone());
         let dirty = std::mem::take(&mut self.pending_dirty);
         let index = self.index.take();
+        let cache = std::mem::take(&mut self.graph_cache);
         let incremental = index.is_some();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(compute_rebuild(&snapshot, index, Some(&dirty)));
+            let _ = tx.send(compute_rebuild(&snapshot, index, cache, Some(&dirty)));
             if let Some(ctx) = ctx {
                 ctx.request_repaint();
             }
@@ -823,7 +834,8 @@ impl GridTalkApp {
         };
         let job = self.rebuild_job.take().expect("job checked above");
         match result {
-            Some((graph, violations, index)) => {
+            Some((graph, violations, index, cache)) => {
+                self.graph_cache = cache;
                 let violations = self.apply_rebuild(graph, violations, index, true);
                 self.layout_revision = job.revision;
                 if !violations.is_empty() {
@@ -2274,7 +2286,7 @@ mod tests {
     #[test]
     fn ui_two_way_sync_and_mode_persistence() {
         let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
-        let (g, _) = build_graph(&wb);
+        let (g, _) = gridtalk_graph::build_graph(&wb);
         let mut sync = SyncState::default();
         let region = g.nodes.iter().find(|n| n.kind == NodeKind::Region).unwrap();
         sync.select_node(&g, region.id);

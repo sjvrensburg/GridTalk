@@ -11,7 +11,7 @@
 //! (`what_if` simulates; nothing writes the file). There is no
 //! write tool in the list at all.
 
-use crate::tools::{ToolRequest, Tools};
+use crate::tools::{error_payload, ErrorKind, ToolRequest, Tools};
 use gridtalk_graph::eval::EvalCache;
 use gridtalk_graph::{build_graph, load_bytes, read_workbook_bytes, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
@@ -101,7 +101,9 @@ impl OpenWorkbook {
         })
     }
 
-    fn fresh(&mut self) -> Result<(), String> {
+    /// Reload the workbook if its file changed. Returns whether it
+    /// reloaded, so the caller can report the new file's warnings.
+    fn fresh(&mut self) -> Result<bool, String> {
         // Stat first (cheap): unchanged stat means no re-read at
         // all. Changed stat re-hashes; only a changed hash (real
         // content change) triggers the expensive reload.
@@ -116,16 +118,16 @@ impl OpenWorkbook {
             // (mtime, len, file_index) cannot detect an in-place
             // same-length edit: always fall through to the hash.
             if !cfg!(windows) && (mtime, len, ctime) == (old_mtime, old_len, old_ctime) {
-                return Ok(());
+                return Ok(false);
             }
             if Self::hash_of(&self.path) == Some(old_hash) {
                 // Content-preserving touch: refresh the stamp.
                 self.stamp = Some((mtime, len, ctime, old_hash));
-                return Ok(());
+                return Ok(false);
             }
         }
         *self = OpenWorkbook::load(&self.path.clone())?;
-        Ok(())
+        Ok(true)
     }
 
     fn tools(&self) -> Tools<'_> {
@@ -163,24 +165,77 @@ impl Default for McpServer {
     }
 }
 
-fn req_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, (i64, String)> {
+/// A JSON-RPC error: code, message, and the typed kind (sent as
+/// `data.kind`) when it comes from a tool call.
+type RpcError = (i64, String, Option<ErrorKind>);
+
+/// An invalid-arguments protocol error (-32602).
+fn invalid(message: String) -> RpcError {
+    (-32602, message, Some(ErrorKind::InvalidArguments))
+}
+
+fn req_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, RpcError> {
     args.get(field)
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
-        .ok_or((-32602, format!("missing or non-string argument: {field}")))
+        .ok_or_else(|| invalid(format!("missing or non-string argument: {field}")))
 }
 
+/// MCP's tools: the two session tools, then every shared tool from
+/// `ToolRequest::schemas()` with a required `workbook_id` added. One
+/// definition per tool, shared with `gridtalk tools`.
 fn tool_definitions() -> Value {
-    json!([
-        {"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods) and return its session id, sheets and regions", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-        {"name": "close_workbook", "description": "Close an open workbook session", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}},
-        {"name": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["workbook_id", "query"]}},
-        {"name": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "range": {"type": "string"}}, "required": ["workbook_id", "range"]}},
-        {"name": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only, never writes)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}, "cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}, "required": ["workbook_id", "cell", "value", "target"]}},
-        {"name": "graph_overview", "description": "Graph nodes and edges for an open workbook (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}}
-    ])
+    let annotations = |read_only: bool| json!({"readOnlyHint": read_only, "destructiveHint": false, "idempotentHint": read_only, "openWorldHint": false});
+    let mut tools = vec![
+        json!({"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods; path on this machine) and return its session id, sheets, regions and load warnings. Opening a path that is already open returns its existing session. Reads the file; never writes it.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}, "annotations": annotations(true)}),
+        json!({"name": "close_workbook", "description": "Close an open workbook session", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}, "annotations": annotations(false)}),
+    ];
+    let shared = ToolRequest::schemas();
+    for t in shared["tools"].as_array().into_iter().flatten() {
+        let mut t = t.clone();
+        if let Some(obj) = t.as_object_mut() {
+            obj.remove("tool");
+        }
+        if let Some(props) = t
+            .pointer_mut("/inputSchema/properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            props.insert(
+                "workbook_id".into(),
+                json!({"type": "string", "description": "The id open_workbook returned"}),
+            );
+        }
+        if let Some(required) = t
+            .pointer_mut("/inputSchema/required")
+            .and_then(|r| r.as_array_mut())
+        {
+            required.insert(0, json!("workbook_id"));
+        }
+        tools.push(t);
+    }
+    Value::Array(tools)
+}
+
+/// The argument names a tool's input schema allows.
+fn allowed_arguments(definitions: &Value, name: &str) -> Option<Vec<String>> {
+    definitions
+        .as_array()?
+        .iter()
+        .find(|t| t["name"] == name)?
+        .pointer("/inputSchema/properties")?
+        .as_object()
+        .map(|p| p.keys().cloned().collect())
+}
+
+/// A tool failure as a tool result: `isError` with the typed
+/// `{"error": {"kind", "message"}}` payload.
+fn tool_error(kind: ErrorKind, message: String) -> Result<Value, RpcError> {
+    let data = error_payload(kind, &message);
+    Ok(json!({
+        "content": [{"type": "text", "text": data.to_string()}],
+        "structuredContent": data,
+        "isError": true
+    }))
 }
 
 impl McpServer {
@@ -224,7 +279,7 @@ impl McpServer {
         let result = match method.as_str() {
             "initialize" => {
                 if self.initialize_seen {
-                    Err((-32602, "already initialized".to_string()))
+                    Err((-32602, "already initialized".to_string(), None))
                 } else {
                     self.initialize_seen = true;
                     self.initialized = true;
@@ -252,6 +307,7 @@ impl McpServer {
                     Err((
                         -32002,
                         "server not initialized: send initialize first".to_string(),
+                        None,
                     ))
                 } else {
                     Ok(json!({"tools": tool_definitions()}))
@@ -262,67 +318,54 @@ impl McpServer {
                     Err((
                         -32002,
                         "server not initialized: send initialize first".to_string(),
+                        None,
                     ))
                 } else {
                     self.call_tool(request.pointer("/params").cloned().unwrap_or(json!({})))
                 }
             }
-            other => Err((-32601, format!("method not found: {other}"))),
+            other => Err((-32601, format!("method not found: {other}"), None)),
         };
         Some(match result {
             Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
-            Err((code, message)) => {
+            Err((code, message, None)) => {
                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+            }
+            Err((code, message, Some(kind))) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": {"kind": kind}}})
             }
         })
     }
 
-    fn call_tool(&mut self, params: Value) -> Result<Value, (i64, String)> {
+    /// Run one `tools/call`. Protocol errors (an unknown tool,
+    /// arguments that break the tool's schema) are JSON-RPC -32602
+    /// errors with `data.kind`; failures while running a tool (an
+    /// unknown or vanished workbook, an unreadable file, a bad range)
+    /// are `isError` results with `{"error": {"kind", "message"}}`.
+    fn call_tool(&mut self, params: Value) -> Result<Value, RpcError> {
         let name = params
             .get("name")
             .and_then(|n| n.as_str())
             .filter(|n| !n.is_empty())
-            .ok_or((-32602, "missing or non-string argument: name".to_string()))?
+            .ok_or_else(|| invalid("missing or non-string argument: name".to_string()))?
             .to_string();
         let name = name.as_str();
-        const KNOWN_TOOLS: [&str; 8] = [
-            "open_workbook",
-            "close_workbook",
-            "search",
-            "expand",
-            "get_cells",
-            "list_formulas",
-            "what_if",
-            "graph_overview",
-        ];
-        if !KNOWN_TOOLS.contains(&name) {
-            return Err((-32602, format!("unknown tool: {name}")));
-        }
+        let definitions = tool_definitions();
+        let Some(allowed) = allowed_arguments(&definitions, name) else {
+            return Err((
+                -32602,
+                format!("unknown tool: {name}"),
+                Some(ErrorKind::UnknownTool),
+            ));
+        };
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        // Reject unknown arguments per tool (schemas declare
-        // additionalProperties: false).
-        let allowed: &[&str] = match name {
-            "open_workbook" => &["path"],
-            "close_workbook" => &["workbook_id"],
-            "search" => &["workbook_id", "query", "limit"],
-            "expand" | "get_cells" | "list_formulas" => &["workbook_id", "range"],
-            "what_if" => &["workbook_id", "cell", "value", "target"],
-            "graph_overview" => &["workbook_id"],
-            _ => &[],
+        let Some(obj) = args.as_object() else {
+            return Err(invalid("arguments must be an object".to_string()));
         };
-        if let Some(obj) = args.as_object() {
-            for key in obj.keys() {
-                if !allowed.contains(&key.as_str()) {
-                    return Err((-32602, format!("unknown argument: {key}")));
-                }
-            }
+        // Schemas declare additionalProperties: false.
+        if let Some(key) = obj.keys().find(|k| !allowed.contains(k)) {
+            return Err(invalid(format!("unknown argument: {key}")));
         }
-        let text_result = |text: String, is_error: bool| {
-            Ok(json!({
-                "content": [{"type": "text", "text": text}],
-                "isError": is_error
-            }))
-        };
         let structured_result = |data: Value, is_error: bool| {
             Ok(json!({
                 "content": [{"type": "text", "text": data.to_string()}],
@@ -332,11 +375,25 @@ impl McpServer {
         };
         match name {
             "open_workbook" => {
-                let path = args
-                    .get("path")
-                    .and_then(|p| p.as_str())
-                    .ok_or((-32602, "missing string argument: path".to_string()))?;
-                match OpenWorkbook::load(&PathBuf::from(path)) {
+                let path = PathBuf::from(req_str(&args, "path")?);
+                // One session per file: reopening a path (however it is
+                // spelled) returns the open session, refreshed.
+                let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if let Some(id) = self.order.iter().find(|id| {
+                    self.workbooks.get(*id).is_some_and(|w| {
+                        std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()) == key
+                    })
+                }) {
+                    let id = id.clone();
+                    let open = self.workbooks.get_mut(&id).expect("listed session");
+                    if let Err(e) = open.fresh() {
+                        return tool_error(ErrorKind::WorkbookUnavailable, e);
+                    }
+                    let mut payload = open_payload(&id, open);
+                    payload["reused"] = json!(true);
+                    return structured_result(payload, false);
+                }
+                match OpenWorkbook::load(&path) {
                     Ok(open) => {
                         // Unpredictable session ids + a hard cap with
                         // oldest-first eviction.
@@ -361,26 +418,13 @@ impl McpServer {
                             }
                         }
                         self.order.push_back(id.clone());
-                        let sheets: Vec<Value> = open
-                            .wb
-                            .sheets
-                            .iter()
-                            .map(|s| json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col()}))
-                            .collect();
-                        let regions: Vec<Value> = open
-                            .graph
-                            .regions
-                            .iter()
-                            .map(|r| json!({"range": r.range.a1(), "headers": r.headers}))
-                            .collect();
-                        let warnings = open.wb.warnings.clone();
-                        self.workbooks.insert(id.clone(), open);
-                        structured_result(
-                            json!({"workbook_id": id, "sheets": sheets, "regions": regions, "warnings": warnings, "evicted_workbook_ids": evicted}),
-                            false,
-                        )
+                        let mut payload = open_payload(&id, &open);
+                        payload["reused"] = json!(false);
+                        payload["evicted_workbook_ids"] = json!(evicted);
+                        self.workbooks.insert(id, open);
+                        structured_result(payload, false)
                     }
-                    Err(e) => text_result(format!("open failed: {e}"), true),
+                    Err(e) => tool_error(ErrorKind::OpenFailed, format!("open failed: {e}")),
                 }
             }
             "close_workbook" => {
@@ -389,61 +433,69 @@ impl McpServer {
                     self.order.retain(|x| x != id);
                     structured_result(json!({"closed": id}), false)
                 } else {
-                    Err((-32602, format!("unknown workbook_id {id}")))
+                    tool_error(
+                        ErrorKind::UnknownWorkbook,
+                        format!("unknown workbook_id {id}"),
+                    )
                 }
             }
             _ => {
-                let id = args
-                    .get("workbook_id")
-                    .and_then(|p| p.as_str())
-                    .ok_or((-32602, "missing string argument: workbook_id".to_string()))?;
-                let open = self.workbooks.get_mut(id).ok_or((
-                    -32602,
-                    format!("unknown workbook_id {id}; call open_workbook first"),
-                ))?;
-                open.fresh().map_err(|e| (-32000, e))?;
-                let tools = open.tools();
-                let req = match name {
-                    "search" => ToolRequest::Search {
-                        query: req_str(&args, "query")?.into(),
-                        limit: match args.get("limit") {
-                            None => 3,
-                            Some(v) => v
-                                .as_u64()
-                                .filter(|n| *n >= 1)
-                                .ok_or((-32602, "limit must be a positive integer".to_string()))?
-                                as usize,
-                        },
-                    },
-                    "expand" => ToolRequest::Expand {
-                        range: req_str(&args, "range")?.into(),
-                    },
-                    "get_cells" => ToolRequest::GetCells {
-                        range: req_str(&args, "range")?.into(),
-                    },
-                    "list_formulas" => ToolRequest::ListFormulas {
-                        range: req_str(&args, "range")?.into(),
-                    },
-                    "what_if" => ToolRequest::WhatIf {
-                        cell: req_str(&args, "cell")?.into(),
-                        value: args.get("value").and_then(|q| q.as_f64()).ok_or((
-                            -32602,
-                            "missing or non-numeric argument: value".to_string(),
-                        ))?,
-                        target: req_str(&args, "target")?.into(),
-                    },
-                    "graph_overview" => ToolRequest::GraphOverview,
-                    other => {
-                        return Err((-32602, format!("unknown tool: {other}")));
+                let id = req_str(&args, "workbook_id")?.to_string();
+                // The shared request is the arguments minus the session
+                // id, tagged with the tool: ToolRequest's own serde
+                // checks every field and type.
+                let mut fields = obj.clone();
+                fields.remove("workbook_id");
+                if let Some(limit) = fields.get("limit") {
+                    if limit.as_u64().is_none_or(|n| n < 1) {
+                        return Err(invalid("limit must be a positive integer".to_string()));
                     }
+                }
+                fields.insert("tool".into(), json!(name));
+                let req: ToolRequest = serde_json::from_value(Value::Object(fields))
+                    .map_err(|e| invalid(format!("invalid arguments for {name}: {e}")))?;
+                let Some(open) = self.workbooks.get_mut(&id) else {
+                    return tool_error(
+                        ErrorKind::UnknownWorkbook,
+                        format!("unknown workbook_id {id}; call open_workbook first"),
+                    );
                 };
-                let result = tools.call(&req);
+                let reloaded = match open.fresh() {
+                    Ok(reloaded) => reloaded,
+                    Err(e) => return tool_error(ErrorKind::WorkbookUnavailable, e),
+                };
+                let result = open.tools().call(&req);
+                let mut data = result.data;
+                // A silent reload replaced the workbook under this
+                // session: say so, with the new file's warnings.
+                if reloaded {
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.insert("reloaded".into(), json!({"warnings": open.wb.warnings}));
+                    }
+                }
                 // Machines get structuredContent; the text content
                 // carries the same payload for text-only clients.
-                structured_result(result.data, !result.ok)
+                structured_result(data, !result.ok)
             }
         }
     }
+}
+
+/// What `open_workbook` reports about a session.
+fn open_payload(id: &str, open: &OpenWorkbook) -> Value {
+    let sheets: Vec<Value> = open
+        .wb
+        .sheets
+        .iter()
+        .map(|s| json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col()}))
+        .collect();
+    let regions: Vec<Value> = open
+        .graph
+        .regions
+        .iter()
+        .map(|r| json!({"range": r.range.a1(), "headers": r.headers}))
+        .collect();
+    json!({"workbook_id": id, "sheets": sheets, "regions": regions, "warnings": open.wb.warnings})
 }
 
 /// Serve MCP on stdio until EOF. Logs go to stderr; stdout is
@@ -634,18 +686,23 @@ mod tests {
         let text = whatif["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"after\":30.0"), "what-if payload: {text}");
 
-        // Unknown workbook is a protocol-level invalid-params error.
+        // An unknown workbook is a tool failure with a typed kind.
         let bad = rpc(
             &mut server,
             json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "search", "arguments": {"workbook_id": "wb-999", "query": "x"}}}),
         );
-        assert_eq!(bad["error"]["code"], -32602);
+        assert_eq!(bad["result"]["isError"], true);
+        assert_eq!(
+            bad["result"]["structuredContent"]["error"]["kind"],
+            "unknown_workbook"
+        );
         // Missing required args are -32602, never silent defaults.
         let missing = rpc(
             &mut server,
             json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "search", "arguments": {"workbook_id": wb_id}}}),
         );
         assert_eq!(missing["error"]["code"], -32602);
+        assert_eq!(missing["error"]["data"]["kind"], "invalid_arguments");
         // Non-object frames get -32600, not silence.
         let batch = server
             .handle(&json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]))
@@ -667,5 +724,112 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}}),
         );
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+    }
+
+    #[test]
+    fn typed_errors_annotations_session_reuse_and_reload_warnings() {
+        let mut server = McpServer::default();
+        rpc(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
+        );
+        let list = rpc(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        );
+        let tools = list["result"]["tools"].as_array().unwrap();
+        for t in tools {
+            assert_eq!(t["annotations"]["destructiveHint"], false, "{}", t["name"]);
+        }
+        let info = tools.iter().find(|t| t["name"] == "workbook_info").unwrap();
+        assert_eq!(info["inputSchema"]["required"], json!(["workbook_id"]));
+        let get_cells = tools.iter().find(|t| t["name"] == "get_cells").unwrap();
+        assert!(get_cells["description"]
+            .as_str()
+            .unwrap()
+            .contains("Sheet1!A1:D4"));
+        assert_eq!(get_cells["annotations"]["readOnlyHint"], true);
+
+        let dir = std::env::temp_dir().join(format!("gt-mcp-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.csv");
+        std::fs::write(&path, "Item,Qty\nApples,2\n").unwrap();
+        let open = |server: &mut McpServer, p: &std::path::Path| {
+            rpc(
+                server,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "open_workbook", "arguments": {"path": p.to_str().unwrap()}}}),
+            )["result"]["structuredContent"]
+                .clone()
+        };
+        let first = open(&mut server, &path);
+        assert_eq!(first["reused"], false);
+        // The same file under another spelling reuses the session.
+        let again = open(&mut server, &dir.join(".").join("book.csv"));
+        assert_eq!(again["reused"], true);
+        assert_eq!(again["workbook_id"], first["workbook_id"]);
+        let id = first["workbook_id"].clone();
+
+        let call = |server: &mut McpServer, name: &str, args: Value| {
+            let mut args = args;
+            args["workbook_id"] = id.clone();
+            rpc(
+                server,
+                json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": name, "arguments": args}}),
+            )
+        };
+        let info = call(&mut server, "workbook_info", json!({}));
+        assert_eq!(
+            info["result"]["structuredContent"]["sheets"][0]["name"],
+            "Sheet1"
+        );
+        let bad_range = call(&mut server, "get_cells", json!({"range": "Sheet1!A0"}));
+        assert_eq!(bad_range["result"]["isError"], true);
+        assert_eq!(
+            bad_range["result"]["structuredContent"]["error"]["kind"],
+            "invalid_range"
+        );
+        let no_sheet = call(&mut server, "get_cells", json!({"range": "Nope!A1"}));
+        assert_eq!(
+            no_sheet["result"]["structuredContent"]["error"]["kind"],
+            "unknown_sheet"
+        );
+        let wrong_type = call(
+            &mut server,
+            "what_if",
+            json!({"cell": "B2", "value": "ten", "target": "Sheet1!B2"}),
+        );
+        assert_eq!(wrong_type["error"]["code"], -32602);
+        let unknown = rpc(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "nope", "arguments": {}}}),
+        );
+        assert_eq!(unknown["error"]["data"]["kind"], "unknown_tool");
+        let clamped = call(
+            &mut server,
+            "search",
+            json!({"query": "apples", "limit": 99}),
+        );
+        assert_eq!(clamped["result"]["structuredContent"]["limit"], 25);
+        assert_eq!(
+            clamped["result"]["structuredContent"]["limit_clamped"],
+            true
+        );
+
+        // A changed file reloads silently; the next response says so.
+        std::fs::write(&path, "Item,Qty,Note\nApples,2,x\nPears,4,y\n").unwrap();
+        let after = call(&mut server, "workbook_info", json!({}));
+        let data = &after["result"]["structuredContent"];
+        assert!(data["reloaded"].is_object(), "{data}");
+        assert_eq!(data["sheets"][0]["cols"], 3);
+        let quiet = call(&mut server, "workbook_info", json!({}));
+        assert!(quiet["result"]["structuredContent"]["reloaded"].is_null());
+
+        std::fs::remove_file(&path).unwrap();
+        let gone = call(&mut server, "workbook_info", json!({}));
+        assert_eq!(
+            gone["result"]["structuredContent"]["error"]["kind"],
+            "workbook_unavailable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

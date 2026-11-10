@@ -4,7 +4,7 @@
 //! external harnesses never scrape human-formatted strings.
 
 use gridtalk_graph::eval::{EvalCache, Value};
-use gridtalk_graph::{sheet_name_eq, CellValue, Graph, WorkbookSnapshot};
+use gridtalk_graph::{quote_sheet, sheet_name_eq, CellValue, Graph, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +31,46 @@ pub enum ToolRequest {
         target: String,
     },
     GraphOverview,
+    WorkbookInfo,
 }
+
+/// What went wrong in a failed tool call, so a client can branch on
+/// the kind instead of matching message text. Every failure carries
+/// `{"error": {"kind": ..., "message": ...}}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// An argument has the wrong type or value (also MCP-level
+    /// schema violations).
+    InvalidArguments,
+    /// A range or cell reference does not parse, is over the cell
+    /// limit, or lies outside the sheet grid.
+    InvalidRange,
+    /// No sheet of that name (sheet names match case-insensitively).
+    UnknownSheet,
+    /// No graph node covers the range.
+    NoGraphNode,
+    /// The calc engine could not evaluate the request.
+    EvaluationFailed,
+    /// MCP: no open workbook has that id.
+    UnknownWorkbook,
+    /// MCP: the workbook's file was deleted or became unreadable.
+    WorkbookUnavailable,
+    /// MCP: the file could not be opened or parsed.
+    OpenFailed,
+    /// MCP: no tool of that name.
+    UnknownTool,
+}
+
+/// The `{"error": {"kind", "message"}}` payload of a failed call.
+pub fn error_payload(kind: ErrorKind, message: &str) -> serde_json::Value {
+    serde_json::json!({"error": {"kind": kind, "message": message}})
+}
+
+/// Largest `search` limit; larger requests are clamped (and say so).
+pub const MAX_SEARCH_LIMIT: usize = 25;
+/// Most edges `expand` returns; the rest are counted, not listed.
+pub const MAX_EXPAND_EDGES: usize = 200;
 
 fn default_limit() -> usize {
     3
@@ -47,27 +86,41 @@ impl ToolRequest {
             ToolRequest::ListFormulas { .. } => "list_formulas",
             ToolRequest::WhatIf { .. } => "what_if",
             ToolRequest::GraphOverview => "graph_overview",
+            ToolRequest::WorkbookInfo => "workbook_info",
         }
     }
 
     /// JSON Schemas for every tool, for MCP/tool-list consumers.
-    /// Each entry carries a real JSON Schema (`inputSchema`) plus the
-    /// `tool` discriminator value a `ToolRequest` JSON must use.
+    /// Each entry carries a real JSON Schema (`inputSchema`), the
+    /// `tool` discriminator value a `ToolRequest` JSON must use, and
+    /// MCP annotations (every tool is read-only: `what_if` evaluates
+    /// on a copy and never writes).
     pub fn schemas() -> serde_json::Value {
         let schema = |props: serde_json::Value, required: &[&str]| serde_json::json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
+        let range = serde_json::json!({"type": "string", "description": RANGE_SYNTAX});
+        let tool = |name: &str, description: String, input: serde_json::Value| {
+            serde_json::json!({
+                "name": name, "tool": name, "description": description, "inputSchema": input,
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            })
+        };
         serde_json::json!({
-            "request_format": "A ToolRequest is a JSON object with a \"tool\" discriminator, e.g. {\"tool\": \"search\", \"query\": \"...\", \"limit\": 3}. Unknown fields are rejected.",
+            "request_format": "A ToolRequest is a JSON object with a \"tool\" discriminator, e.g. {\"tool\": \"search\", \"query\": \"...\", \"limit\": 3}. Unknown fields are rejected. A failed call returns {\"error\": {\"kind\": ..., \"message\": ...}}.",
             "tools": [
-                {"name": "search", "tool": "search", "description": "Hybrid lexical+embedding search over workbook regions", "inputSchema": schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "default": 3}}), &["query"])},
-                {"name": "expand", "tool": "expand", "description": "Graph neighbours of the region containing a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
-                {"name": "get_cells", "tool": "get_cells", "description": "Typed cell values and formulas in a range", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
-                {"name": "list_formulas", "tool": "list_formulas", "description": "Formulas in a range with evaluated values", "inputSchema": schema(serde_json::json!({"range": {"type": "string"}}), &["range"])},
-                {"name": "what_if", "tool": "what_if", "description": "Simulate overriding one cell and re-evaluating a target formula (read-only)", "inputSchema": schema(serde_json::json!({"cell": {"type": "string"}, "value": {"type": "number"}, "target": {"type": "string"}}), &["cell", "value", "target"])},
-                {"name": "graph_overview", "tool": "graph_overview", "description": "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)", "inputSchema": schema(serde_json::json!({}), &[])}
+                tool("workbook_info", "Sheets (name, rows, cols), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
+                tool("search", format!("Hybrid lexical+embedding search over workbook regions. Returns ranked regions with a cited passage each. limit: 1-{MAX_SEARCH_LIMIT} (default 3; larger values are clamped and the response says so)."), schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "default": 3}}), &["query"])),
+                tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
+                tool("graph_overview", "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)".into(), schema(serde_json::json!({}), &[]))
             ]
         })
     }
 }
+
+/// How ranges are written, for tool descriptions.
+const RANGE_SYNTAX: &str = "An A1 range with its sheet: Sheet1!A1:D4, Sheet1!B2 (one cell), or 'Sheet Name'!A1:B2 (quote names with spaces or punctuation; double a quote inside: 'Bob''s'!A1). Sheet names match case-insensitively; cells run A1..XFD1048576.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -88,11 +141,11 @@ impl ToolResult {
             text,
         }
     }
-    fn err(tool: &str, message: String) -> Self {
+    fn err(tool: &str, kind: ErrorKind, message: String) -> Self {
         ToolResult {
             tool: tool.into(),
             ok: false,
-            data: serde_json::json!({"error": message}),
+            data: error_payload(kind, &message),
             text: message,
         }
     }
@@ -121,14 +174,25 @@ impl<'a> Tools<'a> {
     /// The one typed entry point every surface calls.
     pub fn call(&self, req: &ToolRequest) -> ToolResult {
         match req {
-            ToolRequest::Search { query, limit } => {
-                let limit = (*limit).clamp(1, 25);
+            ToolRequest::Search {
+                query,
+                limit: requested,
+            } => {
+                let limit = (*requested).clamp(1, MAX_SEARCH_LIMIT);
+                let clamped = limit != *requested;
+                let limit_note = if clamped {
+                    format!(
+                        "\n(limit {requested} clamped to {limit}; allowed 1-{MAX_SEARCH_LIMIT})"
+                    )
+                } else {
+                    String::new()
+                };
                 let hits = self.hybrid.search(query, limit);
                 if hits.is_empty() {
                     return ToolResult::ok(
                         "search",
-                        serde_json::json!({"hits": []}),
-                        format!("no regions matched \"{query}\""),
+                        serde_json::json!({"hits": [], "limit": limit, "limit_clamped": clamped}),
+                        format!("no regions matched \"{query}\"{limit_note}"),
                     );
                 }
                 let data_hits: Vec<serde_json::Value> = hits
@@ -148,8 +212,13 @@ impl<'a> Tools<'a> {
                     .iter()
                     .map(|h| format!("[{}] score {:.3}", h.range.a1(), h.score))
                     .collect::<Vec<_>>()
-                    .join("\n");
-                ToolResult::ok("search", serde_json::json!({"hits": data_hits}), text)
+                    .join("\n")
+                    + &limit_note;
+                ToolResult::ok(
+                    "search",
+                    serde_json::json!({"hits": data_hits, "limit": limit, "limit_clamped": clamped}),
+                    text,
+                )
             }
             ToolRequest::Expand { range } => {
                 // Accept caller spellings (sheet1!a1:b2, $A$1) by
@@ -223,7 +292,15 @@ impl<'a> Tools<'a> {
                     Some(n) => {
                         let mut edges = Vec::new();
                         let mut lines = vec![format!("node {} ({})", n.id, n.label)];
+                        let mut total_edges = 0usize;
                         for e in &self.graph.edges {
+                            if e.from != n.id && e.to != n.id {
+                                continue;
+                            }
+                            total_edges += 1;
+                            if edges.len() >= MAX_EXPAND_EDGES {
+                                continue;
+                            }
                             if e.from == n.id {
                                 if let Some(t) = nodes_by_id.get(&e.to) {
                                     lines.push(format!(" -{}-> {}", e.kind, t.label));
@@ -243,26 +320,65 @@ impl<'a> Tools<'a> {
                                 }
                             }
                         }
+                        let truncated = total_edges > edges.len();
+                        if truncated {
+                            lines.push(format!(
+                                "({} of {total_edges} edges shown; the cap is {MAX_EXPAND_EDGES})",
+                                edges.len()
+                            ));
+                        }
                         ToolResult::ok(
                             "expand",
-                            serde_json::json!({"node_id": n.id, "label": n.label, "range": n.range.as_ref().map(|r| r.a1()), "edges": edges}),
+                            serde_json::json!({"node_id": n.id, "label": n.label, "range": n.range.as_ref().map(|r| r.a1()), "edges": edges, "total_edges": total_edges, "truncated": truncated}),
                             lines.join("\n"),
                         )
                     }
-                    None => ToolResult::err("expand", format!("no graph node for range {range}")),
+                    None => ToolResult::err(
+                        "expand",
+                        ErrorKind::NoGraphNode,
+                        format!("no graph node for range {range}"),
+                    ),
                 }
             }
             ToolRequest::GetCells { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
                     Some(sheet) => {
+                        // Formula cells report what they compute, not
+                        // only the file's cached value: one batch
+                        // through the workbook's calc engine.
+                        let formulas: Vec<(usize, usize)> = (r0..=r1)
+                            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
+                            .filter(|(r, c)| {
+                                matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. })
+                            })
+                            .collect();
+                        let mut results = if formulas.is_empty() {
+                            Vec::new()
+                        } else {
+                            self.calc.get(self.wb).values(&sheet.name, &formulas)
+                        }
+                        .into_iter();
                         let mut rows = Vec::new();
                         let mut text = format!("Range {range}\n");
                         for r in r0..=r1 {
                             let mut row = Vec::new();
                             for c in c0..=c1 {
                                 let cell = sheet.get(r, c);
-                                row.push(cell_json(&cell));
-                                text.push_str(&cell.display());
+                                match &cell {
+                                    CellValue::Formula { expr, cached } => {
+                                        let result =
+                                            results.next().expect("one result per formula");
+                                        text.push_str(&match &result {
+                                            Ok(v) => v.display(),
+                                            Err(e) => format!("#ERROR({e})"),
+                                        });
+                                        row.push(formula_json(expr, cached.as_deref(), &result));
+                                    }
+                                    _ => {
+                                        text.push_str(&cell.display());
+                                        row.push(cell_json(&cell));
+                                    }
+                                }
                                 if c < c1 {
                                     text.push_str(" | ");
                                 }
@@ -276,9 +392,13 @@ impl<'a> Tools<'a> {
                             text,
                         )
                     }
-                    None => ToolResult::err("get_cells", format!("no sheet named {sheet_name}")),
+                    None => ToolResult::err(
+                        "get_cells",
+                        ErrorKind::UnknownSheet,
+                        format!("no sheet named {sheet_name}"),
+                    ),
                 },
-                None => ToolResult::err("get_cells", range_error(range)),
+                None => ToolResult::err("get_cells", ErrorKind::InvalidRange, range_error(range)),
             },
             ToolRequest::ListFormulas { range } => match parse_range(range) {
                 Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
@@ -329,11 +449,15 @@ impl<'a> Tools<'a> {
                             )
                         }
                     }
-                    None => {
-                        ToolResult::err("list_formulas", format!("no sheet named {sheet_name}"))
-                    }
+                    None => ToolResult::err(
+                        "list_formulas",
+                        ErrorKind::UnknownSheet,
+                        format!("no sheet named {sheet_name}"),
+                    ),
                 },
-                None => ToolResult::err("list_formulas", range_error(range)),
+                None => {
+                    ToolResult::err("list_formulas", ErrorKind::InvalidRange, range_error(range))
+                }
             },
             ToolRequest::WhatIf {
                 cell,
@@ -341,10 +465,18 @@ impl<'a> Tools<'a> {
                 target,
             } => {
                 if !value.is_finite() {
-                    return ToolResult::err("what_if", "what-if value must be finite".into());
+                    return ToolResult::err(
+                        "what_if",
+                        ErrorKind::InvalidArguments,
+                        "what-if value must be finite".into(),
+                    );
                 }
                 let Some((target_sheet, tr, tc)) = parse_cell_ref(target) else {
-                    return ToolResult::err("what_if", format!("cannot parse target {target}"));
+                    return ToolResult::err(
+                        "what_if",
+                        ErrorKind::InvalidRange,
+                        cell_error("target", target),
+                    );
                 };
                 // The override may name its own sheet (Other!B2);
                 // it must never silently land on the target sheet.
@@ -354,16 +486,25 @@ impl<'a> Tools<'a> {
                     format!("{}!{cell}", gridtalk_graph::quote_sheet(&target_sheet))
                 };
                 let Some((override_sheet, orow, ocol)) = parse_cell_ref(&qualified) else {
-                    return ToolResult::err("what_if", format!("cannot parse cell {cell}"));
+                    return ToolResult::err(
+                        "what_if",
+                        ErrorKind::InvalidRange,
+                        cell_error("cell", cell),
+                    );
                 };
                 if self.sheet(&override_sheet).is_none() {
                     return ToolResult::err(
                         "what_if",
+                        ErrorKind::UnknownSheet,
                         format!("no sheet named {override_sheet} for override cell {cell}"),
                     );
                 }
                 if self.sheet(&target_sheet).is_none() {
-                    return ToolResult::err("what_if", format!("no sheet named {target_sheet}"));
+                    return ToolResult::err(
+                        "what_if",
+                        ErrorKind::UnknownSheet,
+                        format!("no sheet named {target_sheet}"),
+                    );
                 }
                 // Canonicalise to the workbook's own sheet names:
                 // callers may write sheet1!a1 in any case, and the
@@ -389,8 +530,59 @@ impl<'a> Tools<'a> {
                             after.display()
                         ),
                     ),
-                    Err(e) => ToolResult::err("what_if", format!("what-if failed: {e}")),
+                    Err(e) => ToolResult::err(
+                        "what_if",
+                        ErrorKind::EvaluationFailed,
+                        format!("what-if failed: {e}"),
+                    ),
                 }
+            }
+            ToolRequest::WorkbookInfo => {
+                let sheets: Vec<serde_json::Value> = self
+                    .wb
+                    .sheets
+                    .iter()
+                    .map(|s| serde_json::json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col()}))
+                    .collect();
+                let names: Vec<serde_json::Value> = self
+                    .wb
+                    .names
+                    .iter()
+                    .map(|n| serde_json::json!({"name": n.name, "scope": n.scope, "refers_to": n.formula}))
+                    .collect();
+                let regions: Vec<serde_json::Value> = self
+                    .graph
+                    .regions
+                    .iter()
+                    .map(|r| serde_json::json!({"range": r.range.a1(), "headers": r.headers}))
+                    .collect();
+                let mut lines = vec![format!("workbook {}", self.wb.name)];
+                for s in &self.wb.sheets {
+                    lines.push(format!(
+                        "sheet {} ({} rows x {} cols)",
+                        quote_sheet(&s.name),
+                        s.cells.len(),
+                        s.max_col()
+                    ));
+                }
+                for n in &self.wb.names {
+                    lines.push(format!("name {} = {}", n.name, n.formula));
+                }
+                for r in &self.graph.regions {
+                    lines.push(format!("region {}: {}", r.range.a1(), r.headers.join(", ")));
+                }
+                for w in &self.wb.warnings {
+                    lines.push(format!("warning: {w}"));
+                }
+                ToolResult::ok(
+                    "workbook_info",
+                    serde_json::json!({
+                        "name": self.wb.name, "sheets": sheets, "defined_names": names,
+                        "regions": regions, "warnings": self.wb.warnings,
+                        "limits": {"range_cells": MAX_RANGE_CELLS, "search_limit": MAX_SEARCH_LIMIT, "expand_edges": MAX_EXPAND_EDGES, "grid_end": "XFD1048576"}
+                    }),
+                    lines.join("\n"),
+                )
             }
             ToolRequest::GraphOverview => {
                 const MAX_OVERVIEW_NODES: usize = 500;
@@ -483,9 +675,10 @@ impl<'a> Tools<'a> {
                 }
             }
             "graph_overview" => ToolRequest::GraphOverview,
+            "workbook_info" => ToolRequest::WorkbookInfo,
             other => {
                 return format!(
-                    "unknown tool {other}; available: search, expand, get_cells, list_formulas, what_if, graph_overview"
+                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, what_if, graph_overview"
                 )
             }
         };
@@ -541,6 +734,27 @@ fn legacy_number(value: &Value) -> Option<f64> {
     }
 }
 
+/// A formula cell for `get_cells`: its text, what it computes
+/// (`result`, typed like `list_formulas`; `null` with `error` when
+/// evaluation failed), and the value the file cached (`cached_result`,
+/// typed; `cached` keeps the display string older callers read).
+fn formula_json(
+    expr: &str,
+    cached: Option<&CellValue>,
+    result: &Result<Value, gridtalk_graph::eval::EvalError>,
+) -> serde_json::Value {
+    let (typed, error) = match result {
+        Ok(v) => (Some(value_json(v)), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    serde_json::json!({
+        "type": "formula", "formula": expr,
+        "result": typed, "error": error,
+        "cached": cached.map(|c| c.display()),
+        "cached_result": cached.map(cell_json),
+    })
+}
+
 fn cell_json(cell: &CellValue) -> serde_json::Value {
     match cell {
         CellValue::Empty => serde_json::json!({"type": "empty"}),
@@ -563,8 +777,23 @@ pub const MAX_RANGE_CELLS: usize = 10_000;
 fn range_error(range: &str) -> String {
     if parse_range_uncapped(range).is_some() {
         format!("range {range} exceeds the {MAX_RANGE_CELLS}-cell limit; narrow the range")
+    } else if parse_range_inner(range, false, false).is_some() {
+        format!("range {range} is outside the sheet grid, which ends at XFD1048576")
     } else {
         format!("cannot parse range {range}")
+    }
+}
+
+/// Why a what-if cell or target did not parse.
+fn cell_error(what: &str, a1: &str) -> String {
+    let outside = split_sheet_prefix(a1)
+        .or_else(|| Some((String::new(), a1)))
+        .and_then(|(sheet, cell)| parse_a1(&sheet, cell))
+        .is_some();
+    if outside {
+        format!("{what} {a1} is outside the sheet grid, which ends at XFD1048576")
+    } else {
+        format!("cannot parse {what} {a1}")
     }
 }
 
@@ -597,7 +826,15 @@ fn split_sheet_prefix(a1: &str) -> Option<(String, &str)> {
     }
 }
 
+/// An A1 cell as 0-based (row, col), anywhere inside the sheet grid
+/// (`A1`..`XFD1048576`).
 fn parse_cell_on_sheet(sheet: &str, cell: &str) -> Option<(usize, usize)> {
+    parse_a1(sheet, cell)
+        .filter(|&(r, c)| r < gridtalk_graph::EXCEL_MAX_ROWS && c < gridtalk_graph::EXCEL_MAX_COLS)
+}
+
+/// An A1 cell as 0-based (row, col), with no grid bound.
+fn parse_a1(sheet: &str, cell: &str) -> Option<(usize, usize)> {
     let cell_owned = cell.replace('$', "");
     let cell = cell_owned.as_str();
     let split = cell.find(|c: char| c.is_ascii_digit())?;
@@ -624,16 +861,23 @@ fn parse_cell_on_sheet(sheet: &str, cell: &str) -> Option<(usize, usize)> {
 /// MAX_RANGE_CELLS are rejected. Quoted sheet names and a
 /// qualified range end (`Sheet1!A1:Sheet1!B2`) are accepted.
 pub fn parse_range(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
-    parse_range_inner(a1, true)
+    parse_range_inner(a1, true, true)
 }
 
 /// Range parsing without the materialisation cap (for Expand,
 /// which never materialises cells).
 pub fn parse_range_uncapped(a1: &str) -> Option<(String, usize, usize, usize, usize)> {
-    parse_range_inner(a1, false)
+    parse_range_inner(a1, false, true)
 }
 
-fn parse_range_inner(a1: &str, capped: bool) -> Option<(String, usize, usize, usize, usize)> {
+/// `capped`: at most MAX_RANGE_CELLS. `grid`: inside the sheet grid
+/// (off only to tell an out-of-grid range from an unparseable one).
+fn parse_range_inner(
+    a1: &str,
+    capped: bool,
+    grid: bool,
+) -> Option<(String, usize, usize, usize, usize)> {
+    let parse_cell_on_sheet = if grid { parse_cell_on_sheet } else { parse_a1 };
     let (sheet, rest) = split_sheet_prefix(a1)?;
     if let Some((a, b)) = rest.split_once(':') {
         let (r0, c0) = parse_cell_on_sheet(&sheet, a)?;
@@ -796,6 +1040,119 @@ mod tests {
         assert_eq!(whatif.data["before"], 0.0);
         assert_eq!(whatif.data["after"], 1.0);
         assert_eq!(whatif.data["after_result"]["value"], true);
+    }
+
+    #[test]
+    fn get_cells_reports_computed_and_cached_values_inside_the_grid() {
+        // D2's cached 99 is stale: it computes 2*3.
+        let mut wb = parse_delimited(
+            "d",
+            "Sheet1",
+            "Item,Qty,Price,Total\nApples,2,3,=B2*C2\n",
+            ',',
+        );
+        *wb.sheets[0].cell_mut(1, 3) = CellValue::Formula {
+            expr: "B2*C2".into(),
+            cached: Some(Box::new(CellValue::Number(99.0))),
+        };
+        *wb.sheets[0].cell_mut(1, 4) = CellValue::Formula {
+            expr: "1/0".into(),
+            cached: None,
+        };
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let out = tools.call(&ToolRequest::GetCells {
+            range: "Sheet1!B2:E2".into(),
+        });
+        assert!(out.ok, "{}", out.text);
+        let d2 = &out.data["rows"][0][2];
+        assert_eq!(d2["type"], "formula");
+        assert_eq!(
+            d2["result"],
+            serde_json::json!({"type": "number", "value": 6.0})
+        );
+        assert_eq!(
+            d2["cached_result"],
+            serde_json::json!({"type": "number", "value": 99.0})
+        );
+        assert_eq!(d2["cached"], "99");
+        assert!(d2["error"].is_null());
+        let e2 = &out.data["rows"][0][3];
+        assert!(e2["result"].is_null() && e2["error"].is_string());
+        assert!(e2["cached_result"].is_null());
+        assert!(out.text.contains("2 | 3 | 6 | #ERROR("), "{}", out.text);
+        // The grid ends at XFD1048576.
+        assert!(
+            tools
+                .call(&ToolRequest::GetCells {
+                    range: "Sheet1!XFD1048576".into()
+                })
+                .ok
+        );
+        for range in ["Sheet1!XFE1", "Sheet1!A1048577", "Sheet1!A1:A1048577"] {
+            let bad = tools.call(&ToolRequest::GetCells {
+                range: range.into(),
+            });
+            assert!(!bad.ok);
+            assert!(
+                bad.text.contains("outside the sheet grid"),
+                "{range}: {}",
+                bad.text
+            );
+        }
+        assert!(tools
+            .call(&ToolRequest::GetCells {
+                range: "Sheet1!1A".into()
+            })
+            .text
+            .contains("cannot parse"));
+        let what_if = tools.call(&ToolRequest::WhatIf {
+            cell: "Sheet1!ZZZZ1".into(),
+            value: 1.0,
+            target: "Sheet1!D2".into(),
+        });
+        assert!(
+            what_if.text.contains("outside the sheet grid"),
+            "{}",
+            what_if.text
+        );
+    }
+
+    #[test]
+    fn expand_is_capped_and_says_so() {
+        let header: Vec<String> = (0..250).map(|i| format!("h{i}")).collect();
+        let row: Vec<String> = (0..250).map(|i| i.to_string()).collect();
+        let csv = format!("{}\n{}\n", header.join(","), row.join(","));
+        let wb = parse_delimited("w", "Sheet1", &csv, ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let region = &g.regions[0].range.a1();
+        let out = tools.call(&ToolRequest::Expand {
+            range: region.clone(),
+        });
+        assert!(out.ok, "{}", out.text);
+        assert_eq!(
+            out.data["edges"].as_array().unwrap().len(),
+            MAX_EXPAND_EDGES
+        );
+        assert_eq!(out.data["total_edges"], 251); // 250 columns + its sheet
+        assert_eq!(out.data["truncated"], true);
+        assert!(out.text.contains("200 of 251 edges shown"), "{}", out.text);
+        let info = tools.call(&ToolRequest::WorkbookInfo);
+        assert_eq!(info.data["sheets"][0]["cols"], 250);
+        assert_eq!(info.data["limits"]["expand_edges"], MAX_EXPAND_EDGES);
     }
 
     #[test]
