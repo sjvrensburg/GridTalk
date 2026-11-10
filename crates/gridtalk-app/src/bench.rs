@@ -49,6 +49,9 @@ impl Expected {
             Value::Number(n) if n.is_finite() => Some(Expected::Number(*n)),
             Value::Number(_) => None,
             Value::Empty => Some(Expected::Number(0.0)),
+            // Blank text has no answer to state: judge_text never
+            // passes it and hermit's prepare_data rejects it.
+            Value::Text(t) if t.trim().is_empty() => None,
             Value::Text(_) | Value::Bool(_) => Some(Expected::Text(value.display())),
         }
     }
@@ -114,8 +117,9 @@ pub fn generate_tasks_ex(
     cache: &EvalCache,
 ) -> TaskGeneration {
     let mut skipped_formulas = 0usize;
-    let mut drafts: Vec<(String, String, Expected, String)> = Vec::new(); // kind, question, expected, citation
-                                                                          // Built on the first formula, like the calc engine.
+    // kind, question, expected, citation
+    let mut drafts: Vec<(String, String, Expected, String)> = Vec::new();
+    // Built on the first formula, like the calc engine.
     let mut lineage: Option<Lineage> = None;
     for (si, sheet) in wb.sheets.iter().enumerate() {
         for (r, row) in sheet.cells.iter().enumerate() {
@@ -171,18 +175,15 @@ pub fn generate_tasks_ex(
                                 continue;
                             };
                             // Only cells the sheet has: A:A stays cheap.
-                            let last_row = r1.min(osheet.cells.len().saturating_sub(1));
-                            for qr in r0..=last_row.max(r0) {
-                                let Some(row) = osheet.cells.get(qr) else {
-                                    break;
-                                };
-                                let last_col = c1.min(row.len().saturating_sub(1));
-                                for qc in c0..=last_col.max(c0) {
+                            let rows = osheet.cells.iter().enumerate().take(r1.saturating_add(1));
+                            for (qr, row) in rows.skip(r0) {
+                                let cols = row.iter().enumerate().take(c1.saturating_add(1));
+                                for (qc, cell) in cols.skip(c0) {
                                     scanned += 1;
                                     if attempts >= WHAT_IF_ATTEMPTS || scanned > WHAT_IF_SCAN {
                                         break 'areas;
                                     }
-                                    let Some(CellValue::Number(orig)) = row.get(qc) else {
+                                    let CellValue::Number(orig) = cell else {
                                         continue;
                                     };
                                     if (osi, qr, qc) == (si, r, c) || !seen.insert((osi, qr, qc)) {
@@ -616,7 +617,7 @@ mod tests {
         ));
     }
     use super::*;
-    use gridtalk_graph::{build_graph, parse_delimited};
+    use gridtalk_graph::{build_graph, parse_delimited, DefinedName, SheetSnapshot};
     use gridtalk_index::HybridIndex;
     use gridtalk_infer::EchoBackend;
 
@@ -663,7 +664,6 @@ mod tests {
 
     #[test]
     fn what_if_tasks_follow_names_3d_refs_and_text_outcomes() {
-        use gridtalk_graph::{DefinedName, SheetSnapshot};
         let month = |name: &str, n: f64| {
             SheetSnapshot::new(
                 name,
@@ -751,6 +751,16 @@ mod tests {
         assert!(!serde_json::to_string(&old)
             .unwrap()
             .contains("expected_text"));
+    }
+
+    #[test]
+    fn blank_text_results_make_no_task() {
+        assert_eq!(Expected::of(&Value::Text(String::new())), None);
+        assert_eq!(Expected::of(&Value::Text("  ".into())), None);
+        assert_eq!(
+            Expected::of(&Value::Bool(true)),
+            Some(Expected::Text("TRUE".into()))
+        );
     }
 
     #[test]

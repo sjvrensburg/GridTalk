@@ -20,11 +20,13 @@ Task kinds:
 
 A what-if task tries the formula's precedent cells as Gridcraft
 resolves them (defined names and 3D references such as
-`Jan:Mar!A2` included), up to 64 numeric precedents, until one
+`Jan:Mar!A2` included), up to 64 numeric precedents among the
+first 4096 cells of its precedent areas, until one
 changes the result. Any typed change counts. Results that are text
 or TRUE/FALSE make tasks too: they carry `expected_text` (the value
 as the cell shows it) and ask for "just the value"; numeric tasks
-carry `expected` and ask for "just the number". Task files written
+carry `expected` and ask for "just the number". Blank text
+results have no answer to state and make no task. Task files written
 before `expected_text` load unchanged.
 
 Every third task is labelled `dev`; the rest are `train`. The dev
