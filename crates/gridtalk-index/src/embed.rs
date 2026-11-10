@@ -290,46 +290,6 @@ impl VectorIndex {
         }
     }
 
-    /// Rebuild over `texts`, reusing the stored vector for any text
-    /// that is unchanged so a one-cell edit does not re-embed every
-    /// region.
-    pub fn rebuild(&mut self, texts: &[String], model: &dyn EmbeddingModel) {
-        if model.name() != self.model_name || model.dim() != self.dim {
-            // Preserve a customised threshold across a model swap.
-            let threshold = self.threshold;
-            *self = VectorIndex::build(texts, model);
-            self.threshold = threshold;
-            return;
-        }
-        // Per-chunk cache: unchanged *lines* keep their vectors
-        // even when their region changed around them.
-        let cache: std::collections::HashMap<&str, &std::sync::Arc<Vec<f32>>> = self
-            .chunk_texts
-            .iter()
-            .flatten()
-            .map(|t| t.as_str())
-            .zip(self.vectors.iter().flatten())
-            .collect();
-        let mut all_vectors = Vec::new();
-        let mut all_texts = Vec::new();
-        for t in texts {
-            // Only embed lines the cache misses — embedding first and
-            // swapping in the cached Arc saved nothing.
-            let lines = chunk_lines(t);
-            let vecs: Vec<std::sync::Arc<Vec<f32>>> = lines
-                .iter()
-                .map(|line| match cache.get(line.as_str()) {
-                    Some(cached) => (*cached).clone(),
-                    None => std::sync::Arc::new(model.embed(line)),
-                })
-                .collect();
-            all_vectors.push(vecs);
-            all_texts.push(lines);
-        }
-        self.vectors = all_vectors;
-        self.chunk_texts = all_texts;
-    }
-
     /// Rebuild for a new document list in which `reuse[i]` names the
     /// old document that new document `i` is unchanged from. Reused
     /// documents keep their vectors without being looked at; the rest

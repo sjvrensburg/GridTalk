@@ -499,17 +499,6 @@ impl HybridIndex {
         }
     }
 
-    /// Incremental refresh after an edit: lexical docs are rebuilt
-    /// (cheap token counts), but unchanged region bodies reuse their
-    /// stored embedding vectors.
-    pub fn update(&mut self, wb: &WorkbookSnapshot, graph: &Graph) {
-        self.lexical = Index::build(wb, graph);
-        let texts: Vec<String> = (0..self.lexical.doc_count())
-            .map(|i| self.lexical.doc_body(i).unwrap().to_string())
-            .collect();
-        self.vector.rebuild(&texts, &self.model);
-    }
-
     /// Incremental refresh after edits to the `dirty` ranges: regions
     /// that kept their range and that no edit touched keep their
     /// lexical document and vectors untouched; only the edited regions

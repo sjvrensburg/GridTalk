@@ -116,6 +116,7 @@ Phase 1b — edit latency (independent of the lineage rules):
 - [x] Rebuild the graph and index on a worker thread after an edit (`RebuildJob`): the UI never blocks; chat and Save wait for a rebuild in flight; the rebuild's snapshot copy is shared with the formula worker
 - [x] Cheaper graph build and invariant check: `NodeLocator` groups region/column nodes by sheet, so a cell lookup is an integer scan of one sheet's nodes instead of a case-folded name comparison against every node. `build_graph` per edit: 17→4.6 ms, 413→54 ms, 1.73→0.33 s
 - [x] Incremental index from dirty ranges (`HybridIndex::update_dirty`): a region that kept its range and that no edit touched keeps its lexical document and vectors without being re-rendered. Index update per edit: 162→43 ms (300k cells), 0.96→0.29 s (1.2M). Total per edit, now off the UI thread: 18 ms, 97 ms, 0.63 s
+- [ ] No full snapshot copy on the UI thread per edit: `IncrementalSnapshot` holds its snapshot (or each sheet) behind an `Arc` and edits through `Arc::make_mut`, so a rebuild or formula job shares the current revision instead of copying it (today ~33 ms per edit at 1.2M cells, ~6 ms at 300k)
 
 Phase 2 — agent-facing correctness:
 
