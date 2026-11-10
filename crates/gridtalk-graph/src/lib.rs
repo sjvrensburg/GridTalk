@@ -878,7 +878,7 @@ fn build_from_snapshot(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
     gc
 }
 
-fn gridcraft_names(wb: &WorkbookSnapshot) -> Vec<gridcraft_model::DefinedName> {
+pub(crate) fn gridcraft_names(wb: &WorkbookSnapshot) -> Vec<gridcraft_model::DefinedName> {
     wb.names
         .iter()
         .map(|n| gridcraft_model::DefinedName {
@@ -1218,6 +1218,15 @@ fn parse_whole_range_at(chars: &[char], at: usize) -> Option<(usize, usize, usiz
 }
 
 pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
+    formula_refs_qualified_on(expr, None)
+}
+
+/// [`formula_refs_qualified`] for a formula on sheet `home`: a range
+/// whose start is unqualified and whose end names `home`
+/// (`A1:Sheet1!B2` on Sheet1) is the rectangle it means. Without a
+/// home sheet such an end cannot be checked, so the two cells are
+/// kept apart.
+pub fn formula_refs_qualified_on(expr: &str, home: Option<&str>) -> Vec<QualifiedRef> {
     let chars: Vec<char> = expr.chars().collect();
     let mut refs = Vec::new();
     let mut i = 0;
@@ -1321,25 +1330,32 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
             // Range? The end may carry its own sheet qualifier
             // (Sheet2!A1:Sheet2!B2); strip it before parsing.
             if next < chars.len() && chars[next] == ':' {
-                let end_at = {
+                // The end's own qualifier, if any, and where its cell
+                // starts.
+                let (end_sheet, end_at) = {
                     let mut j = next + 1;
+                    let mut end_sheet: Option<String> = None;
                     // Skip Name! or 'Quoted Name'! after the colon.
                     if j < chars.len() && chars[j] == '\'' {
                         j += 1;
+                        let mut name = String::new();
                         // Doubled-apostrophe aware, like the
                         // range-start scanner: '' is an escaped
                         // quote inside the name, not its end.
                         while j < chars.len() {
                             if chars[j] == '\'' {
                                 if chars.get(j + 1) == Some(&'\'') {
+                                    name.push('\'');
                                     j += 2;
                                     continue;
                                 }
                                 break;
                             }
+                            name.push(chars[j]);
                             j += 1;
                         }
                         if j + 1 < chars.len() && chars[j + 1] == '!' {
+                            end_sheet = Some(name);
                             j += 2;
                         } else {
                             j = next + 1;
@@ -1352,16 +1368,37 @@ pub fn formula_refs_qualified(expr: &str) -> Vec<QualifiedRef> {
                             k += 1;
                         }
                         if k < chars.len() && chars[k] == '!' && k > j {
+                            end_sheet = Some(chars[j..k].iter().collect());
                             j = k + 1;
                         }
                     }
-                    j
+                    (end_sheet, j)
                 };
                 if let Some((r1, c1, end)) = parse_a1_at(&chars, end_at) {
+                    // An end qualified with a different sheet does not
+                    // make a rectangle (Excel rejects it): keep the
+                    // two cells, each on its own sheet.
+                    let same_sheet = match (&end_sheet, &sheet) {
+                        (None, _) => true,
+                        (Some(e), Some(s)) => sheet_name_eq(e, s),
+                        (Some(e), None) => home.is_some_and(|h| sheet_name_eq(e, h)),
+                    };
+                    if !same_sheet {
+                        refs.push(QualifiedRef {
+                            sheet: sheet.clone(),
+                            row: r0,
+                            col: c0,
+                        });
+                        refs.push(QualifiedRef {
+                            sheet: end_sheet,
+                            row: r1,
+                            col: c1,
+                        });
+                        i = end;
+                        continue;
+                    }
                     let (lo_r, hi_r) = (r0.min(r1), r0.max(r1));
                     let (lo_c, hi_c) = (c0.min(c1), c0.max(c1));
-                    // Cap expansion; huge ranges are represented by corners + interior sampling is wrong,
-                    // so refuse to expand beyond 100k cells and emit corners only with full expansion below that.
                     push_range_refs(&mut refs, &sheet, lo_r, lo_c, hi_r, hi_c);
                     i = end;
                     continue;
@@ -1473,6 +1510,82 @@ pub fn detect_regions(sheet: &SheetSnapshot) -> Vec<Region> {
 }
 
 pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
+    build_graph_cached(wb, &mut GraphCache::default(), None)
+}
+
+/// Work kept between graph builds of one workbook, so a rebuild after
+/// an edit redoes only what the edit can have changed: each sheet's
+/// detected regions and each formula cell's precedent areas. Pass the
+/// edited ranges to [`build_graph_cached`]; the cache resets itself
+/// when the sheets or defined names change (precedents depend on
+/// both).
+#[derive(Debug, Default, Clone)]
+pub struct GraphCache {
+    /// The sheet names and defined names the entries were made for.
+    context: Option<(Vec<String>, Vec<DefinedName>)>,
+    /// Per sheet index: its detected regions.
+    regions: Vec<Option<Vec<Region>>>,
+    /// Per formula cell (sheet index, row, col): its precedent areas.
+    /// Shared with each build's invariant check, so passing them on
+    /// copies a pointer, not the areas.
+    areas: std::collections::HashMap<(usize, usize, usize), std::sync::Arc<[lineage::Area]>>,
+    /// Where the next audit window starts, counted over the entries a
+    /// rebuild reuses (see [`CACHE_AUDIT_SAMPLE`]).
+    audit_cursor: usize,
+}
+
+/// How many reused precedent entries each cached rebuild re-parses
+/// from the cell's current text. The window rotates, so over
+/// successive rebuilds every entry is checked. A mismatch means the
+/// edit tracking missed a change: the cache is dropped and the graph
+/// rebuilt from scratch.
+pub const CACHE_AUDIT_SAMPLE: usize = 256;
+
+impl GraphCache {
+    /// Drop what `dirty` can have changed, or everything when the
+    /// context changed or the edits are unknown (`None`).
+    fn invalidate(&mut self, wb: &WorkbookSnapshot, dirty: Option<&[RangeRef]>) {
+        let context = (
+            wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            wb.names.clone(),
+        );
+        let dirty = match dirty {
+            Some(d) if self.context.as_ref() == Some(&context) => d,
+            _ => {
+                *self = GraphCache {
+                    context: Some(context),
+                    regions: vec![None; wb.sheets.len()],
+                    ..GraphCache::default()
+                };
+                return;
+            }
+        };
+        for (slot, s) in self.regions.iter_mut().zip(&wb.sheets) {
+            if dirty.iter().any(|d| sheet_name_eq(&d.sheet, &s.name)) {
+                *slot = None;
+            }
+        }
+        if !dirty.is_empty() {
+            self.areas.retain(|&(si, r, c), _| {
+                !dirty
+                    .iter()
+                    .any(|d| sheet_name_eq(&d.sheet, &wb.sheets[si].name) && d.contains(r, c))
+            });
+        }
+    }
+}
+
+/// [`build_graph`], reusing `cache` for everything outside the edited
+/// `dirty` ranges (`None`: no edit information, rebuild everything).
+/// The graph and its invariant check still cover the whole workbook;
+/// only region detection and formula parsing are skipped where the
+/// edit cannot have changed them.
+pub fn build_graph_cached(
+    wb: &WorkbookSnapshot,
+    cache: &mut GraphCache,
+    dirty: Option<&[RangeRef]>,
+) -> (Graph, Vec<String>) {
+    cache.invalidate(wb, dirty);
     let mut g = Graph::default();
     let mut next = 0usize;
     let mut push =
@@ -1506,7 +1619,17 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             to: sid,
             kind: "contains".into(),
         });
-        for region in detect_regions(sheet) {
+        let regions = match cache.regions.get(sheet_idx).cloned().flatten() {
+            Some(regions) => regions,
+            None => {
+                let regions = detect_regions(sheet);
+                if let Some(slot) = cache.regions.get_mut(sheet_idx) {
+                    *slot = Some(regions.clone());
+                }
+                regions
+            }
+        };
+        for region in regions {
             let label = format!("{} region {}", sheet.name, region.range.a1());
             let rid = push(&mut g, NodeKind::Region, label, Some(region.range.clone()));
             g.edges.push(Edge {
@@ -1534,26 +1657,62 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             g.region_sheets.push(sheet_idx);
         }
     }
-    // Lifted dependency edges, re-derived from formulas. Targets are
-    // resolved on their own sheet (Sheet2!A1 does not mean this sheet),
-    // using a pre-sorted specificity index instead of rescanning nodes.
+    // Lifted dependency edges: each formula's precedent areas, as
+    // Gridcraft resolves them (sheet qualifiers, 3D spans, names),
+    // mapped onto the nodes they touch. A formula reading its own
+    // column (a running total) keeps that self-edge.
+    let lineage = lineage::Lineage::new(wb);
+    let area_nodes = lineage::AreaNodes::new(wb, &g);
     let locator = NodeLocator::new(&g);
     let mut seen = std::collections::BTreeSet::new();
-    for sheet in &wb.sheets {
-        let home = locator.sheet(&sheet.name);
+    let mut targets = Vec::new();
+    // Each formula's areas, kept for the invariant check so formulas
+    // are parsed once per build.
+    let mut precedents = FormulaAreas::default();
+    // Audit window over the reused entries: CACHE_AUDIT_SAMPLE of them,
+    // starting where the last rebuild's window ended.
+    // The window runs over the entries the cache holds now (at most
+    // that many can be reused).
+    let window = cache.areas.len().max(1);
+    let audit_start = cache.audit_cursor % window;
+    let audited =
+        |ordinal: usize| (ordinal % window + window - audit_start) % window < CACHE_AUDIT_SAMPLE;
+    let mut reused = 0usize;
+    let mut stale: Vec<String> = Vec::new();
+    for (si, sheet) in wb.sheets.iter().enumerate() {
+        let Some(home) = locator.sheet(&sheet.name) else {
+            continue;
+        };
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if let CellValue::Formula { expr, .. } = cell {
-                    let src = home.and_then(|h| locator.find(h, r, c));
-                    for q in formula_refs_qualified(expr) {
-                        let dst = match q.sheet.as_deref() {
-                            None => home.and_then(|h| locator.find(h, q.row, q.col)),
-                            Some(other) => locator.node_for_cell(other, q.row, q.col),
-                        };
-                        if let (Some(s), Some(t)) = (src, dst) {
-                            if s != t && seen.insert((s, t)) {
+                    let Some(src) = locator.find(home, r, c) else {
+                        continue;
+                    };
+                    let key = (si, r, c);
+                    if let Some(cached) = cache.areas.get(&key) {
+                        if audited(reused) && cached[..] != lineage.areas(wb, si, expr)[..] {
+                            stale.push(format!(
+                                "{}!{}{}",
+                                quote_sheet(&sheet.name),
+                                col_name(c),
+                                r + 1
+                            ));
+                        }
+                        reused += 1;
+                    }
+                    let areas = cache
+                        .areas
+                        .entry(key)
+                        .or_insert_with(|| lineage.areas(wb, si, expr).into());
+                    precedents.push(src, areas.clone());
+                    for area in areas.iter() {
+                        targets.clear();
+                        area_nodes.nodes(area, &mut targets);
+                        for &t in &targets {
+                            if seen.insert((src, t)) {
                                 g.edges.push(Edge {
-                                    from: s,
+                                    from: src,
                                     to: t,
                                     kind: "depends_on".into(),
                                 });
@@ -1564,7 +1723,18 @@ pub fn build_graph(wb: &WorkbookSnapshot) -> (Graph, Vec<String>) {
             }
         }
     }
-    let violations = check_invariants(wb, &g);
+    if !stale.is_empty() {
+        // The edit tracking missed these changes, so other entries may
+        // be stale too: start over rather than trust the cache.
+        eprintln!(
+            "gridtalk: graph cache held stale precedents for {}; rebuilding from scratch",
+            stale.join(", ")
+        );
+        *cache = GraphCache::default();
+        return build_graph_cached(wb, cache, None);
+    }
+    cache.audit_cursor = (audit_start + CACHE_AUDIT_SAMPLE) % window;
+    let violations = check_invariants_with(wb, &g, &precedents, &area_nodes);
     (g, violations)
 }
 
@@ -1586,6 +1756,50 @@ fn col_from_letters(letters: &str) -> Option<usize> {
 /// Every lifted depends_on edge must be re-derivable from raw formulas,
 /// and vice versa. Mirrors ExcelGRAG's lifted-edge invariant test.
 pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
+    let lineage = lineage::Lineage::new(wb);
+    let locator = NodeLocator::new(g);
+    let mut precedents = FormulaAreas::default();
+    for (si, sheet) in wb.sheets.iter().enumerate() {
+        let Some(home) = locator.sheet(&sheet.name) else {
+            continue;
+        };
+        for (r, row) in sheet.cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if let CellValue::Formula { expr, .. } = cell {
+                    if let Some(src) = locator.find(home, r, c) {
+                        precedents.push(src, lineage.areas(wb, si, expr).into());
+                    }
+                }
+            }
+        }
+    }
+    check_invariants_with(wb, g, &precedents, &lineage::AreaNodes::new(wb, g))
+}
+
+/// Every formula's precedent areas, keyed by the node of its cell,
+/// stored flat.
+#[derive(Default)]
+struct FormulaAreas {
+    /// (source node, its areas), sharing the graph cache's entries.
+    formulas: Vec<(usize, std::sync::Arc<[lineage::Area]>)>,
+}
+
+impl FormulaAreas {
+    fn push(&mut self, src: usize, areas: std::sync::Arc<[lineage::Area]>) {
+        self.formulas.push((src, areas));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &[lineage::Area])> {
+        self.formulas.iter().map(|(src, areas)| (*src, &areas[..]))
+    }
+}
+
+fn check_invariants_with(
+    wb: &WorkbookSnapshot,
+    g: &Graph,
+    precedents: &FormulaAreas,
+    area_nodes: &lineage::AreaNodes,
+) -> Vec<String> {
     let mut problems = Vec::new();
     // Structural invariants, independent of how edges were derived:
     // unique ids, in-bounds ranges, containment edges actually contain.
@@ -1648,34 +1862,41 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
         .map(|e| (e.from, e.to))
         .collect();
     let locator = NodeLocator::new(g);
+    // Expected edges: the precedent areas mapped onto nodes by an
+    // independent rule (`nodes_by_coverage`).
     let mut expected = std::collections::BTreeSet::new();
-    for sheet in &wb.sheets {
-        let Some(home) = locator.sheet(&sheet.name) else {
-            continue;
-        };
-        for (r, row) in sheet.cells.iter().enumerate() {
-            for (c, cell) in row.iter().enumerate() {
-                if let CellValue::Formula { expr, .. } = cell {
-                    if let Some(s) = locator.find(home, r, c) {
-                        for q in formula_refs_qualified(expr) {
-                            let t = match q.sheet.as_deref() {
-                                None => locator.find(home, q.row, q.col),
-                                Some(other) => locator.node_for_cell(other, q.row, q.col),
-                            };
-                            if let Some(t) = t {
-                                if s != t {
-                                    expected.insert((s, t));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    let mut targets = Vec::new();
+    for (s, areas) in precedents.iter() {
+        for area in areas {
+            targets.clear();
+            area_nodes.nodes_by_coverage(area, &mut targets);
+            expected.extend(targets.iter().map(|&t| (s, t)));
         }
     }
     // Independent cross-check with a second, deliberately simple
     // tokeniser, so a systematic miss in formula_refs_qualified
     // cannot hide by re-deriving the same wrong expected set.
+    // A region and a column with the same bounds (a one-column
+    // region) are equally specific; the lifted edges name the column,
+    // so the locator's region answer maps to it.
+    let same_bounds_column: std::collections::HashMap<usize, usize> = {
+        let mut columns = std::collections::HashMap::new();
+        for n in g.nodes.iter().filter(|n| n.kind == NodeKind::Column) {
+            if let Some(r) = &n.range {
+                columns.insert((r.sheet.to_lowercase(), r.r0, r.c0, r.r1, r.c1), n.id);
+            }
+        }
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Region)
+            .filter_map(|n| {
+                let r = n.range.as_ref()?;
+                let key = (r.sheet.to_lowercase(), r.r0, r.c0, r.r1, r.c1);
+                columns.get(&key).map(|&c| (n.id, c))
+            })
+            .collect()
+    };
+    let canon = |t: usize| same_bounds_column.get(&t).copied().unwrap_or(t);
     let mut independent = std::collections::BTreeSet::new();
     for sheet in &wb.sheets {
         let Some(home) = locator.sheet(&sheet.name) else {
@@ -1746,7 +1967,7 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                         let mut cc = c0;
                                         while cc <= c1 {
                                             // (stepping is checked below)
-                                            if let Some(t) = locator.find(home, rr, cc) {
+                                            if let Some(t) = locator.find(home, rr, cc).map(canon) {
                                                 if src != t {
                                                     independent.insert((src, t));
                                                 }
@@ -1778,7 +1999,9 @@ pub fn check_invariants(wb: &WorkbookSnapshot, g: &Graph) -> Vec<String> {
                                             (digits.parse::<usize>(), col_from_letters(letters))
                                         {
                                             if row1 >= 1 {
-                                                if let Some(t) = locator.find(home, row1 - 1, col) {
+                                                if let Some(t) =
+                                                    locator.find(home, row1 - 1, col).map(canon)
+                                                {
                                                     if src != t {
                                                         independent.insert((src, t));
                                                     }
@@ -2016,6 +2239,7 @@ impl IncrementalSnapshot {
 
 mod calc;
 pub mod eval;
+pub mod lineage;
 
 /// Render a region as a cited passage for the LLM context.
 ///
@@ -2636,6 +2860,321 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].sheet.as_deref(), Some("\u{dc}bung"));
         assert!(formula_refs_qualified("A1A+1").is_empty());
+    }
+
+    /// The `depends_on` edges as (from label, to label).
+    fn depends(g: &Graph) -> Vec<(String, String)> {
+        let label = |id: usize| g.nodes.iter().find(|n| n.id == id).unwrap().label.clone();
+        let mut out: Vec<(String, String)> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == "depends_on")
+            .map(|e| (label(e.from), label(e.to)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn lineage_follows_3d_refs_names_and_running_totals() {
+        let month = |name: &str, n: f64| {
+            SheetSnapshot::new(
+                name,
+                vec![
+                    vec![CellValue::Text("Billed".into())],
+                    vec![CellValue::Number(n)],
+                ],
+            )
+        };
+        let f = |e: &str| CellValue::Formula {
+            expr: e.into(),
+            cached: None,
+        };
+        let summary = SheetSnapshot::new(
+            "Summary",
+            vec![
+                vec![
+                    CellValue::Text("Q1".into()),
+                    CellValue::Text("Tax".into()),
+                    CellValue::Text("Amount".into()),
+                    CellValue::Text("Running".into()),
+                ],
+                vec![
+                    f("SUM(Jan:Mar!A2)"),
+                    f("Quarter*Tax_Rate"),
+                    CellValue::Number(5.0),
+                    f("C2"),
+                ],
+                vec![
+                    CellValue::Number(0.0),
+                    CellValue::Number(0.0),
+                    CellValue::Number(7.0),
+                    f("D2+C3"),
+                ],
+            ],
+        );
+        let rates = SheetSnapshot::new(
+            "Rates",
+            vec![
+                vec![CellValue::Text("Rate".into())],
+                vec![CellValue::Number(0.15)],
+            ],
+        );
+        let wb = WorkbookSnapshot {
+            name: "w".into(),
+            sheets: vec![
+                month("Jan", 1.0),
+                month("Feb", 2.0),
+                month("Mar", 3.0),
+                summary,
+                rates,
+            ],
+            names: vec![
+                DefinedName {
+                    name: "Tax_Rate".into(),
+                    scope: None,
+                    formula: "Rates!$A$2".into(),
+                },
+                DefinedName {
+                    name: "Quarter".into(),
+                    scope: None,
+                    formula: "Summary!$A$2".into(),
+                },
+            ],
+            warnings: Vec::new(),
+            source: None,
+        };
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let edges = depends(&g);
+        let has = |from: &str, to: &str| edges.iter().any(|(a, b)| a == from && b == to);
+        // 3D: Summary!A reads Billed on Jan, Feb and Mar, and is not
+        // misread as the columns JAN:MAR of its own sheet.
+        assert!(has("Q1", "Billed"), "{edges:?}");
+        let billed_sheets: std::collections::BTreeSet<_> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == "depends_on")
+            .filter_map(|e| g.nodes.iter().find(|n| n.id == e.to))
+            .filter(|n| n.label == "Billed")
+            .map(|n| n.range.as_ref().unwrap().sheet.clone())
+            .collect();
+        assert_eq!(billed_sheets.len(), 3, "{billed_sheets:?}");
+        // Names: B2 reads Quarter (Summary!A2, column Q1) and
+        // Tax_Rate (Rates!A2).
+        assert!(has("Tax", "Q1") && has("Tax", "Rate"), "{edges:?}");
+        // A running total reads its own column.
+        assert!(
+            has("Running", "Running") && has("Running", "Amount"),
+            "{edges:?}"
+        );
+        // The old reading of Jan:Mar!A2 as columns JAN:MAR plus a bare
+        // A2 invented a self-edge on Q1.
+        assert!(!has("Q1", "Q1"), "{edges:?}");
+    }
+
+    #[test]
+    fn cyclic_defined_names_resolve_once() {
+        let mut wb = parse_delimited("d", "Sheet1", "A,B\n1,=X+Y\n", ',');
+        for (name, formula) in [("X", "Y+Y+Sheet1!$A$2"), ("Y", "X+X")] {
+            wb.names.push(DefinedName {
+                name: name.into(),
+                scope: None,
+                formula: formula.into(),
+            });
+        }
+        let areas = lineage::Lineage::new(&wb).areas(&wb, 0, "X+Y");
+        assert_eq!(areas, vec![(0, (1, 0, 1, 0))]);
+    }
+
+    #[test]
+    fn a_cached_rebuild_after_edits_matches_a_fresh_build() {
+        let mut wb = parse_delimited(
+            "d",
+            "Sheet1",
+            "Item,Qty,Price,Total\nApples,2,3,=B2*C2\nPears,4,5,=B3*C3\n",
+            ',',
+        );
+        wb.sheets.push(SheetSnapshot::new(
+            "Sheet2",
+            vec![
+                vec![CellValue::Text("Ref".into())],
+                vec![CellValue::Formula {
+                    expr: "Sheet1!D2".into(),
+                    cached: None,
+                }],
+            ],
+        ));
+        let mut inc = IncrementalSnapshot::new(wb);
+        let mut cache = GraphCache::default();
+        let (g, v) = build_graph_cached(inc.snapshot(), &mut cache, None);
+        assert!(v.is_empty(), "{v:?}");
+        assert_eq!((g.nodes.clone(), g.edges.clone()), {
+            let (f, _) = build_graph(inc.snapshot());
+            (f.nodes, f.edges)
+        });
+        let f = |e: &str| CellValue::Formula {
+            expr: e.into(),
+            cached: None,
+        };
+        let edits: Vec<(&str, usize, usize, CellValue)> = vec![
+            // A value inside a region.
+            ("Sheet1", 1, 1, CellValue::Number(9.0)),
+            // A formula now reading another column.
+            ("Sheet1", 2, 3, f("A3&B3")),
+            // A header rename (labels change).
+            ("Sheet1", 0, 2, CellValue::Text("Cost".into())),
+            // A new column grows Sheet1's region: node ids shift, and
+            // Sheet2's cross-sheet edge must follow.
+            ("Sheet1", 0, 4, CellValue::Text("Tax".into())),
+            ("Sheet1", 1, 4, f("D2*0.1")),
+            // A running total on Sheet2.
+            ("Sheet2", 2, 0, f("A2+1")),
+        ];
+        for (sheet, row, col, value) in edits {
+            inc.record_edit(
+                CellEdit {
+                    sheet: sheet.into(),
+                    row,
+                    col,
+                    value,
+                },
+                std::time::Instant::now(),
+            );
+            inc.flush();
+            let dirty = inc.take_dirty_ranges();
+            let (cached, v) = build_graph_cached(inc.snapshot(), &mut cache, Some(&dirty));
+            assert!(v.is_empty(), "{v:?}");
+            let (fresh, _) = build_graph(inc.snapshot());
+            assert_eq!(cached.nodes, fresh.nodes, "after {sheet}!{row},{col}");
+            assert_eq!(cached.edges, fresh.edges, "after {sheet}!{row},{col}");
+            assert_eq!(cached.regions, fresh.regions);
+        }
+        // A new defined name changes what formulas can read: the cache
+        // starts over rather than keeping stale precedents.
+        let mut wb = inc.snapshot().clone();
+        wb.names.push(DefinedName {
+            name: "Rate".into(),
+            scope: None,
+            formula: "Sheet1!$B$2".into(),
+        });
+        *wb.sheets[1].cell_mut(1, 0) = f("Rate");
+        let (cached, _) = build_graph_cached(&wb, &mut cache, Some(&[]));
+        let (fresh, _) = build_graph(&wb);
+        assert_eq!(cached.edges, fresh.edges);
+    }
+
+    #[test]
+    fn the_cache_audit_catches_a_change_the_edit_tracking_missed() {
+        // 600 formulas: more than one audit window.
+        let mut csv = String::from("Item,Qty,Price,Total\n");
+        for r in 2..=601 {
+            csv.push_str(&format!("I{r},{r},2,=B{r}*C{r}\n"));
+        }
+        let mut wb = parse_delimited("d", "Sheet1", &csv, ',');
+        let mut cache = GraphCache::default();
+        build_graph_cached(&wb, &mut cache, None);
+        let edges_to_item = |g: &Graph| {
+            let item = g.nodes.iter().find(|n| n.label == "Item").unwrap().id;
+            g.edges
+                .iter()
+                .any(|e| e.kind == "depends_on" && e.to == item)
+        };
+        // A formula changes behind the cache's back (no dirty range):
+        // D500 now reads Item, which no other formula does.
+        *wb.sheets[0].cell_mut(499, 3) = CellValue::Formula {
+            expr: "A500&B500".into(),
+            cached: None,
+        };
+        assert!(edges_to_item(&build_graph(&wb).0));
+        let windows = 600_usize.div_ceil(CACHE_AUDIT_SAMPLE);
+        let mut caught = None;
+        for i in 0..windows {
+            let (g, v) = build_graph_cached(&wb, &mut cache, Some(&[]));
+            if edges_to_item(&g) {
+                assert!(v.is_empty(), "{v:?}");
+                // Caught: the graph is a fresh build's.
+                assert_eq!(g.edges, build_graph(&wb).0.edges);
+                caught = Some(i);
+                break;
+            }
+        }
+        assert!(caught.is_some(), "not caught within {windows} rebuilds");
+        // The first window after a fresh build covers the start of the
+        // cache, not all of it.
+        let mut cache = GraphCache::default();
+        let mut wb2 = parse_delimited("d", "Sheet1", &csv, ',');
+        build_graph_cached(&wb2, &mut cache, None);
+        *wb2.sheets[0].cell_mut(599, 3) = CellValue::Formula {
+            expr: "A600&B600".into(),
+            cached: None,
+        };
+        let (g, _) = build_graph_cached(&wb2, &mut cache, Some(&[]));
+        assert!(
+            !edges_to_item(&g),
+            "one window audits {CACHE_AUDIT_SAMPLE} entries, not every one"
+        );
+    }
+
+    #[test]
+    fn overlapping_regions_lift_to_the_most_specific_node() {
+        // The inverted U A1:E5's bounding box holds the lone C3, its
+        // own region: G1 reads C3 (and B2:D4) through C3's node only.
+        // A lone one-column region (region and column alike) read
+        // from elsewhere on its sheet.
+        let wb = parse_delimited("d", "Sheet1", "A,,=C3\n1,,\n,,9\n", ',');
+        let (_, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        for formula in ["=C3", "=SUM(B2:D4)"] {
+            let csv =
+                format!("H1,H2,H3,H4,H5,,{formula}\n1,,,,2,,\n3,,9,,4,,\n5,,,,6,,\n7,,,,8,,\n");
+            let wb = parse_delimited("d", "Sheet1", &csv, ',');
+            let (g, violations) = build_graph(&wb);
+            assert!(violations.is_empty(), "{formula}: {violations:?}");
+            assert!(g.regions.iter().any(|r| r.range.a1() == "Sheet1!C3:C3"));
+        }
+    }
+
+    #[test]
+    fn a_range_end_naming_the_home_sheet_is_a_rectangle() {
+        let cells = |home: Option<&str>| -> Vec<(Option<String>, usize, usize)> {
+            formula_refs_qualified_on("SUM(A1:Sheet1!B2)", home)
+                .into_iter()
+                .map(|q| (q.sheet, q.row, q.col))
+                .collect()
+        };
+        // On Sheet1 the end names the home sheet: all of A1:B2.
+        assert_eq!(cells(Some("sheet1")).len(), 4);
+        // On another sheet, or with no home, the two cells stay apart,
+        // the end on the sheet it names.
+        let apart = vec![(None, 0, 0), (Some("Sheet1".to_string()), 1, 1)];
+        assert_eq!(cells(Some("Sheet2")), apart);
+        assert_eq!(cells(None), apart);
+    }
+
+    #[test]
+    fn a_range_end_on_another_sheet_is_not_a_rectangle_on_the_first() {
+        let mut wb = parse_delimited("d", "Sheet1", "A,B,C\n1,2,=SUM(Sheet2!A1:Sheet1!B2)\n", ',');
+        wb.sheets.push(SheetSnapshot::new(
+            "Sheet2",
+            vec![
+                vec![CellValue::Text("X".into()), CellValue::Text("Y".into())],
+                vec![CellValue::Number(9.0), CellValue::Number(8.0)],
+            ],
+        ));
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let edges = depends(&g);
+        // Gridcraft rejects the formula; the lexical fallback keeps
+        // Sheet2!A1 (X) and Sheet1!B2 (B), never the invented
+        // Sheet2!A1:B2 rectangle (which would reach Sheet2's Y).
+        assert_eq!(
+            edges,
+            vec![
+                ("C".to_string(), "B".to_string()),
+                ("C".to_string(), "X".to_string())
+            ]
+        );
     }
 
     #[test]

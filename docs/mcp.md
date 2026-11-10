@@ -37,18 +37,40 @@ args = ["mcp"]
 
 ## Tools
 
-`open_workbook` (returns `workbook_id`, `sheets`, `regions` and
-`warnings`: what the file reader skipped or could not import, e.g.
-an ODS file's formulas, which are imported as their saved results) ·
-`close_workbook` · `search` (hybrid lexical +
-embedding, ranges with `vector_only` flags; a passage longer than
-4,000 characters is cut to the header plus the rows matching the
-query, labelled with their sheet rows, and flagged `truncated`; a closing
-note counts rows shown, matching and total, and names a bounded range to
-read next) ·
-`expand` ·
-`get_cells` (typed values) · `list_formulas` (with evaluated
-values) · `what_if` · `graph_overview`.
+Every tool is listed with MCP annotations (`readOnlyHint: true` for
+all but `close_workbook`; none is destructive) and a description
+with an A1 example. Ranges carry their sheet: `Sheet1!A1:D4`,
+`Sheet1!B2`, or `'Sheet Name'!A1:B2` (quote names with spaces or
+punctuation, doubling any quote inside). Sheet names match
+case-insensitively, and cells must lie inside the sheet grid
+(`A1`..`XFD1048576`).
+
+- `open_workbook`: returns `workbook_id`, `sheets`, `regions` and
+  `warnings` (what the file reader skipped or could not import, e.g.
+  an ODS file's formulas, which are imported as their saved results).
+  Opening a path that is already open, however it is spelled,
+  returns that session (`reused: true`) instead of a second one.
+- `close_workbook`.
+- `workbook_info`: sheets with their sizes, defined names, regions,
+  load warnings and the tools' limits (`range_cells` 10,000,
+  `search_limit` 25, `expand_edges` 200). Call it first.
+- `search`: hybrid lexical + embedding, ranges with `vector_only`
+  flags. A passage longer than 4,000 characters is cut to the header
+  plus the rows matching the query, labelled with their sheet rows,
+  and flagged `truncated`; a closing note counts rows shown, matching
+  and total, and names a bounded range to read next. `limit` is 1-25:
+  the response's `limit` is the one used, and `limit_clamped` says
+  when a larger request was cut down.
+- `expand`: graph neighbours of the region or column containing a
+  range, at most 200 edges; `total_edges` and `truncated` tell when
+  there are more.
+- `get_cells`: typed values; a formula cell carries `result`, what it
+  computes, and `cached_result`, what the file cached, both typed,
+  plus `error` when evaluation failed. At most 10,000 cells per call.
+- `list_formulas`: formulas with evaluated values.
+- `what_if`: before and after values of a target when one cell is
+  set to a number, evaluated on a copy.
+- `graph_overview`: nodes and edges, capped at 500 / 2,000.
 
 Formula results are typed like `get_cells` values:
 `list_formulas` entries carry `result` and `what_if` carries
@@ -58,12 +80,34 @@ says why). The older numeric fields (`value`, `before`, `after`)
 stay for compatibility: booleans there are 1/0 and text results are
 `null`, so read the typed fields to see text.
 
-Sessions are invalidated when the file's (mtime, length) stamp
-changes, so edits saved from the GridTalk UI or Gridcraft are
-picked up on the next call. Sessions are capped at 16 open
-workbooks (oldest evicted). Only regular files are read, and never
-more than the ingestion cap (32 MiB for CSV/TSV, 256 MiB for
-XLSX/ODS).
+## Errors
+
+Every failure names its kind, so a client branches on `kind`
+rather than on message text.
+
+- Protocol errors are JSON-RPC errors: `-32600` for a malformed
+  frame, `-32601` for an unknown method, `-32002` before
+  `initialize`, and `-32602` for a `tools/call` with an unknown tool
+  or arguments that break its schema. A `tools/call` error carries
+  `data.kind`: `unknown_tool` or `invalid_arguments`.
+- Failures while running a tool are results with `isError: true`
+  and `structuredContent` `{"error": {"kind": ..., "message": ...}}`.
+  Kinds: `unknown_workbook`, `workbook_unavailable` (the file was
+  deleted or became unreadable), `open_failed`, `invalid_range`
+  (unparseable, over the cell limit, or outside the grid),
+  `unknown_sheet`, `no_graph_node`, `evaluation_failed`,
+  `invalid_arguments` (e.g. a non-finite what-if value).
+  `gridtalk tools call` prints the same payload.
+
+## Sessions
+
+A session reloads when its file changes (stat first, then a content
+hash), so edits saved from the GridTalk UI or Gridcraft are picked
+up on the next call. That call's response then carries
+`reloaded: {"warnings": [...]}`, the new file's reader warnings, so
+a reload is never silent. Sessions are capped at 16 open workbooks
+(oldest evicted). Only regular files are read, and never more than
+the ingestion cap (32 MiB for CSV/TSV, 256 MiB for XLSX/ODS).
 
 ## Troubleshooting
 
@@ -75,7 +119,7 @@ XLSX/ODS).
 - **Protocol errors:** the server requires `initialize` before
   `tools/call`, negotiates `protocolVersion` down to a supported
   version (2025-03-26 / 2024-11-05), and answers malformed frames
-  with JSON-RPC `-32600`/`-32602` rather than dropping them.
+  with JSON-RPC errors rather than dropping them (see Errors).
 
 ## Without MCP: JSON CLI
 

@@ -164,6 +164,10 @@ pub fn investigate_with(
                         let (osheet, orow, ocol) = override_coord.clone()?;
                         let (_, r0, c0, r1, c1) = crate::tools::parse_range_uncapped(range)?;
                         let sheet_obj = tools.sheet_for(&sheet)?;
+                        // One copy with the override applied answers
+                        // every candidate.
+                        let base = tools.calc.get(tools.wb);
+                        let changed = base.with_override((&osheet, orow, ocol), value).ok()?;
                         let mut tried = 0usize;
                         for r in r0..=r1 {
                             for c in c0..=c1 {
@@ -175,13 +179,12 @@ pub fn investigate_with(
                                 }
                                 if let CellValue::Formula { .. } = sheet_obj.get(r, c) {
                                     tried += 1;
-                                    let trial = tools.calc.get(tools.wb).what_if_number(
-                                        (&osheet, orow, ocol),
-                                        value,
-                                        (&sheet, r, c),
-                                    );
-                                    if let Ok((before, after)) = trial {
-                                        if (after - before).abs() > 1e-9 {
+                                    // Any typed change counts, so a text
+                                    // or boolean dependent is found too.
+                                    if let (Ok(before), Ok(after)) =
+                                        (base.value(&sheet, r, c), changed.value(&sheet, r, c))
+                                    {
+                                        if before.differs_from(&after) {
                                             return Some(format!(
                                                 "{}!{}{}",
                                                 sheet,
@@ -473,6 +476,41 @@ mod tests {
         assert_eq!(inv.trail[0].tool, "search");
         assert!(!inv.citations.is_empty());
         assert!(inv.answer.contains("Provision") || inv.answer.contains("provision"));
+    }
+
+    #[test]
+    fn what_if_discovery_finds_a_text_dependent() {
+        // The region's only formula depending on B2 returns text; the
+        // fallback target (the region's last cell, D2) is not it.
+        let wb = parse_delimited(
+            "demo",
+            "Sheet1",
+            "Item,Qty,Size,Note\nApples,2,\"=IF(B2>5,\"\"big\"\",\"\"small\"\")\",fresh\n",
+            ',',
+        );
+        assert!(matches!(wb.sheets[0].get(1, 2), CellValue::Formula { .. }));
+        let (g, v) = build_graph(&wb);
+        assert!(v.is_empty(), "{v:?}");
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let inv = investigate(
+            "what if B2 is 10 for the apples size",
+            &tools,
+            &EchoBackend,
+            8,
+        )
+        .unwrap();
+        let step = inv
+            .trail
+            .iter()
+            .find(|s| s.tool == "what_if")
+            .expect("a what-if step");
+        assert!(step.args.contains("target=Sheet1!C2"), "{}", step.args);
     }
 
     #[test]

@@ -53,6 +53,16 @@ impl Value {
 }
 
 impl Value {
+    /// Whether a what-if changed this value into `other`: numbers
+    /// differ by more than 1e-9, any other value (text, boolean,
+    /// empty) by equality or by type.
+    pub fn differs_from(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Number(a), Value::Number(b)) => (a - b).abs() > 1e-9,
+            (a, b) => a != b,
+        }
+    }
+
     /// The value as a number, as the numeric API reports it: text is
     /// a type error (it has no number), booleans are 1/0, empty is 0.
     pub fn to_number(&self) -> Result<f64, EvalError> {
@@ -230,17 +240,33 @@ impl Evaluator {
         value: f64,
         target_ref: (&str, usize, usize),
     ) -> Result<(Value, Value), EvalError> {
-        // Reject a bad value before paying for the clone.
+        // with_override rejects a bad value or sheet before paying for
+        // the clone.
+        let before = self.value(target_ref.0, target_ref.1, target_ref.2)?;
+        let after = self.with_override(override_ref, value)?.value(
+            target_ref.0,
+            target_ref.1,
+            target_ref.2,
+        )?;
+        Ok((before, after))
+    }
+
+    /// A copy of this evaluator with the override cell set to `value`
+    /// and its dependents recalculated; `self` is unchanged. Read many
+    /// targets from one copy to explore a single change, instead of
+    /// one [`what_if`](Self::what_if) (and one copy) per target.
+    pub fn with_override(
+        &self,
+        override_ref: (&str, usize, usize),
+        value: f64,
+    ) -> Result<Evaluator, EvalError> {
         if !value.is_finite() {
             return Err(EvalError::Type("what-if value must be finite".into()));
         }
         let over = self.engine.sheet(override_ref.0)?;
-        let target = self.engine.sheet(target_ref.0)?;
-        let before = self.engine.value(target, target_ref.1, target_ref.2)?;
         let mut engine = self.engine.clone();
         engine.set_number(over, override_ref.1, override_ref.2, value)?;
-        let after = engine.value(target, target_ref.1, target_ref.2)?;
-        Ok((before, after))
+        Ok(Evaluator { engine })
     }
 
     /// Like [`what_if`](Self::what_if), with both values as numbers

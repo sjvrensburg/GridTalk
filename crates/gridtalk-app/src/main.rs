@@ -11,7 +11,7 @@ mod tools;
 
 use gridtalk_adapter as adapter;
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
-use gridtalk_index::{HybridIndex, Index};
+use gridtalk_index::HybridIndex;
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
 use std::sync::atomic::AtomicBool;
@@ -102,14 +102,21 @@ fn run(args: &[String]) -> Result<(), String> {
             if !violations.is_empty() {
                 return Err(format!("graph invariants violated: {violations:?}"));
             }
-            let index = Index::build(&wb, &graph);
+            // The same hybrid (lexical + vector) retrieval as chat,
+            // investigate and MCP.
+            let index = HybridIndex::build(&wb, &graph);
             let hits = index.search(&question, 3);
             if hits.is_empty() {
                 println!("No matching region found for \"{question}\".");
                 return Ok(());
             }
             for h in &hits {
-                println!("[{}] score {:.2}", h.range.a1(), h.score);
+                let note = if h.vector_only {
+                    " (vector match only: no query word appears in it)"
+                } else {
+                    ""
+                };
+                println!("[{}] score {:.3}{note}", h.range.a1(), h.score);
             }
             let context = hits
                 .iter()

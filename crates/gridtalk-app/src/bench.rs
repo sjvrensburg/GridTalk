@@ -9,7 +9,7 @@
 use crate::investigate::investigate_with;
 use crate::tools::Tools;
 use gridtalk_graph::eval::EvalCache;
-use gridtalk_graph::{formula_refs_qualified, sheet_name_eq, CellValue, WorkbookSnapshot};
+use gridtalk_graph::{formula_refs_qualified_on, sheet_name_eq, CellValue, WorkbookSnapshot};
 use gridtalk_infer::ChatBackend;
 use serde::{Deserialize, Serialize};
 
@@ -119,7 +119,7 @@ pub fn generate_tasks_ex(
                             let mut seen_prects: std::collections::BTreeSet<(usize, usize, usize)> =
                                 std::collections::BTreeSet::new();
                             let mut attempts = 0usize;
-                            for q in formula_refs_qualified(expr) {
+                            for q in formula_refs_qualified_on(expr, Some(&sheet.name)) {
                                 if attempts >= 64 {
                                     break;
                                 }
