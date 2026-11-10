@@ -360,22 +360,59 @@ mod tests {
             // A header-only row over ragged data.
             "P,Q,R\n1\n2,3\n,,4\n",
         ];
-        for csv in layouts {
-            let wb = parse_delimited("d", "Sheet1", csv, ',');
-            let (g, _) = build_graph(&wb);
-            let an = AreaNodes::new(&wb, &g);
+        // One workbook, a layout per sheet in a different order from
+        // the list, and an empty sheet (no nodes) between them, so a
+        // per-sheet index mix-up would give one sheet another's nodes.
+        let mut wb = parse_delimited("d", "Overlap", layouts[1], ',');
+        wb.sheets
+            .push(crate::SheetSnapshot::new("Empty", Vec::new()));
+        for (name, csv) in [("Gaps", layouts[0]), ("Ragged", layouts[2])] {
+            wb.sheets
+                .extend(parse_delimited("d", name, csv, ',').sheets);
+        }
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let an = AreaNodes::new(&wb, &g);
+        assert!(an.flat[1].is_empty() && an.by_column[1].is_empty());
+        let node_sheet = |id: usize| {
+            g.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.range.as_ref())
+                .map(|r| r.sheet.clone())
+        };
+        let mut nonempty = 0;
+        for (sheet, snapshot) in wb.sheets.iter().enumerate() {
             for r0 in 0..7 {
                 for r1 in r0..7 {
                     for c0 in 0..6 {
                         for c1 in c0..6 {
-                            let area = (0, (r0, c0, r1, c1));
+                            let area = (sheet, (r0, c0, r1, c1));
                             let mut fast = Vec::new();
                             an.nodes_by_coverage(&area, &mut fast);
-                            assert_eq!(fast, coverage_by_scan(&an, &area), "{csv:?} {area:?}");
+                            assert_eq!(
+                                fast,
+                                coverage_by_scan(&an, &area),
+                                "{} {area:?}",
+                                snapshot.name
+                            );
+                            // Every node found lies on the area's sheet.
+                            for id in &fast {
+                                assert_eq!(
+                                    node_sheet(*id).as_deref(),
+                                    Some(snapshot.name.as_str())
+                                );
+                            }
+                            nonempty += usize::from(!fast.is_empty());
                         }
                     }
                 }
             }
         }
+        assert!(nonempty > 0);
+        // An area on a sheet past the end finds nothing.
+        let mut none = Vec::new();
+        an.nodes_by_coverage(&(wb.sheets.len(), (0, 0, 3, 3)), &mut none);
+        assert!(none.is_empty());
     }
 }
