@@ -15,8 +15,17 @@ Task kinds:
 | Kind | Question shape | Ground truth |
 |---|---|---|
 | `cell_value` | "What is the value of Sheet1!B2?" | the stored number |
-| `formula_result` | "What does Sheet1!D2 calculate to?" | `eval_cell` result |
-| `what_if` | "What happens to Sheet1!D2 if Sheet1!B2 becomes 12?" | `what_if` re-evaluation |
+| `formula_result` | "What does Sheet1!D2 calculate to?" | the computed result |
+| `what_if` | "What if Sheet1!B2 becomes 12? What happens to Sheet1!D2?" | the re-evaluated result |
+
+A what-if task tries the formula's precedent cells as Gridcraft
+resolves them (defined names and 3D references such as
+`Jan:Mar!A2` included), up to 64 numeric precedents, until one
+changes the result. Any typed change counts. Results that are text
+or TRUE/FALSE make tasks too: they carry `expected_text` (the value
+as the cell shows it) and ask for "just the value"; numeric tasks
+carry `expected` and ask for "just the number". Task files written
+before `expected_text` load unchanged.
 
 Every third task is labelled `dev`; the rest are `train`. The dev
 split is never optimised against directly (Phase D gates adapter
@@ -33,8 +42,10 @@ gridtalk bench run <workbook> [--tasks tasks.json] \
 Each task runs through the investigate harness with the
 configured backend (the echo backend when no model is
 configured — that score is the floor a real model must beat).
-Scoring is a number check against ground truth plus citation
-precision (did the answer cite the expected range?).
+Scoring is a number check against ground truth (or, for a task
+with `expected_text`, a check that the answer states that text as a
+whole word, ignoring case) plus citation precision (did the answer
+cite the expected range?).
 
 Bench runs execute sequentially: task order, trails and CARD
 rows are deterministic, and there is no parallelism to tune.
@@ -53,7 +64,8 @@ target.
 Tasks come from a file only when you pass `--tasks`; the split is
 assigned by a stable hash of the task (not position), generation
 samples evenly across the workbook when `--max` caps the pool,
-and formula cells that error have no ground truth — they are
+and formula cells that error or give a non-finite number have no
+ground truth — they are
 counted as skipped in the CARD, never silently tasked.
 
 ## CARD.md

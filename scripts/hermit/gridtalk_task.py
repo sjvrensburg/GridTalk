@@ -320,7 +320,40 @@ def _citation_present(answer: str, task: dict, extra: dict | None) -> bool:
     return False
 
 
+def _text_present(answer: str, expected: str) -> bool:
+    """Mirror of bench.rs `judge_text`: the expected text appears as a
+    whole word or phrase, ignoring case."""
+    answer = answer.lower()
+    expected = expected.strip().lower()
+    if not expected:
+        return False
+
+    def word(c: str) -> bool:
+        return c.isalnum() or c == "_"
+
+    start = answer.find(expected)
+    while start != -1:
+        end = start + len(expected)
+        before_ok = start == 0 or not word(answer[start - 1])
+        after_ok = end == len(answer) or not word(answer[end])
+        if before_ok and after_ok:
+            return True
+        start = answer.find(expected, start + 1)
+    return False
+
+
 def score(task: dict, output: RunOutput) -> JudgeResult:
+    text = task.get("expected_text")
+    if isinstance(text, str) and text.strip():
+        # A text or boolean answer (bench.rs `expected_text`).
+        passed = _text_present(str(output.output), text)
+        extra = getattr(output, "extra", None) or {}
+        cited = _citation_present(str(output.output), task, extra) if task.get("citation") else False
+        return JudgeResult(
+            score=1.0 if passed else 0.0,
+            feedback=f"expected text {text!r} {'found' if passed else 'missing'}; citation {'hit' if cited else 'miss'}",
+            extra={"passed": passed, "citation_hit": cited, "kind": task.get("kind")},
+        )
     raw = task.get("expected")
     if isinstance(raw, bool):
         return JudgeResult(
@@ -387,6 +420,10 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             raise ValueError(f"bench task id {row['id']!r} cannot round-trip hermit's split files")
         if not isinstance(row["question"], str) or not row["question"].strip():
             raise ValueError(f"task {row['id']}: question must be a non-empty string")
+        if "expected_text" in row and (
+            not isinstance(row["expected_text"], str) or not row["expected_text"].strip()
+        ):
+            raise ValueError(f"task {row['id']}: expected_text must be a non-empty string")
         exp = row["expected"]
         if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
             raise ValueError(f"task {row['id']}: expected must be a number or numeric string")
