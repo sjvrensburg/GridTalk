@@ -142,26 +142,28 @@ pub fn generate_tasks_ex(
                         // Built on the first formula: one
                         // recalculation for every task.
                         let calc = cache.get(wb);
-                        // An error or a non-finite number has no
-                        // deterministic answer.
+                        // An error has no deterministic answer, and
+                        // no before value for a what-if.
                         let Ok(before_value) = calc.value(&sheet.name, r, c) else {
                             skipped_formulas += 1;
                             continue;
                         };
-                        let Some(expected) = Expected::of(&before_value) else {
-                            skipped_formulas += 1;
-                            continue;
-                        };
-                        drafts.push((
-                            "formula_result".into(),
-                            format!(
-                                "What does {} calculate to? {}",
+                        // A non-finite number or blank text has no
+                        // answer to state, but a what-if can still
+                        // change it into one.
+                        match Expected::of(&before_value) {
+                            Some(expected) => drafts.push((
+                                "formula_result".into(),
+                                format!(
+                                    "What does {} calculate to? {}",
+                                    a1(&sheet.name, r, c),
+                                    expected.ask("")
+                                ),
+                                expected,
                                 a1(&sheet.name, r, c),
-                                expected.ask("")
-                            ),
-                            expected,
-                            a1(&sheet.name, r, c),
-                        ));
+                            )),
+                            None => skipped_formulas += 1,
+                        }
                         // One what-if task per formula: its precedent
                         // cells as Gridcraft resolves them (names and
                         // 3D references included), deduplicated, until
@@ -186,7 +188,7 @@ pub fn generate_tasks_ex(
                                     let CellValue::Number(orig) = cell else {
                                         continue;
                                     };
-                                    if (osi, qr, qc) == (si, r, c) || !seen.insert((osi, qr, qc)) {
+                                    if !seen.insert((osi, qr, qc)) {
                                         continue;
                                     }
                                     attempts += 1;
@@ -531,9 +533,11 @@ pub fn run_bench_with(
         let (passed, cited, steps, error) =
             match investigate_with(&task.question, tools, backend, max_steps, adapter, None) {
                 Ok(inv) => (
-                    match &task.expected_text {
-                        Some(text) => judge_text(&inv.answer, text),
-                        None => judge_number(&inv.answer, task.expected),
+                    // Blank text falls back to the number, as
+                    // hermit's score() does.
+                    match task.expected_text.as_deref() {
+                        Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
+                        _ => judge_number(&inv.answer, task.expected),
                     },
                     citation_hit(&inv.citations, &task.citation, &inv.answer),
                     inv.trail.len(),
@@ -720,11 +724,13 @@ mod tests {
                     CellValue::Text("Q1".into()),
                     CellValue::Text("Tax".into()),
                     CellValue::Text("Size".into()),
+                    CellValue::Text("Flag".into()),
                 ],
                 vec![
                     f("SUM(Jan:Mar!A2)"),
                     f("Tax_Rate*100"),
                     f("IF(Jan!A2>5,\"big\",\"small\")"),
+                    f("IF(Jan!A2>5,\"big\",\"\")"),
                 ],
             ],
         );
@@ -778,6 +784,12 @@ mod tests {
             .find(|t| t.kind == "formula_result" && t.citation == "Summary!C2")
             .expect("a text formula-result task");
         assert_eq!(result.expected_text.as_deref(), Some("small"));
+        // A blank result has no formula-result task, but a what-if
+        // can still turn it into an answer.
+        assert_eq!(what_if("Summary!D2").expected_text.as_deref(), Some("big"));
+        assert!(!tasks
+            .iter()
+            .any(|t| t.kind == "formula_result" && t.citation == "Summary!D2"));
         // Task files written before typed tasks still load.
         let old: BenchTask = serde_json::from_str(
             r#"{"id":"t0001","kind":"cell_value","split":"dev","question":"q","expected":2.0,"citation":"Sheet1!B2"}"#,
