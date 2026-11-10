@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 struct OpenWorkbook {
@@ -184,7 +185,12 @@ fn req_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, RpcError> {
 /// MCP's tools: the two session tools, then every shared tool from
 /// `ToolRequest::schemas()` with a required `workbook_id` added. One
 /// definition per tool, shared with `gridtalk tools`.
-fn tool_definitions() -> Value {
+fn tool_definitions() -> &'static Value {
+    static DEFINITIONS: OnceLock<Value> = OnceLock::new();
+    DEFINITIONS.get_or_init(build_tool_definitions)
+}
+
+fn build_tool_definitions() -> Value {
     let annotations = |read_only: bool| json!({"readOnlyHint": read_only, "destructiveHint": false, "idempotentHint": read_only, "openWorldHint": false});
     let mut tools = vec![
         json!({"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods; path on this machine) and return its session id, sheets, regions and load warnings. Opening a path that is already open returns its existing session. Reads the file; never writes it.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}, "annotations": annotations(true)}),
@@ -350,8 +356,7 @@ impl McpServer {
             .ok_or_else(|| invalid("missing or non-string argument: name".to_string()))?
             .to_string();
         let name = name.as_str();
-        let definitions = tool_definitions();
-        let Some(allowed) = allowed_arguments(&definitions, name) else {
+        let Some(allowed) = allowed_arguments(tool_definitions(), name) else {
             return Err((
                 -32602,
                 format!("unknown tool: {name}"),
@@ -385,6 +390,9 @@ impl McpServer {
                     })
                 }) {
                     let id = id.clone();
+                    // Reopening counts as a fresh open for eviction.
+                    self.order.retain(|x| x != &id);
+                    self.order.push_back(id.clone());
                     let open = self.workbooks.get_mut(&id).expect("listed session");
                     if let Err(e) = open.fresh() {
                         return tool_error(ErrorKind::WorkbookUnavailable, e);
@@ -612,7 +620,7 @@ mod tests {
                 .collect()
         };
         let shared = names(&ToolRequest::schemas()["tools"]);
-        let mcp: Vec<String> = names(&tool_definitions())
+        let mcp: Vec<String> = names(tool_definitions())
             .into_iter()
             .filter(|n| n != "open_workbook" && n != "close_workbook")
             .collect();

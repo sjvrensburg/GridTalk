@@ -14,6 +14,7 @@ use crate::{
 };
 use gridcraft_core::RangeRef as GcRange;
 use gridcraft_formula::Expr;
+use std::collections::HashSet;
 
 /// One area a formula reads: a snapshot sheet index and an inclusive
 /// 0-based rectangle (r0, c0, r1, c1).
@@ -46,7 +47,7 @@ impl Lineage {
     pub fn areas(&self, snapshot: &WorkbookSnapshot, sheet: usize, expr: &str) -> Vec<Area> {
         let mut out = Vec::new();
         match gridcraft_formula::parse(expr.strip_prefix('=').unwrap_or(expr)) {
-            Ok(e) => self.collect(sheet, &e, 0, &mut out),
+            Ok(e) => self.collect(sheet, &e, 0, &mut HashSet::new(), &mut out),
             Err(_) => {
                 // Unparseable: keep the lexical extractor's cells.
                 for q in formula_refs_qualified(expr) {
@@ -66,7 +67,18 @@ impl Lineage {
         out
     }
 
-    fn collect(&self, sheet: usize, e: &Expr, depth: usize, out: &mut Vec<Area>) {
+    /// `expanded`: the names already resolved for this formula. A name
+    /// resolves to the same areas wherever it appears (always from the
+    /// formula's sheet), so each is expanded once: repeated or cyclic
+    /// names cannot multiply the work.
+    fn collect(
+        &self,
+        sheet: usize,
+        e: &Expr,
+        depth: usize,
+        expanded: &mut HashSet<String>,
+        out: &mut Vec<Area>,
+    ) {
         let (areas, _) = gridcraft_calc::eval::precedents(&self.wb, sheet, e);
         out.extend(areas.into_iter().map(|a| (a.sheet, bounds(a.range))));
         if depth >= MAX_NAME_DEPTH {
@@ -79,9 +91,12 @@ impl Lineage {
             }
         });
         for name in names {
+            if !expanded.insert(name.to_ascii_lowercase()) {
+                continue;
+            }
             if let Some(def) = self.name(sheet, name) {
                 if let Ok(target) = gridcraft_formula::parse(def.strip_prefix('=').unwrap_or(def)) {
-                    self.collect(sheet, &target, depth + 1, out);
+                    self.collect(sheet, &target, depth + 1, expanded, out);
                 }
             }
         }

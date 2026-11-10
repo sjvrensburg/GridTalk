@@ -1523,7 +1523,7 @@ pub struct GraphCache {
 impl GraphCache {
     /// Drop what `dirty` can have changed, or everything when the
     /// context changed or the edits are unknown (`None`).
-    fn invalidate(&mut self, wb: &WorkbookSnapshot, dirty: Option<&[RangeRef]>) -> Vec<bool> {
+    fn invalidate(&mut self, wb: &WorkbookSnapshot, dirty: Option<&[RangeRef]>) {
         let context = (
             wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
             wb.names.clone(),
@@ -1536,17 +1536,12 @@ impl GraphCache {
                     regions: vec![None; wb.sheets.len()],
                     areas: Default::default(),
                 };
-                return vec![true; wb.sheets.len()];
+                return;
             }
         };
-        let touched: Vec<bool> = wb
-            .sheets
-            .iter()
-            .map(|s| dirty.iter().any(|d| sheet_name_eq(&d.sheet, &s.name)))
-            .collect();
-        for (i, t) in touched.iter().enumerate() {
-            if *t {
-                self.regions[i] = None;
+        for (slot, s) in self.regions.iter_mut().zip(&wb.sheets) {
+            if dirty.iter().any(|d| sheet_name_eq(&d.sheet, &s.name)) {
+                *slot = None;
             }
         }
         if !dirty.is_empty() {
@@ -1556,7 +1551,6 @@ impl GraphCache {
                     .any(|d| sheet_name_eq(&d.sheet, &wb.sheets[si].name) && d.contains(r, c))
             });
         }
-        touched
     }
 }
 
@@ -2907,6 +2901,20 @@ mod tests {
         // The old reading of Jan:Mar!A2 as columns JAN:MAR plus a bare
         // A2 invented a self-edge on Q1.
         assert!(!has("Q1", "Q1"), "{edges:?}");
+    }
+
+    #[test]
+    fn cyclic_defined_names_resolve_once() {
+        let mut wb = parse_delimited("d", "Sheet1", "A,B\n1,=X+Y\n", ',');
+        for (name, formula) in [("X", "Y+Y+Sheet1!$A$2"), ("Y", "X+X")] {
+            wb.names.push(DefinedName {
+                name: name.into(),
+                scope: None,
+                formula: formula.into(),
+            });
+        }
+        let areas = lineage::Lineage::new(&wb).areas(&wb, 0, "X+Y");
+        assert_eq!(areas, vec![(0, (1, 0, 1, 0))]);
     }
 
     #[test]

@@ -292,32 +292,31 @@ impl<'a> Tools<'a> {
                     Some(n) => {
                         let mut edges = Vec::new();
                         let mut lines = vec![format!("node {} ({})", n.id, n.label)];
+                        // Counted per listed entry: a self-edge (a
+                        // running total) is listed both out and in, and
+                        // an edge to a missing node is not listed.
                         let mut total_edges = 0usize;
                         for e in &self.graph.edges {
-                            if e.from != n.id && e.to != n.id {
-                                continue;
-                            }
-                            total_edges += 1;
-                            if edges.len() >= MAX_EXPAND_EDGES {
-                                continue;
-                            }
-                            if e.from == n.id {
-                                if let Some(t) = nodes_by_id.get(&e.to) {
-                                    lines.push(format!(" -{}-> {}", e.kind, t.label));
-                                    edges.push(serde_json::json!({
-                                        "direction": "out", "kind": e.kind, "label": t.label,
-                                        "range": t.range.as_ref().map(|r| r.a1())
-                                    }));
+                            let sides = [
+                                (e.from == n.id, e.to, "out", "-", "->"),
+                                (e.to == n.id, e.from, "in", "<-", "-"),
+                            ];
+                            for (touches, other, direction, left, right) in sides {
+                                if !touches {
+                                    continue;
                                 }
-                            }
-                            if e.to == n.id {
-                                if let Some(t) = nodes_by_id.get(&e.from) {
-                                    lines.push(format!(" <-{}- {}", e.kind, t.label));
-                                    edges.push(serde_json::json!({
-                                        "direction": "in", "kind": e.kind, "label": t.label,
-                                        "range": t.range.as_ref().map(|r| r.a1())
-                                    }));
+                                let Some(t) = nodes_by_id.get(&other) else {
+                                    continue;
+                                };
+                                total_edges += 1;
+                                if edges.len() >= MAX_EXPAND_EDGES {
+                                    continue;
                                 }
+                                lines.push(format!(" {left}{}{right} {}", e.kind, t.label));
+                                edges.push(serde_json::json!({
+                                    "direction": direction, "kind": e.kind, "label": t.label,
+                                    "range": t.range.as_ref().map(|r| r.a1())
+                                }));
                             }
                         }
                         let truncated = total_edges > edges.len();
@@ -1150,6 +1149,25 @@ mod tests {
         assert_eq!(out.data["total_edges"], 251); // 250 columns + its sheet
         assert_eq!(out.data["truncated"], true);
         assert!(out.text.contains("200 of 251 edges shown"), "{}", out.text);
+        // A running total's self-edge is listed out and in, and both
+        // count toward total_edges.
+        let wb2 = parse_delimited("r", "Sheet1", "Amount,Running\n5,=A2\n7,=B2+A3\n", ',');
+        let (g2, v2) = build_graph(&wb2);
+        assert!(v2.is_empty(), "{v2:?}");
+        let hybrid2 = HybridIndex::build(&wb2, &g2);
+        let tools2 = Tools {
+            wb: &wb2,
+            graph: &g2,
+            hybrid: &hybrid2,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let running = g2.nodes.iter().find(|n| n.label == "Running").unwrap();
+        let out2 = tools2.call(&ToolRequest::Expand {
+            range: running.range.as_ref().unwrap().a1(),
+        });
+        let listed = out2.data["edges"].as_array().unwrap().len();
+        assert_eq!(out2.data["total_edges"], listed);
+        assert_eq!(out2.data["truncated"], false);
         let info = tools.call(&ToolRequest::WorkbookInfo);
         assert_eq!(info.data["sheets"][0]["cols"], 250);
         assert_eq!(info.data["limits"]["expand_edges"], MAX_EXPAND_EDGES);
