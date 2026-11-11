@@ -304,7 +304,8 @@ fn bad_arguments_exit_with_an_error_and_no_frames() {
         vec!["--root", missing.to_str().unwrap()],
     ] {
         let output = gridtalk_mcp(&args).stdin(Stdio::null()).output().unwrap();
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        // A usage error (exit 2; see `gridtalk help`).
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?} wrote to stdout");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.starts_with("gridtalk: "), "{args:?}: {stderr}");
