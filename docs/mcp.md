@@ -167,4 +167,4 @@ gridtalk tools list
 gridtalk tools call tests/fixtures/demo.csv '{"tool":"what_if","cell":"B2","value":10,"target":"Sheet1!D2"}'
 ```
 
-Same typed core, stable exit codes (non-zero on `ok:false`).
+Same typed core. `tools call` prints the result once and exits 5 when it is `ok:false`; a bad request is a usage error (exit 2) and an unreadable workbook exit 3 (see `gridtalk help`).

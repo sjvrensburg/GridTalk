@@ -4,11 +4,13 @@
 //! end (Phase 4, on Gridcraft's ui-egui) will render.
 
 mod bench;
+mod cli;
 mod investigate;
 mod mcp;
 mod optimise;
 mod tools;
 
+use cli::CliError;
 use gridtalk_adapter as adapter;
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
@@ -57,51 +59,100 @@ impl ViewState {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&args) {
-        eprintln!("gridtalk: {e}");
-        std::process::exit(1);
+        if let Some(message) = e.message() {
+            eprintln!("gridtalk: {message}");
+        }
+        std::process::exit(e.exit_code());
     }
 }
 
-const COMMANDS: &[&str] = &[
-    "adapter",
-    "ask",
-    "bench",
-    "investigate",
-    "graph",
-    "view",
-    "spike",
-    "tools",
-    "mcp",
-    "generate",
-    "models",
-    "open-in-gridcraft",
-    "optimise",
-    "help",
-    "--help",
-    "-h",
-];
+/// Commands whose first argument is a subcommand, so `gridtalk <cmd>
+/// <sub> --help` is help too.
+const WITH_SUBCOMMANDS: &[&str] = &["adapter", "bench", "models", "tools"];
 
-fn run(args: &[String]) -> Result<(), String> {
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
-    if !COMMANDS.contains(&cmd) {
-        return Err(format!(
-            "unknown command {cmd:?}; run `gridtalk help` for usage"
-        ));
+/// The file argument and the free text after it (`ask`, `generate`).
+fn file_and_text<'a>(
+    cmd: &str,
+    rest: &'a [String],
+    first: &str,
+    what: &str,
+) -> Result<(&'a str, String), CliError> {
+    let file = rest
+        .first()
+        .ok_or_else(|| cli::usage(cmd, format!("missing <{first}>")))?;
+    if file.starts_with("--") {
+        return Err(cli::usage(cmd, format!("unknown flag {file}")));
+    }
+    let text = rest[1..].join(" ");
+    if text.trim().is_empty() {
+        return Err(cli::usage(cmd, format!("missing the {what}")));
+    }
+    Ok((file, text))
+}
+
+/// The workbook a command reads, or an input error.
+fn workbook_and_graph(file: &str) -> Result<(WorkbookSnapshot, Graph), CliError> {
+    let wb = load_workbook(file)?;
+    let (graph, violations) = build_graph(&wb);
+    if !violations.is_empty() {
+        return Err(CliError::Other(format!(
+            "graph invariants violated: {violations:?}"
+        )));
+    }
+    Ok((wb, graph))
+}
+
+fn run(args: &[String]) -> Result<(), CliError> {
+    let Some(cmd) = args.get(1).map(String::as_str) else {
+        println!("{}", cli::top_help());
+        return Ok(());
+    };
+    let cmd = cli::canonical(cmd);
+    let rest = &args[2..];
+    match cmd {
+        "help" | "--help" | "-h" => {
+            return match rest {
+                [] => {
+                    println!("{}", cli::top_help());
+                    Ok(())
+                }
+                [name] => match cli::command(name) {
+                    Some(c) => {
+                        println!("{}", cli::command_help(c));
+                        Ok(())
+                    }
+                    None => Err(cli::usage("help", format!("unknown command {name:?}"))),
+                },
+                [_, extra, ..] => Err(cli::usage("help", format!("unexpected argument {extra:?}"))),
+            };
+        }
+        "version" | "--version" | "-V" => {
+            if let Some(extra) = rest.first() {
+                return Err(cli::usage(
+                    "version",
+                    format!("unexpected argument {extra:?}"),
+                ));
+            }
+            println!("{}", cli::version());
+            return Ok(());
+        }
+        _ => {}
+    }
+    let Some(command) = cli::command(cmd) else {
+        return Err(CliError::Usage(format!(
+            "unknown command {cmd:?}; run `gridtalk help` for the commands"
+        )));
+    };
+    let asks_help = rest.first().is_some_and(|a| cli::is_help(a))
+        || (WITH_SUBCOMMANDS.contains(&cmd) && rest.get(1).is_some_and(|a| cli::is_help(a)));
+    if asks_help {
+        println!("{}", cli::command_help(command));
+        return Ok(());
     }
     match cmd {
         "ask" => {
-            let file = args
-                .get(2)
-                .ok_or("usage: gridtalk ask <file.csv> <question...>")?;
-            let question = args[3..].join(" ");
-            if question.is_empty() {
-                return Err("usage: gridtalk ask <file.csv> <question...>".into());
-            }
-            let wb = load_workbook(file)?;
-            let (graph, violations) = build_graph(&wb);
-            if !violations.is_empty() {
-                return Err(format!("graph invariants violated: {violations:?}"));
-            }
+            let (file, question) = file_and_text(cmd, rest, "file", "question")?;
+            let (wb, graph) = workbook_and_graph(file)?;
             // The same hybrid (lexical + vector) retrieval as chat,
             // investigate and MCP.
             let index = HybridIndex::build(&wb, &graph);
@@ -132,29 +183,28 @@ fn run(args: &[String]) -> Result<(), String> {
                 max_tokens: 512,
             };
             let cancel = Arc::new(AtomicBool::new(false));
+            let mut sink = cli::TokenSink::new(&cancel);
             let mut first = true;
-            backend
-                .stream(&req, &cancel, &mut |t| {
-                    if first {
-                        print!("\n--- {} ---\n", backend.name());
-                        first = false;
-                    }
-                    print!("{t}");
-                })
-                .map_err(|e| e.to_string())?;
-            println!();
+            let header = format!("\n--- {} ---\n", backend.name());
+            let streamed = backend.stream(&req, &cancel, &mut |t| {
+                if first {
+                    sink.write(&header);
+                    first = false;
+                }
+                sink.write(t);
+            });
+            // A reader that went away (`| head`) is not a failure.
+            if sink.closed {
+                return Ok(());
+            }
+            streamed.map_err(|e| CliError::Backend(e.to_string()))?;
+            sink.write("\n");
             Ok(())
         }
         "graph" => {
-            let file = args.get(2).ok_or("usage: gridtalk graph <file.csv>")?;
-            if args.len() > 3 {
-                return Err("usage: gridtalk graph <file.csv> (no extra arguments)".into());
-            }
-            let wb = load_workbook(file)?;
-            let (graph, violations) = build_graph(&wb);
-            if !violations.is_empty() {
-                return Err(format!("graph invariants violated: {violations:?}"));
-            }
+            let parsed = cli::parse(cmd, rest, &[])?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+            let (_, graph) = workbook_and_graph(file)?;
             for n in &graph.nodes {
                 let kind = match n.kind {
                     NodeKind::Workbook => "workbook",
@@ -171,17 +221,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "view" => {
             // Terminal rendering of the dual view: grid left, graph right.
-            let file = args.get(2).ok_or("usage: gridtalk view <file.csv>")?;
-            if args.len() > 3 {
-                return Err("usage: gridtalk view <file.csv> (no extra arguments)".into());
-            }
-            let wb = load_workbook(file)?;
+            let parsed = cli::parse(cmd, rest, &[])?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+            let (wb, graph) = workbook_and_graph(file)?;
             if wb.sheets.is_empty() {
-                return Err("workbook has no sheets".into());
-            }
-            let (graph, violations) = build_graph(&wb);
-            if !violations.is_empty() {
-                return Err(format!("graph invariants violated: {violations:?}"));
+                return Err(CliError::Input("workbook has no sheets".into()));
             }
             let mut state = ViewState::default();
             if let Some(sheet) = wb.sheets.first() {
@@ -221,8 +265,11 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "adapter" => {
             let root = adapter::adapters_root();
-            match args.get(2).map(|s| s.as_str()) {
+            let sub = rest.first().map(String::as_str);
+            let sub_args = rest.get(1..).unwrap_or_default();
+            match sub {
                 Some("list") => {
+                    cli::parse(cmd, sub_args, &[])?.positionals(cmd, &[], 0)?;
                     let names = adapter::list_adapters(&root);
                     if names.is_empty() {
                         println!("no adapters in {}", root.display());
@@ -237,11 +284,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("show") => {
-                    let name = args.get(3).ok_or("usage: gridtalk adapter show <name>")?;
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
                     // The CARD.md read below joins `name` onto the
                     // root: a traversal name must never reach it.
                     if !adapter::valid_adapter_name(name) {
-                        return Err(format!("invalid adapter name {name:?}"));
+                        return Err(cli::usage(cmd, format!("invalid adapter name {name:?}")));
                     }
                     let a = adapter::load_adapter(&root, name);
                     println!(
@@ -255,44 +303,23 @@ fn run(args: &[String]) -> Result<(), String> {
                         println!("--- CARD.md ---");
                         println!(
                             "{}",
-                            std::fs::read_to_string(&card).map_err(|e| e.to_string())?
+                            std::fs::read_to_string(&card)
+                                .map_err(|e| CliError::Input(format!("{}: {e}", card.display())))?
                         );
                     }
                     Ok(())
                 }
                 Some("export") => {
-                    // gridtalk adapter export <name> [--out AGENTS.md]
-                    let name = args
-                        .get(3)
-                        .filter(|n| !n.starts_with("--"))
-                        .ok_or("usage: gridtalk adapter export <name> [--out AGENTS.md]")?;
+                    let parsed = cli::parse(cmd, sub_args, &["--out"])?;
+                    let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
                     if !adapter::valid_adapter_name(name) || !root.join(name).is_dir() {
-                        return Err(format!("adapter {name:?} not found"));
-                    }
-                    // Strict flag parsing: at most one --out with a
-                    // non-flag value, nothing else.
-                    let mut out_path: Option<&String> = None;
-                    let mut i = 4;
-                    while i < args.len() {
-                        match args[i].as_str() {
-                            "--out" if out_path.is_none() => {
-                                let value = args
-                                    .get(i + 1)
-                                    .filter(|v| !v.starts_with("--"))
-                                    .ok_or("export flag --out needs a value")?;
-                                out_path = Some(value);
-                                i += 2;
-                            }
-                            other => {
-                                return Err(format!("unknown or duplicate export flag {other}"));
-                            }
-                        }
+                        return Err(CliError::Input(format!("adapter {name:?} not found")));
                     }
                     let loaded = adapter::load_adapter(&root, name);
                     let md = adapter::export_agents_md(&loaded);
-                    match out_path {
+                    match parsed.flag("--out") {
                         Some(path) => {
-                            std::fs::write(path, &md).map_err(|e| e.to_string())?;
+                            std::fs::write(path, &md).map_err(|e| format!("{path}: {e}"))?;
                             println!("wrote {} (adapter {name} v{})", path, loaded.version);
                         }
                         None => print!("{md}"),
@@ -300,60 +327,31 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("rollback") => {
-                    let name = args
-                        .get(3)
-                        .ok_or("usage: gridtalk adapter rollback <name>")?;
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
                     let v = adapter::rollback(&root, name)?;
                     println!("adapter {name} rolled back to v{v}");
                     Ok(())
                 }
-                _ => Err(
-                    "usage: gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]"
-                        .into(),
-                ),
+                Some(other) => Err(cli::usage(cmd, format!("unknown subcommand {other:?}"))),
+                None => Err(cli::usage(cmd, "missing subcommand")),
             }
         }
         "optimise" => {
-            // gridtalk optimise <file> [--adapter <name>] [--rounds 3]
-            let file = args
-                .get(2)
-                .ok_or("usage: gridtalk optimise <file> [--adapter <name>] [--rounds 3]")?;
-            let mut name = "default".to_string();
-            let mut rounds = 3usize;
-            {
-                // Strict like bench: no duplicates, no unknowns,
-                // no flag-shaped values, rounds capped at 10.
-                let mut seen: Vec<&str> = Vec::new();
-                let mut i = 3;
-                while i < args.len() {
-                    let flag_name = args[i].as_str();
-                    if seen.contains(&flag_name) {
-                        return Err(format!("duplicate optimise flag {flag_name}"));
-                    }
-                    seen.push(flag_name);
-                    let value = args
-                        .get(i + 1)
-                        .filter(|v| !v.starts_with("--"))
-                        .ok_or_else(|| format!("optimise flag {flag_name} needs a value"))?;
-                    match flag_name {
-                        "--adapter" => name = value.clone(),
-                        "--rounds" => {
-                            rounds = value
-                                .parse::<usize>()
-                                .ok()
-                                .filter(|n| (1..=10).contains(n))
-                                .ok_or("--rounds must be an integer in 1..=10")?
-                        }
-                        other => return Err(format!("unknown optimise flag {other}")),
-                    }
-                    i += 2;
-                }
-            }
-            let wb = load_workbook(file)?;
-            let (graph, violations) = build_graph(&wb);
-            if !violations.is_empty() {
-                return Err(format!("graph invariants violated: {violations:?}"));
-            }
+            let parsed = cli::parse(cmd, rest, &["--adapter", "--rounds"])?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+            let name = parsed.flag("--adapter").unwrap_or("default").to_string();
+            let rounds = match parsed.flag("--rounds") {
+                Some(v) => v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=10).contains(n))
+                    .ok_or_else(|| {
+                        cli::usage(cmd, format!("--rounds must be 1 to 10, got {v:?}"))
+                    })?,
+                None => 3,
+            };
+            let (wb, graph) = workbook_and_graph(file)?;
             let hybrid = HybridIndex::build(&wb, &graph);
             let toolset = tools::Tools {
                 wb: &wb,
@@ -409,58 +407,23 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "bench" => {
-            // gridtalk bench generate <file> [--out tasks.json] [--max 100]
-            // gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]
-            // Strict flag parsing: unknown flags, duplicates and
-            // missing values are usage errors, never silent defaults.
-            let mut flags: std::collections::BTreeMap<String, String> =
-                std::collections::BTreeMap::new();
-            {
-                let known = [
-                    "--out",
-                    "--max",
-                    "--tasks",
-                    "--split",
-                    "--card",
-                    "--adapter",
-                ];
-                let mut i = 4;
-                while i < args.len() {
-                    let name = &args[i];
-                    if !known.contains(&name.as_str()) {
-                        return Err(format!(
-                            "unknown bench flag {name}; expected one of {known:?} with a value"
-                        ));
-                    }
-                    let value = args
-                        .get(i + 1)
-                        .filter(|v| !v.starts_with("--"))
-                        .ok_or_else(|| format!("bench flag {name} needs a value"))?;
-                    if flags.insert(name.clone(), value.clone()).is_some() {
-                        return Err(format!("duplicate bench flag {name}"));
-                    }
-                    i += 2;
-                }
-            }
-            let flag = |name: &str| -> Option<String> { flags.get(name).cloned() };
-            match args.get(2).map(|s| s.as_str()) {
+            let sub_args = rest.get(1..).unwrap_or_default();
+            match rest.first().map(String::as_str) {
                 Some("generate") => {
-                    let file = args.get(3).ok_or(
-                        "usage: gridtalk bench generate <file> [--out tasks.json] [--max 100]",
-                    )?;
-                    let max: usize = match flag("--max") {
+                    let parsed = cli::parse(cmd, sub_args, &["--out", "--max"])?;
+                    let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+                    let max: usize = match parsed.flag("--max") {
                         Some(v) => {
                             v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| {
-                                format!("--max must be a positive integer, got {v:?}")
+                                cli::usage(
+                                    cmd,
+                                    format!("--max must be a positive integer, got {v:?}"),
+                                )
                             })?
                         }
                         None => 100,
                     };
-                    let wb = load_workbook(file)?;
-                    let (_, violations) = build_graph(&wb);
-                    if !violations.is_empty() {
-                        return Err(format!("graph invariants violated: {violations:?}"));
-                    }
+                    let (wb, _) = workbook_and_graph(file)?;
                     let gen =
                         bench::generate_tasks_ex(&wb, max, &gridtalk_graph::eval::EvalCache::new());
                     let tasks = gen.tasks;
@@ -471,9 +434,9 @@ fn run(args: &[String]) -> Result<(), String> {
                         );
                     }
                     let json = serde_json::to_string_pretty(&tasks).map_err(|e| e.to_string())?;
-                    match flag("--out") {
+                    match parsed.flag("--out") {
                         Some(out) => {
-                            std::fs::write(&out, &json).map_err(|e| e.to_string())?;
+                            std::fs::write(out, &json).map_err(|e| format!("{out}: {e}"))?;
                             eprintln!(
                                 "wrote {} tasks ({} train / {} dev) to {out}",
                                 tasks.len(),
@@ -486,14 +449,22 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("run") => {
-                    let file = args
-                        .get(3)
-                        .ok_or("usage: gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md]")?;
-                    let wb = load_workbook(file)?;
-                    let (graph, violations) = build_graph(&wb);
-                    if !violations.is_empty() {
-                        return Err(format!("graph invariants violated: {violations:?}"));
+                    let parsed = cli::parse(
+                        cmd,
+                        sub_args,
+                        &["--tasks", "--split", "--card", "--adapter"],
+                    )?;
+                    let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+                    // Checked before the workbook loads: a typo must
+                    // not cost a full load first.
+                    let split = parsed.flag("--split").unwrap_or("all").to_string();
+                    if !matches!(split.as_str(), "train" | "dev" | "all") {
+                        return Err(cli::usage(
+                            cmd,
+                            format!("unknown split {split:?}; expected train, dev or all"),
+                        ));
                     }
+                    let (wb, graph) = workbook_and_graph(file)?;
                     let hybrid = HybridIndex::build(&wb, &graph);
                     let toolset = tools::Tools {
                         wb: &wb,
@@ -502,11 +473,13 @@ fn run(args: &[String]) -> Result<(), String> {
                         calc: &gridtalk_graph::eval::EvalCache::new(),
                     };
                     let mut skipped_formulas = 0usize;
-                    let tasks: Vec<bench::BenchTask> = match flag("--tasks") {
+                    let tasks: Vec<bench::BenchTask> = match parsed.flag("--tasks") {
                         Some(path) => {
-                            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                            serde_json::from_str(&text)
-                                .map_err(|e| format!("invalid tasks file {path}: {e}"))?
+                            let text = std::fs::read_to_string(path)
+                                .map_err(|e| CliError::Input(format!("{path}: {e}")))?;
+                            serde_json::from_str(&text).map_err(|e| {
+                                CliError::Input(format!("invalid tasks file {path}: {e}"))
+                            })?
                         }
                         None => {
                             let gen = bench::generate_tasks_ex(&wb, 100, toolset.calc);
@@ -539,19 +512,15 @@ fn run(args: &[String]) -> Result<(), String> {
                             }
                         }
                     }
-                    if flag("--split").is_none() {
+                    if parsed.flag("--split").is_none() {
                         eprintln!(
                             "gridtalk: note: scoring all splits (dev included); use --split train to exclude dev"
                         );
                     }
-                    let split = flag("--split").unwrap_or_else(|| "all".into());
-                    if !matches!(split.as_str(), "train" | "dev" | "all") {
-                        return Err(format!("unknown split {split}; expected train, dev or all"));
-                    }
                     let cfg = config_from_env();
                     let backend = backend_from_config(&cfg.inference);
                     warn_if_external(&cfg);
-                    let bench_adapter = flag("--adapter").map(|name| load_named_adapter(&name));
+                    let bench_adapter = parsed.flag("--adapter").map(load_named_adapter);
                     let report = bench::run_bench_with(
                         &tasks,
                         &toolset,
@@ -560,12 +529,12 @@ fn run(args: &[String]) -> Result<(), String> {
                         bench_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
                         bench_adapter.as_ref(),
                     )
-                    .map_err(|e| format!("bench run failed: {e}"))?;
+                    .map_err(|e| CliError::Backend(format!("bench run failed: {e}")))?;
                     let card =
                         bench::render_card_with_skipped(&report, tasks.len(), skipped_formulas);
-                    match flag("--card") {
+                    match parsed.flag("--card") {
                         Some(path) => {
-                            std::fs::write(&path, &card).map_err(|e| e.to_string())?;
+                            std::fs::write(path, &card).map_err(|e| format!("{path}: {e}"))?;
                             match report.accuracy("all") {
                                 Some(acc) => println!(
                                     "bench: {} tasks, accuracy {:.1}% -> {path}",
@@ -579,55 +548,43 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     Ok(())
                 }
-                _ => {
-                    Err("usage: gridtalk bench generate <file> | gridtalk bench run <file>".into())
-                }
+                Some(other) => Err(cli::usage(cmd, format!("unknown subcommand {other:?}"))),
+                None => Err(cli::usage(cmd, "missing subcommand")),
             }
         }
         "investigate" => {
-            let file = args
-                .get(2)
-                .ok_or("usage: gridtalk investigate <file> [--adapter <name>] <question...>")?;
-            // Extract an optional --adapter <name> pair before the
-            // question words are joined.
+            let file = rest
+                .first()
+                .ok_or_else(|| cli::usage(cmd, "missing <file>"))?;
+            if file.starts_with("--") {
+                return Err(cli::usage(cmd, format!("expected the file before {file}")));
+            }
+            // --adapter is a flag only before the question starts;
+            // inside the question it is literal text.
             let mut adapter_name: Option<String> = None;
             let mut question_words: Vec<String> = Vec::new();
-            {
-                // --adapter is only a flag before the question
-                // starts (or after a `--` separator handling);
-                // inside the question it is literal text.
-                let mut i = 3;
-                let mut in_flags = true;
-                while i < args.len() {
-                    if in_flags && args[i] == "--adapter" {
-                        if adapter_name.is_some() {
-                            return Err("duplicate --adapter flag".into());
-                        }
-                        adapter_name = Some(
-                            args.get(i + 1)
-                                .filter(|v| !v.starts_with("--"))
-                                .ok_or("--adapter needs a value")?
-                                .clone(),
-                        );
-                        i += 2;
-                    } else {
-                        in_flags = false;
-                        question_words.push(args[i].clone());
-                        i += 1;
+            let mut words = rest[1..].iter();
+            while let Some(word) = words.next() {
+                if question_words.is_empty() && word == "--adapter" {
+                    if adapter_name.is_some() {
+                        return Err(cli::usage(cmd, "--adapter given twice"));
                     }
+                    adapter_name = Some(
+                        words
+                            .next()
+                            .filter(|v| !v.starts_with("--"))
+                            .ok_or_else(|| cli::usage(cmd, "--adapter needs a value"))?
+                            .clone(),
+                    );
+                } else {
+                    question_words.push(word.clone());
                 }
             }
             let question = question_words.join(" ");
-            if question.is_empty() {
-                return Err(
-                    "usage: gridtalk investigate <file> [--adapter <name>] <question...>".into(),
-                );
+            if question.trim().is_empty() {
+                return Err(cli::usage(cmd, "missing the question"));
             }
-            let wb = load_workbook(file)?;
-            let (graph, violations) = build_graph(&wb);
-            if !violations.is_empty() {
-                return Err(format!("graph invariants violated: {violations:?}"));
-            }
+            let (wb, graph) = workbook_and_graph(file)?;
             let hybrid = HybridIndex::build(&wb, &graph);
             let tools = tools::Tools {
                 wb: &wb,
@@ -638,7 +595,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
-            let cli_adapter = adapter_name.as_ref().map(|n| load_named_adapter(n));
+            let cli_adapter = adapter_name.as_deref().map(load_named_adapter);
             let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
             let inv = investigate::investigate_with(
                 &question,
@@ -648,7 +605,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 cli_adapter.as_ref(),
                 sidecar.as_deref(),
             )
-            .map_err(|e| format!("backend failed: {e}"))?;
+            .map_err(|e| CliError::Backend(format!("backend failed: {e}")))?;
             for step in &inv.trail {
                 println!(
                     "[tool] {} ({}) -> {}",
@@ -664,9 +621,8 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "open-in-gridcraft" => {
-            let file = args
-                .get(2)
-                .ok_or("usage: gridtalk open-in-gridcraft <file>")?;
+            let parsed = cli::parse(cmd, rest, &[])?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
             let bin = gridcraft_binary().ok_or(
                 "Gridcraft binary not found. Build it once with: cargo build --manifest-path vendor/gridcraft/Cargo.toml -p gridcraft (or set GRIDTALK_GRIDCRAFT_BIN)",
             )?;
@@ -679,16 +635,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "generate" => {
-            let model = args
-                .get(2)
-                .ok_or("usage: gridtalk generate <model.gguf> <prompt...>")?;
-            let prompt = args[3..].join(" ");
-            if prompt.trim().is_empty() {
-                return Err(
-                    "usage: gridtalk generate <model.gguf> <prompt...> (prompt must not be empty)"
-                        .into(),
-                );
-            }
+            let (model, prompt) = file_and_text(cmd, rest, "model.gguf", "prompt")?;
             let backend = gridtalk_infer::llama_backend::LlamaCppBackend {
                 model_path: std::path::PathBuf::from(model),
                 ..gridtalk_infer::llama_backend::LlamaCppBackend::default()
@@ -699,9 +646,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 max_tokens: 128,
             };
             let cancel = Arc::new(AtomicBool::new(false));
-            let stats = backend
-                .generate_with_stats(&req, &cancel, &mut |tok| print!("{tok}"))
-                .map_err(|e| e.to_string())?;
+            let mut sink = cli::TokenSink::new(&cancel);
+            let generated = backend.generate_with_stats(&req, &cancel, &mut |tok| sink.write(tok));
+            if sink.closed {
+                return Ok(());
+            }
+            let stats = generated.map_err(|e| CliError::Backend(e.to_string()))?;
             println!(
                 "\n\n[bench] llama.cpp/Vulkan prompt_tokens={} generated={} first_token_ms={:?} total_ms={:.0} tok/s={:.1}",
                 stats.prompt_tokens,
@@ -717,20 +667,23 @@ fn run(args: &[String]) -> Result<(), String> {
             // --allow-write is accepted for forward compatibility;
             // there are no write tools yet either way (what_if is
             // simulation-only), so it currently changes nothing.
-            // Anything else is a typo and must not be silently ignored.
+            // --root repeats, so this does not use cli::parse.
             let mut options = mcp::McpOptions::default();
-            let mut rest = args[2..].iter();
-            while let Some(arg) = rest.next() {
+            let mut args = rest.iter();
+            while let Some(arg) = args.next() {
                 let mut value = |flag: &str| {
-                    rest.next()
-                        .ok_or_else(|| format!("{flag} needs a value"))
+                    args.next()
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| cli::usage(cmd, format!("{flag} needs a value")))
                         .cloned()
                 };
                 match arg.as_str() {
                     "--allow-write" => eprintln!(
                         "gridtalk: warning: --allow-write is a no-op (no write tools exist yet)"
                     ),
-                    "--root" => options.add_root(std::path::Path::new(&value("--root")?))?,
+                    "--root" => options
+                        .add_root(std::path::Path::new(&value("--root")?))
+                        .map_err(|e| cli::usage(cmd, e))?,
                     "--timeout" => {
                         let secs = value("--timeout")?;
                         let secs: u64 = secs
@@ -738,7 +691,10 @@ fn run(args: &[String]) -> Result<(), String> {
                             .ok()
                             .filter(|s| (1..=86_400).contains(s))
                             .ok_or_else(|| {
-                                format!("--timeout must be 1 to 86400 seconds, got {secs}")
+                                cli::usage(
+                                    cmd,
+                                    format!("--timeout must be 1 to 86400 seconds, got {secs}"),
+                                )
                             })?;
                         options.call_timeout = std::time::Duration::from_secs(secs);
                     }
@@ -749,27 +705,20 @@ fn run(args: &[String]) -> Result<(), String> {
                             .ok()
                             .filter(|m| (1..=1 << 30).contains(m))
                             .ok_or_else(|| {
-                                format!("--memory-budget must be a positive number of MiB, got {mib}")
+                                cli::usage(cmd, format!("--memory-budget must be a positive number of MiB, got {mib}"))
                             })?;
                         options.memory_budget = mib << 20;
                     }
-                    other => {
-                        return Err(format!(
-                            "unknown argument {other} for `gridtalk mcp` (expected --root <dir>, --timeout <seconds>, --memory-budget <MiB> or --allow-write)"
-                        ))
-                    }
+                    other => return Err(cli::usage(cmd, format!("unknown argument {other}"))),
                 }
             }
-            mcp::serve_stdio(options)
+            Ok(mcp::serve_stdio(options)?)
         }
         "tools" => {
-            // gridtalk tools list
-            // gridtalk tools call <file> '<json ToolRequest>'
-            match args.get(2).map(|s| s.as_str()) {
+            let sub_args = rest.get(1..).unwrap_or_default();
+            match rest.first().map(String::as_str) {
                 Some("list") => {
-                    if args.len() > 3 {
-                        return Err("usage: gridtalk tools list (no extra arguments)".into());
-                    }
+                    cli::parse(cmd, sub_args, &[])?.positionals(cmd, &[], 0)?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&tools::ToolRequest::schemas()).unwrap()
@@ -777,20 +726,13 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("call") => {
-                    if args.len() > 5 {
-                        return Err("usage: gridtalk tools call <file> '<json>'".into());
-                    }
-                    let file = args
-                        .get(3)
-                        .ok_or("usage: gridtalk tools call <file> '<json>'")?;
-                    let json = args
-                        .get(4)
-                        .ok_or("usage: gridtalk tools call <file> '<json>'")?;
-                    let wb = load_workbook(file)?;
-                    let (graph, violations) = build_graph(&wb);
-                    if !violations.is_empty() {
-                        return Err(format!("graph invariants violated: {violations:?}"));
-                    }
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let positional = parsed.positionals(cmd, &["<file>", "'<json>'"], 0)?;
+                    let (file, json) = (&positional[0], &positional[1]);
+                    // The request is checked before the workbook loads.
+                    let req: tools::ToolRequest = serde_json::from_str(json)
+                        .map_err(|e| cli::usage(cmd, format!("invalid tool request JSON: {e}")))?;
+                    let (wb, graph) = workbook_and_graph(file)?;
                     let hybrid = HybridIndex::build(&wb, &graph);
                     let toolset = tools::Tools {
                         wb: &wb,
@@ -798,11 +740,9 @@ fn run(args: &[String]) -> Result<(), String> {
                         hybrid: &hybrid,
                         calc: &gridtalk_graph::eval::EvalCache::new(),
                     };
-                    let req: tools::ToolRequest = serde_json::from_str(json)
-                        .map_err(|e| format!("invalid tool request JSON: {e}"))?;
                     let result = toolset.call(&req);
                     // Print the result exactly once; a failed call
-                    // exits 1 without duplicating the error text.
+                    // exits 5 without repeating the error text.
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
@@ -810,14 +750,16 @@ fn run(args: &[String]) -> Result<(), String> {
                     if result.ok {
                         Ok(())
                     } else {
-                        std::process::exit(1);
+                        Err(CliError::ToolFailed)
                     }
                 }
-                _ => Err("usage: gridtalk tools list | gridtalk tools call <file> '<json>'".into()),
+                Some(other) => Err(cli::usage(cmd, format!("unknown subcommand {other:?}"))),
+                None => Err(cli::usage(cmd, "missing subcommand")),
             }
         }
         "spike" => {
-            let file = args.get(2).ok_or("usage: gridtalk spike <model.gguf>")?;
+            let parsed = cli::parse(cmd, rest, &[])?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
             let report = gridtalk_infer::probe::probe_model(std::path::Path::new(file));
             println!(
                 "{}: header_ok={} arch={:?} tensors={:?} — {}",
@@ -830,19 +772,19 @@ fn run(args: &[String]) -> Result<(), String> {
             if report.header_ok {
                 Ok(())
             } else {
-                Err("model header did not validate".into())
+                Err(CliError::Input("model header did not validate".into()))
             }
         }
         "models" => {
             let mgr = gridtalk_infer::models::ModelManager::default_cache();
-            match args.get(2).map(|s| s.as_str()) {
+            let sub_args = rest.get(1..).unwrap_or_default();
+            match rest.first().map(String::as_str) {
                 Some("import") => {
-                    let src = args
-                        .get(3)
-                        .ok_or("usage: gridtalk models import <file.gguf>")?;
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let src = &parsed.positionals(cmd, &["<file.gguf>"], 0)?[0];
                     let entry = mgr
                         .import(std::path::Path::new(src))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| CliError::Input(e.to_string()))?;
                     println!(
                         "imported {} ({} bytes) -> {}",
                         entry.name,
@@ -852,23 +794,27 @@ fn run(args: &[String]) -> Result<(), String> {
                     Ok(())
                 }
                 Some("remove") => {
-                    let name = args.get(3).ok_or("usage: gridtalk models remove <name>")?;
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
                     mgr.remove(name).map_err(|e| e.to_string())?;
                     println!("removed {name}");
                     Ok(())
                 }
                 Some("download") => {
-                    let usage = "usage: gridtalk models download <http(s)://…/file.gguf> [name]";
-                    let url = args.get(3).ok_or(usage)?;
+                    let parsed = cli::parse(cmd, sub_args, &[])?;
+                    let positional = parsed.positionals(cmd, &["<url>"], 1)?;
+                    let url = &positional[0];
                     // Default name: the URL's last path segment.
-                    let name = match args.get(4) {
+                    let name = match positional.get(1) {
                         Some(n) => n.clone(),
                         None => url
                             .split(['?', '#'])
                             .next()
                             .and_then(|u| u.rsplit('/').next())
                             .filter(|n| !n.is_empty())
-                            .ok_or("cannot derive a model name from the URL; pass one")?
+                            .ok_or_else(|| {
+                                cli::usage(cmd, "cannot derive a model name from the URL; pass one")
+                            })?
                             .to_string(),
                     };
                     let entry = mgr.download_http(url, &name).map_err(|e| e.to_string())?;
@@ -880,10 +826,8 @@ fn run(args: &[String]) -> Result<(), String> {
                     );
                     Ok(())
                 }
-                Some(other) => Err(format!(
-                    "unknown models subcommand {other:?}; usage: gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]"
-                )),
-                _ => {
+                Some(other) => Err(cli::usage(cmd, format!("unknown subcommand {other:?}"))),
+                None => {
                     let entries = mgr.list();
                     if entries.is_empty() {
                         println!("no models in {}", mgr.dir.display());
@@ -901,11 +845,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        "help" | "--help" | "-h" => {
-            println!("GridTalk — talk to your spreadsheet, locally.\n\nUsage:\n  gridtalk ask <file.csv|tsv|xlsx|xlsm|xltx|xltm|xls|xlsb|ods> <question...>\n  gridtalk investigate <file> <question...>\n  gridtalk bench generate <file> [--out tasks.json] | bench run <file> [--card CARD.md] [--adapter <name>]\n  gridtalk optimise <file> [--adapter <name>] [--rounds 3]\n  gridtalk adapter list|show <name>|rollback <name>|export <name> [--out AGENTS.md]\n  gridtalk graph <file>\n  gridtalk view <file>\n  gridtalk spike <model.gguf>\n  gridtalk tools list | tools call <file> '<json>'\n  gridtalk mcp [--root <dir>]... [--timeout <seconds>] [--memory-budget <MiB>]  (MCP server over stdio)\n  gridtalk generate <model.gguf> <prompt...>\n  gridtalk models [import <file.gguf>|download <url> [name]|remove <name>]\n  gridtalk open-in-gridcraft <file>\n\nConfig: GRIDTALK_CONFIG=/path/to/config.toml (default: local echo backend)");
-            Ok(())
-        }
-        _ => unreachable!("COMMANDS guard rejects unknown commands before dispatch"),
+        // The command table and this match list the same commands
+        // (help and version are answered above).
+        other => Err(CliError::Other(format!(
+            "command {other:?} is in the help table but not implemented"
+        ))),
     }
 }
 
@@ -995,8 +939,9 @@ fn load_named_adapter(name: &str) -> adapter::Adapter {
 
 /// Load a workbook, printing the reader's warnings (parts it skipped
 /// or could not import) to stderr so a partial import is never silent.
-fn load_workbook(file: &str) -> Result<WorkbookSnapshot, String> {
-    let wb = load_path(std::path::Path::new(file)).map_err(|e| e.to_string())?;
+fn load_workbook(file: &str) -> Result<WorkbookSnapshot, CliError> {
+    let wb = load_path(std::path::Path::new(file))
+        .map_err(|e| CliError::Input(format!("{file}: {e}")))?;
     for w in &wb.warnings {
         eprintln!("gridtalk: warning: {file}: {w}");
     }
