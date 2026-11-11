@@ -1099,7 +1099,7 @@ impl GridTalkApp {
                     write_atomic_bytes(path, text.as_bytes())
                 }
             }
-            "ods" | "xls" | "xlsb" => Err(format!(
+            e if gridtalk_graph::PACKAGE_EXTENSIONS.contains(&e) => Err(format!(
                 ".{ext} is read-only in GridTalk; use Save As to write .xlsx or .csv"
             )),
             _ => Err(format!("cannot save .{ext}; use .xlsx or .csv")),
@@ -1135,12 +1135,15 @@ impl GridTalkApp {
 
 /// What the Open dialog offers: CSV/TSV and every format
 /// `gridtalk_graph` reads through Gridcraft.
-const OPEN_EXTENSIONS: [&str; 9] = [
-    "csv", "tsv", "xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb", "ods",
-];
+fn open_extensions() -> Vec<&'static str> {
+    ["csv", "tsv"]
+        .into_iter()
+        .chain(gridtalk_graph::PACKAGE_EXTENSIONS.iter().copied())
+        .collect()
+}
 
 /// Hover text for the save buttons: what an .xlsx save keeps.
-const SAVE_HOVER: &str = "Saving .xlsx keeps what was read from the opened file (formatting, merges, tables, charts), with your edits applied; anything it could not read was listed when it opened. .csv and .tsv hold one sheet's cells. Macros are kept only in .xlsm; .xls, .xlsb and .ods files are read-only";
+const SAVE_HOVER: &str = "Saving .xlsx keeps what was read from the opened file (formatting, merges, tables, charts), with your edits applied; anything it could not read was listed when it opened. .csv and .tsv hold one sheet's cells. Macros are kept only in .xlsm and .xltm; .xls, .xlsb and .ods files are read-only";
 
 /// A status line for edits dropped since `before` (the dropped-edit
 /// count before a flush), or `None` when every edit was applied.
@@ -1409,7 +1412,7 @@ impl eframe::App for GridTalkApp {
             ui.horizontal(|ui| {
                 if ui.button("Open…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Spreadsheets", &OPEN_EXTENSIONS)
+                        .add_filter("Spreadsheets", &open_extensions())
                         .pick_file()
                     {
                         self.open(&path);

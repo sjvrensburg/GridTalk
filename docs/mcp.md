@@ -68,7 +68,8 @@ case-insensitively, and cells must lie inside the sheet grid
 - `open_workbook`: returns `workbook_id`, `sheets`, `regions` and
   `warnings` (what the file reader skipped or could not import, e.g.
   the formulas of an `.xlsb` or ODS file, which are imported as their
-  saved results: the first warning of an `.xlsb` file says so). Files
+  saved results: the first warning of such a file says what that means
+  for the graph and the tools). Files
   are read by their content, so an `.xls` that is really an XLSX
   package opens, with a warning; an encrypted workbook is refused with
   `open_failed`. `.xls` files keep their formulas; `.xlsm`/`.xltm`

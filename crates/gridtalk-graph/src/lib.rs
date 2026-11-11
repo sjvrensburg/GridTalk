@@ -128,7 +128,7 @@ pub struct WorkbookSnapshot {
     /// Shown to users so a partial import is never silent.
     #[serde(default)]
     pub warnings: Vec<String>,
-    /// The Gridcraft workbook an XLSX/ODS snapshot was read from
+    /// The Gridcraft workbook a non-CSV/TSV snapshot was read from
     /// (decision 0005). It carries everything the snapshot does not
     /// model: styles, merges, tables, array formulas, error values,
     /// the date system, charts. [`to_gridcraft_workbook`] starts from
@@ -448,10 +448,10 @@ impl From<std::io::Error> for IngestError {
 
 /// Ingestion cap for CSV/TSV files.
 pub const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
-/// Ingestion cap for XLSX/ODS packages.
+/// Ingestion cap for the files in [`PACKAGE_EXTENSIONS`].
 pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Largest total unpacked size an XLSX/ODS package may declare: room
+/// Largest total unpacked size a zip package may declare: room
 /// for a sheet at [`MAX_SNAPSHOT_CELLS`] plus its strings and styles,
 /// and half of what Gridcraft's reader allows (1 GiB).
 pub const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
@@ -535,9 +535,9 @@ fn check_ingestible(ext: &str, len: u64) -> Result<(), IngestError> {
     }
 }
 
-/// Load a workbook snapshot from a path. CSV/TSV are fully supported.
-/// XLSX/ODS go through the Gridcraft engine. XLSB/XLS are explicitly
-/// out of scope (see plan Phase 2). Unsupported or oversized files
+/// Load a workbook snapshot from a path. CSV/TSV are parsed here;
+/// every format in [`PACKAGE_EXTENSIONS`] goes through the Gridcraft
+/// engine ([`load_gridcraft_bytes`]). Unsupported or oversized files
 /// are rejected before more than the cap is read
 /// ([`read_workbook_bytes`]).
 pub fn load_path(path: &std::path::Path) -> Result<WorkbookSnapshot, IngestError> {
@@ -592,9 +592,14 @@ pub fn load_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<WorkbookSnapsh
     }
 }
 
-/// What GridTalk adds to Gridcraft's own warning for an XLSB file:
-/// what values-only means for the graph and the tools.
-pub const XLSB_VALUES_ONLY_WARNING: &str = "Opened as values only: GridTalk cannot read .xlsb formulas yet, so every formula cell holds its last saved result as a constant. There are no formula dependencies in the graph, list_formulas finds none, and what_if changes nothing downstream. For live formulas, save the workbook as .xlsx in Excel and open that.";
+/// What GridTalk puts before Gridcraft's own warning for a format it
+/// reads as values only (`xlsb`, `ods`): what that means for the graph
+/// and the tools. It is a workbook's first warning.
+pub fn values_only_warning(format: &str) -> String {
+    format!(
+        "Opened as values only: GridTalk cannot read .{format} formulas yet, so every formula cell holds its last saved result as a constant. There are no formula dependencies in the graph, list_formulas finds none, and what_if changes nothing downstream. For live formulas, save the workbook as .xlsx and open that."
+    )
+}
 
 /// One of Gridcraft's readers (`read_xlsx`, `read_xls`, ...).
 type GridcraftReader =
@@ -615,6 +620,10 @@ pub fn load_gridcraft_bytes(
     bytes: &[u8],
 ) -> Result<WorkbookSnapshot, IngestError> {
     use gridcraft_xlsx::Format;
+    // Before sniffing, which already unpacks a zip package's content
+    // types and relationships. Bytes that are not a zip (an XLS
+    // compound file) pass; the XLS reader bounds its own records.
+    check_package_unpacked(bytes)?;
     let format = gridcraft_xlsx::sniff(bytes);
     let (read, label, expected): (GridcraftReader, &str, &[&str]) = match format {
         Format::Xlsx => (
@@ -641,10 +650,6 @@ pub fn load_gridcraft_bytes(
             )))
         }
     };
-    // Zip packages only: the XLS reader bounds its own records.
-    if format != Format::Xls {
-        check_package_unpacked(bytes)?;
-    }
     let (wb, report) =
         read(bytes).map_err(|e| IngestError::Parse(format!("gridcraft {label} reader: {e}")))?;
     let mut snapshot = from_gridcraft_workbook(name, &wb)?;
@@ -654,8 +659,10 @@ pub fn load_gridcraft_bytes(
             "this .{ext} file holds {label} content and was read as {label}"
         ));
     }
-    if format == Format::Xlsb {
-        warnings.push(XLSB_VALUES_ONLY_WARNING.to_string());
+    match format {
+        Format::Xlsb => warnings.push(values_only_warning("xlsb")),
+        Format::Ods => warnings.push(values_only_warning("ods")),
+        _ => {}
     }
     warnings.extend(report.warnings);
     snapshot.warnings = warnings;
@@ -1031,10 +1038,11 @@ pub(crate) fn gridcraft_names(wb: &WorkbookSnapshot) -> Vec<gridcraft_model::Def
         .collect()
 }
 
-/// Serialise a snapshot to XLSX bytes via Gridcraft (used for
-/// fixtures and Save-As). Formulas are written as formulas; a
-/// snapshot read from XLSX/ODS keeps what its source workbook has
-/// beyond cells (see [`to_gridcraft_workbook`]).
+/// Serialise a snapshot to `.xlsx` bytes via Gridcraft (used by
+/// tests and fixtures). Formulas are written as formulas; a
+/// snapshot read through Gridcraft keeps what its source workbook has
+/// beyond cells (see [`to_gridcraft_workbook`]), except a VBA project,
+/// which only [`to_package_bytes`] with `.xlsm`/`.xltm` writes.
 pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
     to_package_bytes(wb, "xlsx")
 }
@@ -2897,7 +2905,9 @@ mod tests {
         assert_eq!(wb.sheets[0].get(0, 0), CellValue::Text("Item".into()));
         assert_eq!(wb.sheets[0].get(1, 0), CellValue::Text("Apples".into()));
         assert_eq!(wb.sheets[0].get(1, 1), CellValue::Number(2.0));
-        // Gridcraft's ODS import is data-only; that must reach the user.
+        // Gridcraft's ODS import is data-only; that must reach the user,
+        // GridTalk's explanation first.
+        assert_eq!(wb.warnings[0], values_only_warning("ods"));
         assert!(wb.warnings.iter().any(|w| w.contains("data-only")));
     }
 

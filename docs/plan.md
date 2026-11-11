@@ -24,7 +24,7 @@ supports it unchanged by pointing `base_url` at the proxy.
 
 - [x] Snapshot interchange type (`WorkbookSnapshot` / `SheetSnapshot`)
 - [x] CSV/TSV ingestion incl. quoted fields, type inference, formulas
-- [x] Typed `UnsupportedFormat` errors for XLSB/XLS/XLSM (explicit, not silent)
+- [x] Typed `UnsupportedFormat` errors for unsupported formats (explicit, not silent); XLSB/XLS/XLSM were refused here until they were accepted (below)
 - [x] XLSX/ODS via Gridcraft `xlsx` crate (`load_gridcraft_bytes`, XLSX round-trip + ODS fixture tests). Known limits: ODS is data-only (Gridcraft imports formula results as constants, so what-if on `.ods` changes nothing; the reader's warning says so), and XLSX save writes the source Gridcraft workbook with the edits overlaid, so it keeps what Gridcraft read (decision 0005)
 - [x] Incremental dirty-range re-snapshot (`IncrementalSnapshot`: 500 ms debounce, dirty-range list, revision counter). Known limits: the UI never consumes the dirty ranges (each edit rebuilds the whole graph and index), and an edit that cannot be applied is reported in the UI status
 - [x] egui grid+chat shell (`gridtalk-ui`: editable grid, chat pane, settings window) — on egui/eframe directly; Gridcraft `ui-egui` ribbon reuse remains a later swap

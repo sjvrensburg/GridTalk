@@ -9,8 +9,8 @@ use gridcraft_model::{Cell, Formula, Workbook};
 use gridcraft_xlsx::{testing, write_xlsx_as, XlsxKind};
 use gridtalk_graph::eval::{eval_cell_value_in_workbook, Value as EvalValue};
 use gridtalk_graph::{
-    build_graph, has_macros, load_bytes, to_package_bytes, CellValue, IngestError,
-    WorkbookSnapshot, XLSB_VALUES_ONLY_WARNING,
+    build_graph, has_macros, load_bytes, to_package_bytes, values_only_warning, CellValue,
+    IngestError, WorkbookSnapshot,
 };
 use std::io::Write;
 use std::path::Path;
@@ -250,7 +250,8 @@ fn xlsb_opens_as_values_only_with_a_warning() {
     // The formula is its saved result, a constant.
     assert_eq!(wb.sheets[0].get(2, 0), CellValue::Number(5.0));
     assert_eq!(
-        wb.warnings[0], XLSB_VALUES_ONLY_WARNING,
+        wb.warnings[0],
+        values_only_warning("xlsb"),
         "{:?}",
         wb.warnings
     );
