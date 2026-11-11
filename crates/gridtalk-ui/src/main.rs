@@ -5,8 +5,11 @@
 //! surface, see docs/decisions/0001).
 
 mod eval_worker;
+mod find;
+mod history;
 mod layout;
 
+use egui::{Key, KeyboardShortcut, Modifiers};
 use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
@@ -19,6 +22,7 @@ use gridtalk_graph::{
 use gridtalk_index::HybridIndex as Index;
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, cleartext_url_warning, cleartext_warning, ChatRequest};
+use history::History;
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -231,6 +235,13 @@ impl SyncState {
             self.selected_range = n.range.clone();
         }
     }
+    /// Select a whole range, highlighting the node of its first cell.
+    pub fn select_range(&mut self, graph: &Graph, range: &RangeRef) {
+        self.highlighted_node = graph
+            .node_for_cell(&range.sheet, range.r0, range.c0)
+            .map(|n| n.id);
+        self.selected_range = Some(range.clone());
+    }
     pub fn select_cell(&mut self, graph: &Graph, sheet: &str, row: usize, col: usize) {
         self.selected_range = Some(RangeRef {
             sheet: sheet.into(),
@@ -294,6 +305,8 @@ fn node_for_selection(graph: &Graph, sel: &RangeRef) -> Option<usize> {
 struct ChatMsg {
     role: String,
     text: String,
+    /// The ranges an answer was given as context (its "Sources:").
+    sources: Vec<RangeRef>,
 }
 
 pub struct GridTalkApp {
@@ -360,6 +373,29 @@ pub struct GridTalkApp {
     chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
     chat_busy: bool,
     chat_started: Option<std::time::Instant>,
+    /// The context ranges of the answer being generated.
+    chat_sources: Vec<RangeRef>,
+    /// Chat messages removed to keep the log short (shown as a note).
+    chat_dropped: usize,
+    /// Grid edits that undo and redo walk through.
+    history: History,
+    /// The grid cell editor that had the keyboard last frame, if any.
+    grid_editor_focus: Option<egui::Id>,
+    /// The find bar (Ctrl+F): open, its query, the matches for that
+    /// query at `find_revision`, and the match shown.
+    find_open: bool,
+    find_focus: bool,
+    find_query: String,
+    find_matches: Vec<find::Match>,
+    find_for: Option<(String, u64)>,
+    find_pos: usize,
+    /// The backend as edited in Settings (loaded with the model
+    /// settings).
+    set_backend: String,
+    set_model_path: String,
+    set_base_url: String,
+    set_model: String,
+    set_api_key_env: String,
 }
 
 impl Default for GridTalkApp {
@@ -448,6 +484,21 @@ impl GridTalkApp {
             chat_rx: None,
             chat_busy: false,
             chat_started: None,
+            chat_sources: Vec::new(),
+            chat_dropped: 0,
+            history: History::default(),
+            grid_editor_focus: None,
+            find_open: false,
+            find_focus: false,
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_for: None,
+            find_pos: 0,
+            set_backend: String::new(),
+            set_model_path: String::new(),
+            set_base_url: String::new(),
+            set_model: String::new(),
+            set_api_key_env: String::new(),
             wizard_step: 0,
             wizard_backend: "local".into(),
             wizard_model_path: String::new(),
@@ -603,17 +654,26 @@ fn validate_wizard(backend: &str, model_path: &str, base_url: &str) -> Result<()
     }
 }
 
+/// Chat messages kept; older ones are dropped, and the log says so.
+const MAX_CHAT: usize = 200;
+
 impl GridTalkApp {
     fn push_chat(&mut self, role: &str, text: String) {
+        self.push_chat_with_sources(role, text, Vec::new());
+    }
+
+    fn push_chat_with_sources(&mut self, role: &str, text: String, sources: Vec<RangeRef>) {
         self.chat.push(ChatMsg {
             role: role.into(),
             text,
+            sources,
         });
-        // Cap history so per-frame layout cost stays bounded.
-        const MAX_CHAT: usize = 200;
+        // Cap history so per-frame layout cost stays bounded; the log
+        // says how many messages went.
         if self.chat.len() > MAX_CHAT {
             let drop = self.chat.len() - MAX_CHAT;
             self.chat.drain(..drop);
+            self.chat_dropped += drop;
         }
     }
 
@@ -659,6 +719,11 @@ impl GridTalkApp {
                 }
                 self.chat_cancel = None;
                 self.chat.clear();
+                self.chat_dropped = 0;
+                self.chat_sources.clear();
+                self.history.clear();
+                self.find_matches.clear();
+                self.find_for = None;
                 self.chat_rx = None;
                 self.chat_busy = false;
                 self.chat_started = None;
@@ -884,6 +949,7 @@ impl GridTalkApp {
                 self.sync.select_node(&self.graph, id);
             }
         }
+        self.chat_sources = hits.iter().map(|h| h.range.clone()).collect();
         let context = hits
             .iter()
             .map(|h| format!("[{}]\n{}", h.range.a1(), h.passage))
@@ -936,6 +1002,383 @@ impl GridTalkApp {
         });
     }
 
+    /// Pick a file to open (the Open button and Ctrl+O).
+    fn open_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Spreadsheets", &open_extensions())
+            .pick_file()
+        {
+            self.open(&path);
+        } else {
+            self.status = "Open cancelled.".into();
+        }
+    }
+
+    /// Keyboard shortcuts: Ctrl+S save, Ctrl+O open, Ctrl+F find,
+    /// Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo (Cmd on macOS), Escape
+    /// closes the find bar. Undo and redo act on grid edits unless a
+    /// text field is being typed in, so a cell editor keeps egui's own
+    /// text undo while it is being typed in; a grid cell that was only
+    /// clicked into (not typed in yet) has no text to undo.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let pressed = |modifiers: Modifiers, key: Key| {
+            ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(modifiers, key)))
+        };
+        if pressed(Modifiers::COMMAND, Key::S) {
+            self.save();
+        }
+        if pressed(Modifiers::COMMAND, Key::O) {
+            self.open_dialog();
+        }
+        if pressed(Modifiers::COMMAND, Key::F) {
+            self.find_open = true;
+            self.find_focus = true;
+        }
+        if self.find_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.find_open = false;
+        }
+        let typing_in_field = ctx
+            .memory(|m| m.focused())
+            .is_some_and(|id| Some(id) != self.grid_editor_focus || self.history.typing());
+        if typing_in_field {
+            return;
+        }
+        // Redo first: Ctrl+Z would also match Ctrl+Shift+Z.
+        if pressed(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+            || pressed(Modifiers::COMMAND, Key::Y)
+        {
+            self.redo();
+        } else if pressed(Modifiers::COMMAND, Key::Z) {
+            self.undo();
+        }
+    }
+
+    fn undo(&mut self) {
+        self.step_history(true);
+    }
+
+    fn redo(&mut self) {
+        self.step_history(false);
+    }
+
+    /// Undo (`back`) or redo one grid edit.
+    fn step_history(&mut self, back: bool) {
+        if self.is_read_only() {
+            let verb = if back { "undone" } else { "redone" };
+            self.status = format!("Read-only mode is on: nothing is {verb}.");
+            return;
+        }
+        let change = if back {
+            self.history.undo()
+        } else {
+            self.history.redo()
+        };
+        let Some(change) = change else {
+            self.status = format!("Nothing to {}.", if back { "undo" } else { "redo" });
+            return;
+        };
+        let cell = gridtalk_graph::CellRef {
+            sheet: change.sheet.clone(),
+            row: change.row,
+            col: change.col,
+        }
+        .a1();
+        let value = if back { change.before } else { change.after };
+        self.apply_change(&change.sheet, change.row, change.col, value);
+        self.status = if back {
+            format!("Undid the edit of {cell} (Ctrl+Y redoes it).")
+        } else {
+            format!("Redid the edit of {cell}.")
+        };
+    }
+
+    /// Set a cell for undo or redo: record the edit (not in the
+    /// history), show the value in its editor, and select the cell.
+    fn apply_change(
+        &mut self,
+        sheet: &str,
+        row: usize,
+        col: usize,
+        value: gridtalk_graph::CellValue,
+    ) {
+        let Some(inc) = &mut self.inc else {
+            return;
+        };
+        let Some(sheet_idx) = inc
+            .snapshot()
+            .sheets
+            .iter()
+            .position(|s| gridtalk_graph::sheet_name_eq(&s.name, sheet))
+        else {
+            return;
+        };
+        self.edit_buffers
+            .insert((sheet_idx, row, col), cell_input_text(&value));
+        inc.record_edit(
+            CellEdit {
+                sheet: sheet.to_string(),
+                row,
+                col,
+                value,
+            },
+            std::time::Instant::now(),
+        );
+        self.select_on_sheet(
+            sheet_idx,
+            &RangeRef {
+                sheet: sheet.to_string(),
+                r0: row,
+                c0: col,
+                r1: row,
+                c1: col,
+            },
+        );
+    }
+
+    /// Show `range`'s sheet and select the range (the grid scrolls to
+    /// it).
+    fn select_on_sheet(&mut self, sheet_idx: usize, range: &RangeRef) {
+        self.selected_sheet = sheet_idx;
+        self.sync.select_range(&self.graph, range);
+    }
+
+    /// Select a range named by sheet (a chat answer's source).
+    fn select_source(&mut self, range: &RangeRef) {
+        let idx = self.inc.as_ref().and_then(|inc| {
+            inc.snapshot()
+                .sheets
+                .iter()
+                .position(|s| gridtalk_graph::sheet_name_eq(&s.name, &range.sheet))
+        });
+        match idx {
+            Some(idx) => self.select_on_sheet(idx, range),
+            None => self.status = format!("{} is not in this workbook any more.", range.a1()),
+        }
+    }
+
+    /// The find matches for the current query and workbook revision.
+    fn refresh_find(&mut self) {
+        let Some(inc) = &self.inc else {
+            self.find_matches.clear();
+            return;
+        };
+        let key = (self.find_query.clone(), inc.revision);
+        if self.find_for.as_ref() != Some(&key) {
+            let snapshot = inc.snapshot();
+            self.find_matches = find::find_cells(snapshot, &self.find_query);
+            // An edit re-runs the search: carry on from the selected
+            // match, if it still is one, instead of the first.
+            let selected = self.sync.selected_range.as_ref().and_then(|sel| {
+                let s = snapshot
+                    .sheets
+                    .iter()
+                    .position(|sh| gridtalk_graph::sheet_name_eq(&sh.name, &sel.sheet))?;
+                (sel.r0 == sel.r1 && sel.c0 == sel.c1).then_some((s, sel.r0, sel.c0))
+            });
+            self.find_pos = selected
+                .and_then(|m| self.find_matches.binary_search(&m).ok())
+                .unwrap_or(0);
+            self.find_for = Some(key);
+        }
+    }
+
+    /// Go to the next (`forward`) or previous match.
+    fn find_step(&mut self, forward: bool) {
+        self.refresh_find();
+        let n = self.find_matches.len();
+        if n == 0 {
+            self.status = format!("No cell contains \"{}\".", self.find_query.trim());
+            return;
+        }
+        // The first step lands on the first match.
+        let at_start = self.sync.selected_range.is_none()
+            || self
+                .find_matches
+                .get(self.find_pos)
+                .is_none_or(|&(s, r, c)| {
+                    let name = self
+                        .inc
+                        .as_ref()
+                        .map(|i| i.snapshot().sheets[s].name.clone());
+                    self.sync.selected_range.as_ref()
+                        != Some(&RangeRef {
+                            sheet: name.unwrap_or_default(),
+                            r0: r,
+                            c0: c,
+                            r1: r,
+                            c1: c,
+                        })
+                });
+        if !at_start {
+            self.find_pos = if forward {
+                (self.find_pos + 1) % n
+            } else {
+                (self.find_pos + n - 1) % n
+            };
+        }
+        let (s, r, c) = self.find_matches[self.find_pos];
+        let Some(name) = self
+            .inc
+            .as_ref()
+            .map(|i| i.snapshot().sheets[s].name.clone())
+        else {
+            return;
+        };
+        self.select_on_sheet(
+            s,
+            &RangeRef {
+                sheet: name,
+                r0: r,
+                c0: c,
+                r1: r,
+                c1: c,
+            },
+        );
+        let more = if n >= find::MAX_MATCHES { "+" } else { "" };
+        self.status = format!("Match {} of {n}{more}.", self.find_pos + 1);
+    }
+
+    /// The find bar above the grid.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let mut step: Option<bool> = None;
+        ui.horizontal(|ui| {
+            ui.label("Find:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.find_query)
+                    .hint_text("text or formula")
+                    .desired_width(220.0),
+            );
+            if std::mem::take(&mut self.find_focus) {
+                resp.request_focus();
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                step = Some(!ui.input(|i| i.modifiers.shift));
+                // Keep typing-and-Enter going.
+                resp.request_focus();
+            }
+            if ui.button("Previous").clicked() {
+                step = Some(false);
+            }
+            if ui.button("Next").clicked() {
+                step = Some(true);
+            }
+            let found = self
+                .find_for
+                .as_ref()
+                .is_some_and(|(q, _)| *q == self.find_query);
+            if found && !self.find_query.trim().is_empty() {
+                let n = self.find_matches.len();
+                let more = if n >= find::MAX_MATCHES { "+" } else { "" };
+                ui.weak(format!("{n}{more} found"));
+            }
+            if ui.button("✕").on_hover_text("Close (Escape)").clicked() {
+                self.find_open = false;
+            }
+        });
+        if let Some(forward) = step {
+            self.find_step(forward);
+        }
+    }
+
+    /// Settings' backend section: which backend answers, and how to
+    /// reach it.
+    fn backend_settings_ui(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Inference backend");
+        ui.radio_value(
+            &mut self.set_backend,
+            "local".to_string(),
+            "Local GGUF model (private)",
+        );
+        if self.set_backend == "local" {
+            ui.horizontal(|ui| {
+                ui.label("Model .gguf:");
+                ui.text_edit_singleline(&mut self.set_model_path);
+                if ui.button("Browse…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("GGUF model", &["gguf"])
+                        .pick_file()
+                    {
+                        self.set_model_path = path.display().to_string();
+                    }
+                }
+            });
+        }
+        ui.radio_value(
+            &mut self.set_backend,
+            "openai-compatible".to_string(),
+            "OpenAI-compatible endpoint (cell values are sent verbatim)",
+        );
+        if self.set_backend == "openai-compatible" {
+            egui::Grid::new("backend-settings")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Base URL:");
+                    ui.text_edit_singleline(&mut self.set_base_url);
+                    ui.end_row();
+                    ui.label("Model name:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.set_model)
+                            .hint_text("as the endpoint names it"),
+                    );
+                    ui.end_row();
+                    ui.label("API key variable:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.set_api_key_env)
+                            .hint_text("environment variable holding the key"),
+                    );
+                    ui.end_row();
+                });
+            if let Some(warning) = cleartext_url_warning(&self.set_base_url) {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+            }
+            ui.weak("The key itself is never written to the config file.");
+        }
+        if ui.button("Save backend").clicked() {
+            self.save_backend_settings();
+        }
+    }
+
+    /// Validate and write Settings' backend to the config file in use.
+    fn save_backend_settings(&mut self) {
+        if let Err(e) = validate_wizard(
+            &self.set_backend,
+            self.set_model_path.trim(),
+            self.set_base_url.trim(),
+        ) {
+            self.status = format!("Backend not saved: {e}");
+            return;
+        }
+        let path = active_config_file(&self.config_path);
+        let optional = |v: &str| Some(v.trim()).filter(|v| !v.is_empty()).map(toml_string);
+        let updates: Vec<ConfigUpdate> = if self.set_backend == "local" {
+            vec![
+                ("backend", Some(toml_string("local"))),
+                ("engine", Some(toml_string("llamacpp"))),
+                ("model_path", optional(&self.set_model_path)),
+            ]
+        } else {
+            vec![
+                ("backend", Some(toml_string("openai-compatible"))),
+                ("base_url", optional(&self.set_base_url)),
+                ("model", optional(&self.set_model)),
+                ("api_key_env", optional(&self.set_api_key_env)),
+            ]
+        };
+        self.status = match write_inference_config(&path, &updates) {
+            Ok(()) => {
+                // The cleartext warning follows the saved backend.
+                // Only it is reloaded: unsaved GPU-layer and context
+                // edits in the section below must survive this save.
+                self.llm_cleartext = cleartext_warning(&Config::load(&path).inference);
+                format!(
+                    "Backend saved to {}; it answers the next question.",
+                    path.display()
+                )
+            }
+            Err(e) => format!("Could not save the backend to {}: {e}", path.display()),
+        };
+    }
+
     /// Load the llama.cpp settings shown in the Settings window from
     /// the config file in use.
     fn load_llm_settings(&mut self) {
@@ -945,6 +1388,19 @@ impl GridTalkApp {
         self.llm_gpu_layers = cfg.inference.n_gpu_layers.filter(|&n| n != u32::MAX);
         self.llm_n_ctx = cfg.inference.n_ctx;
         self.llm_cleartext = cleartext_warning(&cfg.inference);
+        self.set_backend = if cfg.inference.backend == "openai-compatible" {
+            "openai-compatible".into()
+        } else {
+            "local".into()
+        };
+        self.set_model_path = cfg.inference.model_path.clone().unwrap_or_default();
+        self.set_base_url = cfg
+            .inference
+            .base_url
+            .clone()
+            .unwrap_or_else(|| gridtalk_infer::DEFAULT_BASE_URL.to_string());
+        self.set_model = cfg.inference.model.clone().unwrap_or_default();
+        self.set_api_key_env = cfg.inference.api_key_env.clone().unwrap_or_default();
         self.llm_settings_loaded = true;
     }
 
@@ -1244,6 +1700,7 @@ fn snapshot_to_delimited(snapshot: &gridtalk_graph::WorkbookSnapshot, delim: cha
 impl eframe::App for GridTalkApp {
     fn ui(&mut self, ui_root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui_root.ctx().clone();
+        self.handle_shortcuts(&ctx);
         // Closing with unsaved edits needs a second, deliberate
         // close. The guard re-arms whenever the workbook is clean
         // again (saved/opened), so it works more than once.
@@ -1304,7 +1761,12 @@ impl eframe::App for GridTalkApp {
                     // Drop answers generated for a workbook that is
                     // no longer open.
                     if wb_tag == self.chat_workbook && wb_tag == self.workbook_name {
-                        self.push_chat(&role, text);
+                        let sources = if role == "error" {
+                            Vec::new()
+                        } else {
+                            std::mem::take(&mut self.chat_sources)
+                        };
+                        self.push_chat_with_sources(&role, text, sources);
                     }
                     self.chat_rx = None;
                     self.chat_busy = false;
@@ -1410,20 +1872,13 @@ impl eframe::App for GridTalkApp {
 
         egui::Panel::top("menu").show(ui_root, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Spreadsheets", &open_extensions())
-                        .pick_file()
-                    {
-                        self.open(&path);
-                    } else {
-                        self.status = "Open cancelled.".into();
-                    }
+                if ui.button("Open…").on_hover_text("Ctrl+O").clicked() {
+                    self.open_dialog();
                 }
                 let save_label = if self.dirty() { "Save ●" } else { "Save" };
                 if ui
                     .add_enabled(!self.is_read_only(), egui::Button::new(save_label))
-                    .on_hover_text(SAVE_HOVER)
+                    .on_hover_text(format!("{SAVE_HOVER} (Ctrl+S)"))
                     .on_disabled_hover_text("Read-only mode is on")
                     .clicked()
                 {
@@ -1722,6 +2177,8 @@ impl eframe::App for GridTalkApp {
                     ui.colored_label(ui.visuals().warn_fg_color, format!("Warning: {warning}"));
                 }
                 ui.separator();
+                self.backend_settings_ui(ui);
+                ui.separator();
                 self.llm_settings_ui(ui);
                 ui.separator();
                 if ui.button("Close").clicked() {
@@ -1771,8 +2228,14 @@ impl GridTalkApp {
             .min_size(CHAT_PANEL_MIN_HEIGHT)
             .max_size(max_chat)
             .show(ui, |ui| self.chat_section(ui));
+        if self.find_open {
+            self.find_bar(ui);
+        }
         // Collect edits/clicks while rendering; apply after.
         let mut pending_edit: Option<CellEdit> = None;
+        // An editor that lost focus ends its typing session for undo.
+        let mut typing_ended = false;
+        let mut focused_editor: Option<egui::Id> = None;
         let mut clicked_cell: Option<(String, usize, usize)> = None;
         // Sheet tabs need the sheet list; take names from the cached
         // sheet plus the snapshot sheet count via inc (names only).
@@ -1907,6 +2370,9 @@ impl GridTalkApp {
                                 // editor even once its debounced edit
                                 // lands as a formula.
                                 let editing = ui.memory(|m| m.has_focus(editor_id));
+                                if editing {
+                                    focused_editor = Some(editor_id);
+                                }
                                 let show_value = is_formula && !show_formulas && !editing;
                                 if read_only || show_value {
                                     // Not editable here: a clickable,
@@ -1982,6 +2448,9 @@ impl GridTalkApp {
                                 if resp.clicked() {
                                     clicked_cell = Some((sheet_name.clone(), r, c));
                                 }
+                                if resp.lost_focus() {
+                                    typing_ended = true;
+                                }
                                 if resp.changed() {
                                     pending_edit = Some(CellEdit {
                                         sheet: sheet_name.clone(),
@@ -2031,14 +2500,31 @@ impl GridTalkApp {
         // Read-only cells are not editors, but never record an edit
         // in read-only mode whatever the source.
         let pending_edit = pending_edit.filter(|_| !self.is_read_only());
-        if let (Some(edit), Some(inc)) = (pending_edit, &mut self.inc) {
-            inc.record_edit(edit, std::time::Instant::now());
+        if let Some(edit) = pending_edit {
+            self.record_grid_edit(edit);
         }
+        if typing_ended {
+            self.history.end_typing();
+        }
+        self.grid_editor_focus = focused_editor;
+    }
+
+    /// An edit typed into the grid: recorded for undo with the value
+    /// it replaces (pending edits included), then queued.
+    fn record_grid_edit(&mut self, edit: CellEdit) {
+        let Some(inc) = &mut self.inc else {
+            return;
+        };
+        let before = inc.current_value(&edit.sheet, edit.row, edit.col);
+        self.history
+            .record(&edit.sheet, edit.row, edit.col, before, edit.value.clone());
+        inc.record_edit(edit, std::time::Instant::now());
     }
 
     /// Chat log and input, drawn in the bottom panel under the grid.
     fn chat_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Chat");
+        let mut clicked_source: Option<RangeRef> = None;
         // Input row pinned to the bottom, log filling the rest: the
         // content always uses the panel's full height, so egui never
         // shrinks the panel to fit it.
@@ -2060,8 +2546,33 @@ impl GridTalkApp {
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
+                    if self.chat_dropped > 0 {
+                        ui.weak(format!(
+                            "{} earlier message{} removed: the chat keeps the last {MAX_CHAT}.",
+                            self.chat_dropped,
+                            if self.chat_dropped == 1 {
+                                " was"
+                            } else {
+                                "s were"
+                            }
+                        ));
+                    }
                     for msg in &self.chat {
                         ui.label(format!("{}: {}", msg.role, msg.text));
+                        if !msg.sources.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.weak("Sources:");
+                                for range in &msg.sources {
+                                    if ui
+                                        .link(range.a1())
+                                        .on_hover_text("Select these cells")
+                                        .clicked()
+                                    {
+                                        clicked_source = Some(range.clone());
+                                    }
+                                }
+                            });
+                        }
                     }
                     if self.chat_busy {
                         ui.horizontal(|ui| {
@@ -2077,6 +2588,9 @@ impl GridTalkApp {
                     }
                 });
         });
+        if let Some(range) = clicked_source {
+            self.select_source(&range);
+        }
     }
 
     fn graph_pane(&mut self, ui: &mut egui::Ui) {
@@ -2268,7 +2782,260 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Event, RawInput};
     use gridtalk_graph::parse_delimited;
+
+    /// An app with `text` open as `in.csv` in a fresh scratch folder.
+    fn app_with(tag: &str, text: &str) -> (GridTalkApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gt-ui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.csv");
+        std::fs::write(&source, text).unwrap();
+        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
+        app.open(&source);
+        (app, dir)
+    }
+
+    /// Press `key` with `modifiers` and let the app handle shortcuts.
+    fn press(app: &mut GridTalkApp, ctx: &egui::Context, modifiers: Modifiers, key: Key) {
+        ctx.begin_pass(RawInput {
+            events: vec![
+                Event::ModifiersChanged(modifiers),
+                Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..RawInput::default()
+        });
+        app.handle_shortcuts(ctx);
+        // No renderer here: drop the font texture egui uploads.
+        ctx.end_pass().textures_delta.clear();
+    }
+
+    fn b2(app: &GridTalkApp) -> CellValue {
+        app.inc.as_ref().unwrap().current_value("Sheet1", 1, 1)
+    }
+
+    fn typed(value: f64) -> CellEdit {
+        CellEdit {
+            sheet: "Sheet1".into(),
+            row: 1,
+            col: 1,
+            value: CellValue::Number(value),
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_restore_grid_edits() {
+        let (mut app, dir) = app_with("undo", "Item,Qty\nApples,2\nPears,4\n");
+        // Typing "50" into B2: two keystrokes, one change.
+        app.record_grid_edit(typed(5.0));
+        app.record_grid_edit(typed(50.0));
+        app.history.end_typing();
+        app.sync.selected_range = None;
+        app.undo();
+        assert_eq!(b2(&app), CellValue::Number(2.0));
+        assert_eq!(
+            app.edit_buffers.get(&(0, 1, 1)).map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!B2:B2"
+        );
+        assert!(app.status.contains("Sheet1!B2"), "{}", app.status);
+        app.redo();
+        assert_eq!(b2(&app), CellValue::Number(50.0));
+        app.undo();
+        app.undo();
+        assert_eq!(app.status, "Nothing to undo.");
+        // Read-only: undo changes nothing.
+        app.redo();
+        app.prefs.read_only = true;
+        app.undo();
+        assert_eq!(b2(&app), CellValue::Number(50.0));
+        assert!(app.status.contains("Read-only"), "{}", app.status);
+        // A new workbook starts with no history.
+        app.prefs.read_only = false;
+        // The second Open confirms discarding the unsaved edits.
+        app.open(&dir.join("in.csv"));
+        app.open(&dir.join("in.csv"));
+        app.undo();
+        assert_eq!(app.status, "Nothing to undo.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyboard_shortcuts() {
+        let (mut app, dir) = app_with("keys", "Item,Qty\nApples,2\n");
+        let ctx = egui::Context::default();
+        app.record_grid_edit(typed(7.0));
+        app.history.end_typing();
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Z);
+        assert_eq!(b2(&app), CellValue::Number(2.0));
+        press(
+            &mut app,
+            &ctx,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Key::Z,
+        );
+        assert_eq!(b2(&app), CellValue::Number(7.0));
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Z);
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Y);
+        assert_eq!(b2(&app), CellValue::Number(7.0));
+        // Ctrl+F opens the find bar, Escape closes it.
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::F);
+        assert!(app.find_open && app.find_focus);
+        press(&mut app, &ctx, Modifiers::NONE, Key::Escape);
+        assert!(!app.find_open);
+        // Ctrl+S saves the open file.
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::S);
+        assert!(app.status.starts_with("Saved"), "{}", app.status);
+        let saved = std::fs::read_to_string(dir.join("in.csv")).unwrap();
+        assert!(saved.contains("Apples,7"), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_steps_through_matches_across_sheets() {
+        let (mut app, dir) = app_with("find", "Item,Qty\nApples,2\nPears,4\nApple pie,1\n");
+        app.find_query = "apple".into();
+        app.find_step(true);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A2:A2"
+        );
+        assert_eq!(app.status, "Match 1 of 2.");
+        app.find_step(true);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A4:A4"
+        );
+        app.find_step(true);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A2:A2"
+        );
+        app.find_step(false);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A4:A4"
+        );
+        app.find_query = "zebra".into();
+        app.find_step(true);
+        assert_eq!(app.status, "No cell contains \"zebra\".");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_carries_on_from_the_selected_match_after_an_edit() {
+        let (mut app, dir) = app_with("find-edit", "Item,Qty\nfig,1\nfig,2\nfig,3\n");
+        app.find_query = "fig".into();
+        app.find_step(true);
+        app.find_step(true);
+        assert_eq!(app.status, "Match 2 of 3.");
+        // An edit elsewhere re-runs the search; Next goes on to the third.
+        let inc = app.inc.as_mut().unwrap();
+        inc.record_edit(typed(9.0), std::time::Instant::now());
+        inc.flush();
+        app.find_step(true);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A4:A4"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_sources_select_their_range_and_dropped_messages_are_counted() {
+        let (mut app, dir) = app_with("chat", "Item,Qty\nApples,2\n");
+        let range = RangeRef {
+            sheet: "sheet1".into(),
+            r0: 0,
+            c0: 0,
+            r1: 1,
+            c1: 1,
+        };
+        app.push_chat_with_sources("echo", "B2 is 2".into(), vec![range.clone()]);
+        assert_eq!(app.chat[0].sources, vec![range.clone()]);
+        app.select_source(&range);
+        assert_eq!(app.sync.selected_range.as_ref(), Some(&range));
+        assert!(app.sync.highlighted_node.is_some());
+        app.select_source(&RangeRef {
+            sheet: "Gone".into(),
+            ..range
+        });
+        assert!(
+            app.status.contains("not in this workbook"),
+            "{}",
+            app.status
+        );
+        for i in 0..MAX_CHAT + 4 {
+            app.push_chat("you", format!("q{i}"));
+        }
+        assert_eq!(app.chat.len(), MAX_CHAT);
+        assert_eq!(app.chat_dropped, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_save_the_backend_to_the_config_in_use() {
+        let (mut app, dir) = app_with("backend", "A\n1\n");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            "[inference]\nn_ctx = 4096\n\n[ui]\ntheme = \"dark\"\n",
+        )
+        .unwrap();
+        app.config_path = config.display().to_string();
+        app.load_llm_settings();
+        assert_eq!(app.set_backend, "local");
+        app.set_backend = "openai-compatible".into();
+        app.set_base_url = "http://203.0.113.5/v1".into();
+        app.set_model = "qwen".into();
+        app.set_api_key_env = "MY_KEY".into();
+        // An unsaved context-size edit in the model section.
+        app.llm_n_ctx = Some(8192);
+        app.save_backend_settings();
+        assert!(app.status.starts_with("Backend saved"), "{}", app.status);
+        let text = std::fs::read_to_string(&config).unwrap();
+        for line in [
+            "backend = \"openai-compatible\"",
+            "base_url = \"http://203.0.113.5/v1\"",
+            "model = \"qwen\"",
+            "api_key_env = \"MY_KEY\"",
+            "n_ctx = 4096",
+            "theme = \"dark\"",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+        // The plain-http warning follows the saved backend; unsaved
+        // model settings are kept.
+        assert!(app.llm_cleartext.is_some());
+        assert_eq!(app.llm_n_ctx, Some(8192));
+        // A local backend needs a .gguf file that exists.
+        app.set_backend = "local".into();
+        app.set_model_path = dir.join("missing.gguf").display().to_string();
+        app.save_backend_settings();
+        assert!(
+            app.status.starts_with("Backend not saved"),
+            "{}",
+            app.status
+        );
+        let model = dir.join("m.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        app.set_model_path = model.display().to_string();
+        app.save_backend_settings();
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("backend = \"local\""), "{text}");
+        assert!(text.contains("model_path = "), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ui_two_way_sync_and_mode_persistence() {

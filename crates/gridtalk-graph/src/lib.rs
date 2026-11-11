@@ -2261,6 +2261,27 @@ impl IncrementalSnapshot {
         self.pending.len()
     }
 
+    /// The value a cell will hold once pending edits land: the latest
+    /// pending edit for it, else the snapshot's value (`Empty` past the
+    /// sheet's edge or on a sheet that does not exist). Undo records
+    /// this as the value an edit replaces.
+    pub fn current_value(&self, sheet: &str, row: usize, col: usize) -> CellValue {
+        if let Some(edit) = self
+            .pending
+            .iter()
+            .rev()
+            .find(|e| e.row == row && e.col == col && crate::sheet_name_eq(&e.sheet, sheet))
+        {
+            return edit.value.clone();
+        }
+        self.snapshot
+            .sheets
+            .iter()
+            .find(|s| crate::sheet_name_eq(&s.name, sheet))
+            .map(|s| s.get(row, col))
+            .unwrap_or(CellValue::Empty)
+    }
+
     pub fn record_edit(&mut self, edit: CellEdit, now: std::time::Instant) {
         self.dirty.push(RangeRef {
             sheet: edit.sheet.clone(),
@@ -3412,6 +3433,31 @@ mod tests {
         let (g, violations) = build_graph(&wb);
         assert!(violations.is_empty(), "{violations:?}");
         assert!(g.edges.iter().any(|e| e.kind == "depends_on"));
+    }
+
+    #[test]
+    fn current_value_sees_pending_edits_first() {
+        let wb = parse_delimited("d", "Sheet1", "A,B\n1,2\n", ',');
+        let mut inc = IncrementalSnapshot::new(wb);
+        let now = std::time::Instant::now();
+        assert_eq!(inc.current_value("Sheet1", 1, 0), CellValue::Number(1.0));
+        assert_eq!(inc.current_value("sheet1", 9, 9), CellValue::Empty);
+        assert_eq!(inc.current_value("Nope", 0, 0), CellValue::Empty);
+        for v in [5.0, 6.0] {
+            inc.record_edit(
+                CellEdit {
+                    sheet: "SHEET1".into(),
+                    row: 1,
+                    col: 0,
+                    value: CellValue::Number(v),
+                },
+                now,
+            );
+        }
+        // The latest pending edit wins, before and after the flush.
+        assert_eq!(inc.current_value("Sheet1", 1, 0), CellValue::Number(6.0));
+        inc.flush();
+        assert_eq!(inc.current_value("Sheet1", 1, 0), CellValue::Number(6.0));
     }
 
     #[test]
