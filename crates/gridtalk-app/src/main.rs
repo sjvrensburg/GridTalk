@@ -66,10 +66,6 @@ fn main() {
     }
 }
 
-/// Commands whose first argument is a subcommand, so `gridtalk <cmd>
-/// <sub> --help` is help too.
-const WITH_SUBCOMMANDS: &[&str] = &["adapter", "bench", "models", "tools"];
-
 /// The file argument and the free text after it (`ask`, `generate`).
 fn file_and_text<'a>(
     cmd: &str,
@@ -80,8 +76,10 @@ fn file_and_text<'a>(
     let file = rest
         .first()
         .ok_or_else(|| cli::usage(cmd, format!("missing <{first}>")))?;
-    if file.starts_with("--") {
-        return Err(cli::usage(cmd, format!("unknown flag {file}")));
+    // These commands take no flags: one before the text is a typo,
+    // not the start of it.
+    if let Some(flag) = rest.iter().take(2).find(|a| a.starts_with("--")) {
+        return Err(cli::usage(cmd, format!("unknown flag {flag}")));
     }
     let text = rest[1..].join(" ");
     if text.trim().is_empty() {
@@ -116,6 +114,10 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     println!("{}", cli::top_help());
                     Ok(())
                 }
+                [flag] if cli::is_help(flag) => {
+                    println!("{}", cli::top_help());
+                    Ok(())
+                }
                 [name] => match cli::command(name) {
                     Some(c) => {
                         println!("{}", cli::command_help(c));
@@ -127,6 +129,12 @@ fn run(args: &[String]) -> Result<(), CliError> {
             };
         }
         "version" | "--version" | "-V" => {
+            if let ([flag], Some(c)) = (rest, cli::command("version")) {
+                if cli::is_help(flag) {
+                    println!("{}", cli::command_help(c));
+                    return Ok(());
+                }
+            }
             if let Some(extra) = rest.first() {
                 return Err(cli::usage(
                     "version",
@@ -144,7 +152,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         )));
     };
     let asks_help = rest.first().is_some_and(|a| cli::is_help(a))
-        || (WITH_SUBCOMMANDS.contains(&cmd) && rest.get(1).is_some_and(|a| cli::is_help(a)));
+        || (cli::WITH_SUBCOMMANDS.contains(&cmd) && rest.get(1).is_some_and(|a| cli::is_help(a)));
     if asks_help {
         println!("{}", cli::command_help(command));
         return Ok(());
@@ -288,9 +296,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
                     // The CARD.md read below joins `name` onto the
                     // root: a traversal name must never reach it.
-                    if !adapter::valid_adapter_name(name) {
-                        return Err(cli::usage(cmd, format!("invalid adapter name {name:?}")));
-                    }
+                    valid_adapter_arg(cmd, name)?;
                     let a = adapter::load_adapter(&root, name);
                     println!(
                         "adapter {name} v{} top_k={} max_steps={} ref_context={}",
@@ -312,9 +318,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 Some("export") => {
                     let parsed = cli::parse(cmd, sub_args, &["--out"])?;
                     let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
-                    if !adapter::valid_adapter_name(name) || !root.join(name).is_dir() {
-                        return Err(CliError::Input(format!("adapter {name:?} not found")));
-                    }
+                    existing_adapter(cmd, &root, name)?;
                     let loaded = adapter::load_adapter(&root, name);
                     let md = adapter::export_agents_md(&loaded);
                     match parsed.flag("--out") {
@@ -329,6 +333,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 Some("rollback") => {
                     let parsed = cli::parse(cmd, sub_args, &[])?;
                     let name = &parsed.positionals(cmd, &["<name>"], 0)?[0];
+                    existing_adapter(cmd, &root, name)?;
                     let v = adapter::rollback(&root, name)?;
                     println!("adapter {name} rolled back to v{v}");
                     Ok(())
@@ -341,6 +346,9 @@ fn run(args: &[String]) -> Result<(), CliError> {
             let parsed = cli::parse(cmd, rest, &["--adapter", "--rounds"])?;
             let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
             let name = parsed.flag("--adapter").unwrap_or("default").to_string();
+            // Checked before the workbook loads and the rounds score:
+            // an invalid name would only fail at the first commit.
+            valid_adapter_arg(cmd, &name)?;
             let rounds = match parsed.flag("--rounds") {
                 Some(v) => v
                     .parse::<usize>()
@@ -576,6 +584,10 @@ fn run(args: &[String]) -> Result<(), CliError> {
                             .ok_or_else(|| cli::usage(cmd, "--adapter needs a value"))?
                             .clone(),
                     );
+                } else if question_words.is_empty() && word.starts_with("--") {
+                    // A mistyped flag must not silently become the
+                    // question (and run unadapted).
+                    return Err(cli::usage(cmd, format!("unknown flag {word}")));
                 } else {
                     question_words.push(word.clone());
                 }
@@ -636,6 +648,11 @@ fn run(args: &[String]) -> Result<(), CliError> {
         }
         "generate" => {
             let (model, prompt) = file_and_text(cmd, rest, "model.gguf", "prompt")?;
+            // A model that is not there is an input error (exit 3),
+            // not a backend failure.
+            if !std::path::Path::new(model).is_file() {
+                return Err(CliError::Input(format!("{model}: no such model file")));
+            }
             let backend = gridtalk_infer::llama_backend::LlamaCppBackend {
                 model_path: std::path::PathBuf::from(model),
                 ..gridtalk_infer::llama_backend::LlamaCppBackend::default()
@@ -917,6 +934,27 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n - 1).collect::<String>())
+    }
+}
+
+/// An adapter name on the command line must be a valid one (usage
+/// error otherwise): it is joined onto the adapters root.
+fn valid_adapter_arg(cmd: &str, name: &str) -> Result<(), CliError> {
+    if adapter::valid_adapter_name(name) {
+        Ok(())
+    } else {
+        Err(cli::usage(cmd, format!("invalid adapter name {name:?}")))
+    }
+}
+
+/// A valid adapter name that exists under `root` (input error when
+/// it does not).
+fn existing_adapter(cmd: &str, root: &std::path::Path, name: &str) -> Result<(), CliError> {
+    valid_adapter_arg(cmd, name)?;
+    if root.join(name).is_dir() {
+        Ok(())
+    } else {
+        Err(CliError::Input(format!("adapter {name:?} not found")))
     }
 }
 

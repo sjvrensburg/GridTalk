@@ -159,6 +159,10 @@ pub const COMMANDS: &[Command] = &[
     },
 ];
 
+/// Commands whose first argument is a subcommand, so `gridtalk <cmd>
+/// <sub> --help` is help too.
+pub const WITH_SUBCOMMANDS: &[&str] = &["adapter", "bench", "models", "tools"];
+
 pub fn command(name: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|c| c.name == canonical(name))
 }
@@ -247,8 +251,9 @@ impl Parsed {
 }
 
 /// Parse `args` strictly: every `--flag` must be one of `flags`, given
-/// once, with a value that is not itself a flag. Anything else is a
-/// positional.
+/// once, with a value that is not itself a flag. A short option
+/// (`-o`) is an unknown flag, not a file name; a lone `-` and anything
+/// else is a positional.
 pub fn parse(command: &str, args: &[String], flags: &[&'static str]) -> Result<Parsed, CliError> {
     let mut parsed = Parsed {
         positional: Vec::new(),
@@ -256,7 +261,7 @@ pub fn parse(command: &str, args: &[String], flags: &[&'static str]) -> Result<P
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        if !arg.starts_with("--") {
+        if !arg.starts_with('-') || arg == "-" {
             parsed.positional.push(arg.clone());
             continue;
         }
@@ -330,6 +335,7 @@ mod tests {
         assert_eq!(p.flag("--max"), None);
         for (bad, why) in [
             (&["--tasks", "x"][..], "unknown flag --tasks"),
+            (&["-o", "x"][..], "unknown flag -o"),
             (&["--out"][..], "--out needs a value"),
             (&["--out", "--max", "3"][..], "--out needs a value"),
             (&["--out", "a", "--out", "b"][..], "--out given twice"),
@@ -368,5 +374,8 @@ mod tests {
             assert!(command_help(c).contains(c.summary));
         }
         assert!(top.contains(EXIT_CODES));
+        for name in WITH_SUBCOMMANDS {
+            assert!(command(name).is_some(), "{name} is not in COMMANDS");
+        }
     }
 }

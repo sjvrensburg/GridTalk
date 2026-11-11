@@ -54,6 +54,8 @@ fn version_and_help() {
         assert_eq!(stdout(&expect(&[flag], 0)), want);
     }
     expect(&["--version", "extra"], 2);
+    assert!(stdout(&expect(&["version", "--help"], 0)).contains("Print the version."));
+    assert!(stdout(&expect(&["help", "--help"], 0)).contains("Exit codes: 0 success"));
 
     for args in [&[][..], &["help"], &["--help"], &["-h"]] {
         let top = stdout(&expect(args, 0));
@@ -156,6 +158,21 @@ fn usage_errors_exit_2_and_name_the_problem() {
         ),
         (vec!["generate", "model.gguf"], "missing the prompt"),
         (vec!["mcp", "--timeout", "0"], "--timeout must be"),
+        (vec!["graph", "-o", "x"], "unknown flag -o"),
+        (
+            vec!["ask", &demo, "--adapter", "x", "q"],
+            "unknown flag --adapter",
+        ),
+        (
+            vec!["investigate", &demo, "--adaptor", "x", "q"],
+            "unknown flag --adaptor",
+        ),
+        (
+            vec!["optimise", &demo, "--adapter", "../x"],
+            "invalid adapter name",
+        ),
+        (vec!["adapter", "rollback", "../x"], "invalid adapter name"),
+        (vec!["adapter", "export", "../x"], "invalid adapter name"),
     ] {
         let output = expect(&args, 2);
         let err = stderr(&output);
@@ -193,6 +210,7 @@ fn input_backend_and_tool_failures_have_their_own_codes() {
         3,
     );
     expect(&["spike", &demo], 3);
+    expect(&["generate", "gt-cli-no-such-model.gguf", "hi"], 3);
     // 5: the tool ran and reported an error, printed once on stdout.
     let failed = expect(
         &[
