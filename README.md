@@ -2,7 +2,7 @@
 
 Talk to your spreadsheet without data ever leaving your PC.
 
-GridTalk is a lightweight, local-first evolution of [ExcelGRAG](https://github.com/sjvrensburg/ExcelGRAG), built on the [Gridcraft](https://github.com/storytold/gridcraft) spreadsheet engine. Open a CSV/TSV/XLSX/ODS workbook, ask it questions in plain language, and get answers grounded in specific cells — with inference running on your own machine by default.
+GridTalk is a lightweight, local-first evolution of [ExcelGRAG](https://github.com/sjvrensburg/ExcelGRAG), built on the [Gridcraft](https://github.com/storytold/gridcraft) spreadsheet engine. Open a CSV/TSV/XLSX/XLSM/XLS/XLSB/ODS workbook, ask it questions in plain language, and get answers grounded in specific cells — with inference running on your own machine by default.
 
 ## Privacy model
 
@@ -19,7 +19,7 @@ practice and we have no Apple hardware to test on.
 
 ## Status
 
-Working local-first prototype: CSV/TSV/XLSX/ODS ingestion (via the
+Working local-first prototype: CSV/TSV/XLSX/XLSM/XLS/ODS ingestion, XLSB as values only (via the
 vendored Gridcraft engine), a lifted property graph with cited
 answers, hybrid lexical+embedding search, an investigate tool
 harness, a dual-view desktop UI, and real local GGUF generation on
