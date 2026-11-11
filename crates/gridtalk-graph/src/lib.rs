@@ -507,6 +507,11 @@ fn ext_and_name(path: &std::path::Path) -> (String, String) {
     (ext, name)
 }
 
+/// Spreadsheet files read through Gridcraft (everything but CSV/TSV),
+/// all under [`MAX_PACKAGE_BYTES`]. The reader is chosen from the
+/// content, not the extension (see [`load_gridcraft_bytes`]).
+pub const PACKAGE_EXTENSIONS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb", "ods"];
+
 /// Format check and size cap for an ingestible file of `len` bytes.
 fn check_ingestible(ext: &str, len: u64) -> Result<(), IngestError> {
     match ext {
@@ -514,17 +519,18 @@ fn check_ingestible(ext: &str, len: u64) -> Result<(), IngestError> {
             "delimited file is {len} bytes, over the {MAX_DELIMITED_BYTES}-byte ingestion cap"
         ))),
         "csv" | "tsv" => Ok(()),
-        "xlsb" | "xls" | "xlsm" => Err(IngestError::UnsupportedFormat {
-            ext: ext.into(),
-            hint: "GridTalk does not support Excel binary/legacy formats; save as .xlsx or .csv and re-open".into(),
-        }),
-        "xlsx" | "ods" if len > MAX_PACKAGE_BYTES => Err(IngestError::Parse(format!(
-            "spreadsheet package is {len} bytes, over the {MAX_PACKAGE_BYTES}-byte ingestion cap"
-        ))),
-        "xlsx" | "ods" => Ok(()),
+        _ if PACKAGE_EXTENSIONS.contains(&ext) && len > MAX_PACKAGE_BYTES => {
+            Err(IngestError::Parse(format!(
+                "spreadsheet file is {len} bytes, over the {MAX_PACKAGE_BYTES}-byte ingestion cap"
+            )))
+        }
+        _ if PACKAGE_EXTENSIONS.contains(&ext) => Ok(()),
         _ => Err(IngestError::UnsupportedFormat {
             ext: ext.into(),
-            hint: "expected .csv, .tsv, .xlsx or .ods".into(),
+            hint: format!(
+                "expected .csv, .tsv or one of .{}",
+                PACKAGE_EXTENSIONS.join(", .")
+            ),
         }),
     }
 }
@@ -586,22 +592,73 @@ pub fn load_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<WorkbookSnapsh
     }
 }
 
-/// Read XLSX/ODS bytes through the vendored Gridcraft engine and
-/// convert its workbook model into a GridTalk snapshot.
+/// What GridTalk adds to Gridcraft's own warning for an XLSB file:
+/// what values-only means for the graph and the tools.
+pub const XLSB_VALUES_ONLY_WARNING: &str = "Opened as values only: GridTalk cannot read .xlsb formulas yet, so every formula cell holds its last saved result as a constant. There are no formula dependencies in the graph, list_formulas finds none, and what_if changes nothing downstream. For live formulas, save the workbook as .xlsx in Excel and open that.";
+
+/// One of Gridcraft's readers (`read_xlsx`, `read_xls`, ...).
+type GridcraftReader =
+    fn(
+        &[u8],
+    )
+        -> Result<(gridcraft_model::Workbook, gridcraft_xlsx::ReadReport), gridcraft_xlsx::IoError>;
+
+/// Read a spreadsheet file (anything but CSV/TSV) through the vendored
+/// Gridcraft engine and convert its workbook model into a GridTalk
+/// snapshot. The reader is chosen from the content, so a file whose
+/// extension is wrong (an `.xls` download that is really an XLSX
+/// package) still opens, with a warning; `ext` only names the format
+/// in messages.
 pub fn load_gridcraft_bytes(
     name: &str,
     ext: &str,
     bytes: &[u8],
 ) -> Result<WorkbookSnapshot, IngestError> {
-    check_package_unpacked(bytes)?;
-    let (wb, report) = if ext == "ods" {
-        gridcraft_xlsx::read_ods(bytes)
-    } else {
-        gridcraft_xlsx::read_xlsx(bytes)
+    use gridcraft_xlsx::Format;
+    let format = gridcraft_xlsx::sniff(bytes);
+    let (read, label, expected): (GridcraftReader, &str, &[&str]) = match format {
+        Format::Xlsx => (
+            gridcraft_xlsx::read_xlsx,
+            "XLSX",
+            &["xlsx", "xlsm", "xltx", "xltm"],
+        ),
+        Format::Xlsb => (gridcraft_xlsx::read_xlsb, "XLSB", &["xlsb"]),
+        Format::Ods => (gridcraft_xlsx::read_ods, "ODS", &["ods"]),
+        Format::Xls => (gridcraft_xlsx::read_xls, "XLS", &["xls"]),
+        Format::Encrypted => {
+            return Err(IngestError::Parse(
+                "the workbook is password-protected (encrypted); GridTalk cannot open encrypted workbooks yet. Remove the password in Excel (File > Info > Protect Workbook) and open it again".into(),
+            ))
+        }
+        Format::LegacyBinary => {
+            return Err(IngestError::Parse(format!(
+                "this .{ext} file is an Office compound file but not an Excel workbook"
+            )))
+        }
+        Format::Csv | Format::Unknown => {
+            return Err(IngestError::Parse(format!(
+                "this .{ext} file is not a spreadsheet package (no XLSX, XLSB, XLS or ODS content); if it is text, such as a CSV or an HTML export, save it as .csv"
+            )))
+        }
+    };
+    // Zip packages only: the XLS reader bounds its own records.
+    if format != Format::Xls {
+        check_package_unpacked(bytes)?;
     }
-    .map_err(|e| IngestError::Parse(format!("gridcraft {ext} reader: {e}")))?;
+    let (wb, report) =
+        read(bytes).map_err(|e| IngestError::Parse(format!("gridcraft {label} reader: {e}")))?;
     let mut snapshot = from_gridcraft_workbook(name, &wb)?;
-    snapshot.warnings = report.warnings;
+    let mut warnings = Vec::new();
+    if !expected.contains(&ext) {
+        warnings.push(format!(
+            "this .{ext} file holds {label} content and was read as {label}"
+        ));
+    }
+    if format == Format::Xlsb {
+        warnings.push(XLSB_VALUES_ONLY_WARNING.to_string());
+    }
+    warnings.extend(report.warnings);
+    snapshot.warnings = warnings;
     snapshot.source = Some(std::sync::Arc::new(wb));
     Ok(snapshot)
 }
@@ -979,9 +1036,45 @@ pub(crate) fn gridcraft_names(wb: &WorkbookSnapshot) -> Vec<gridcraft_model::Def
 /// snapshot read from XLSX/ODS keeps what its source workbook has
 /// beyond cells (see [`to_gridcraft_workbook`]).
 pub fn to_xlsx_bytes(wb: &WorkbookSnapshot) -> Result<Vec<u8>, IngestError> {
+    to_package_bytes(wb, "xlsx")
+}
+
+/// The extensions [`to_package_bytes`] writes: the `.xlsx` family.
+pub const WRITABLE_PACKAGE_EXTENSIONS: &[&str] = &["xlsx", "xlsm", "xltx", "xltm"];
+
+/// Serialise a snapshot as the `.xlsx`-family member `ext` names, so
+/// the package's content type matches its file name (Excel refuses an
+/// `.xlsx` file declaring macros). Only `.xlsm` and `.xltm` keep a VBA
+/// project read from the source (see [`has_macros`]); `.xls`, `.xlsb`
+/// and `.ods` are read-only.
+pub fn to_package_bytes(wb: &WorkbookSnapshot, ext: &str) -> Result<Vec<u8>, IngestError> {
+    use gridcraft_xlsx::XlsxKind;
+    let kind = match ext {
+        "xlsx" => XlsxKind::Workbook,
+        "xlsm" => XlsxKind::MacroWorkbook,
+        "xltx" => XlsxKind::Template,
+        "xltm" => XlsxKind::MacroTemplate,
+        _ => {
+            return Err(IngestError::UnsupportedFormat {
+                ext: ext.into(),
+                hint: format!(
+                    "GridTalk writes .{} (and .csv/.tsv)",
+                    WRITABLE_PACKAGE_EXTENSIONS.join(", .")
+                ),
+            })
+        }
+    };
     let gc = to_gridcraft_workbook(wb);
-    gridcraft_xlsx::write_xlsx(&gc)
-        .map_err(|e| IngestError::Parse(format!("gridcraft xlsx writer: {e}")))
+    gridcraft_xlsx::write_xlsx_as(&gc, kind)
+        .map_err(|e| IngestError::Parse(format!("gridcraft .{ext} writer: {e}")))
+}
+
+/// Whether the workbook was read with a VBA project (macros), which
+/// only an `.xlsm` or `.xltm` save keeps. GridTalk never runs it.
+pub fn has_macros(wb: &WorkbookSnapshot) -> bool {
+    wb.source
+        .as_ref()
+        .is_some_and(|source| source.vba_project.is_some())
 }
 
 pub fn parse_delimited(name: &str, sheet: &str, text: &str, delim: char) -> WorkbookSnapshot {
@@ -2386,7 +2479,7 @@ mod tests {
         ));
         // The format is checked before anything is opened.
         assert!(matches!(
-            read_workbook_bytes(&dir.join("missing.xls")),
+            read_workbook_bytes(&dir.join("missing.numbers")),
             Err(IngestError::UnsupportedFormat { .. })
         ));
         // A FIFO reports length 0; it must be refused, not read forever.
@@ -2456,8 +2549,14 @@ mod tests {
             Err(IngestError::Io(_))
         ));
         assert!(matches!(
-            load_bytes(std::path::Path::new("x.xls"), b""),
+            load_bytes(std::path::Path::new("x.numbers"), b""),
             Err(IngestError::UnsupportedFormat { .. })
+        ));
+        // A supported extension with no spreadsheet inside is a parse
+        // error that says so.
+        assert!(matches!(
+            load_bytes(std::path::Path::new("x.xls"), b""),
+            Err(IngestError::Parse(m)) if m.contains("not a spreadsheet package")
         ));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3306,8 +3405,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_binary_format_is_typed_error() {
-        let err = load_path(std::path::Path::new("book.xlsb")).unwrap_err();
+    fn unsupported_format_is_typed_error() {
+        let err = load_path(std::path::Path::new("book.numbers")).unwrap_err();
         assert!(matches!(err, IngestError::UnsupportedFormat { .. }));
     }
 }

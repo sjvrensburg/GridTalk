@@ -362,7 +362,7 @@ fn tool_definitions() -> &'static Value {
 fn build_tool_definitions() -> Value {
     let annotations = |read_only: bool| json!({"readOnlyHint": read_only, "destructiveHint": false, "idempotentHint": read_only, "openWorldHint": false});
     let mut tools = vec![
-        json!({"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/ods; path on this machine) and return its session id, sheets, regions and load warnings. Opening a path that is already open returns its existing session. Reads the file; never writes it.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}, "annotations": annotations(true)}),
+        json!({"name": "open_workbook", "description": "Open a spreadsheet (csv/tsv/xlsx/xlsm/xltx/xltm/xls/xlsb/ods; path on this machine; .xlsb and .ods formulas come in as their saved values, see warnings) and return its session id, sheets, regions and load warnings. Opening a path that is already open returns its existing session. Reads the file; never writes it.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"path": {"type": "string"}}, "required": ["path"]}, "annotations": annotations(true)}),
         json!({"name": "close_workbook", "description": "Close an open workbook session", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"workbook_id": {"type": "string"}}, "required": ["workbook_id"]}, "annotations": annotations(false)}),
     ];
     let shared = ToolRequest::schemas();

@@ -1032,12 +1032,7 @@ impl GridTalkApp {
         }
         // If the chosen name has no usable extension, default to
         // .xlsx rather than failing in save_to.
-        let path = if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("xlsx") | Some("csv") | Some("tsv")
-        ) {
-            path.to_path_buf()
-        } else if path.extension().is_none() {
+        let path = if path.extension().is_none() {
             path.with_extension("xlsx")
         } else {
             path.to_path_buf()
@@ -1082,10 +1077,16 @@ impl GridTalkApp {
                 self.status = format!("Graph invariants violated: {violations:?}");
             }
         }
+        // Only .xlsm and .xltm hold macros: say when a save leaves them out.
+        let macros_note = (gridtalk_graph::has_macros(&snapshot)
+            && matches!(ext.as_str(), "xlsx" | "xltx"))
+        .then_some("The workbook's macros were not saved: only .xlsm and .xltm hold them.");
         let result: Result<(), String> = match ext.as_str() {
-            "xlsx" => gridtalk_graph::to_xlsx_bytes(&snapshot)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| write_atomic_bytes(path, &bytes)),
+            e if gridtalk_graph::WRITABLE_PACKAGE_EXTENSIONS.contains(&e) => {
+                gridtalk_graph::to_package_bytes(&snapshot, e)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| write_atomic_bytes(path, &bytes))
+            }
             "csv" | "tsv" => {
                 if snapshot.sheets.len() > 1 {
                     Err(format!(
@@ -1098,15 +1099,22 @@ impl GridTalkApp {
                     write_atomic_bytes(path, text.as_bytes())
                 }
             }
-            "ods" => Err("ODS is read-only in GridTalk; use Save As to write .xlsx or .csv".into()),
+            "ods" | "xls" | "xlsb" => Err(format!(
+                ".{ext} is read-only in GridTalk; use Save As to write .xlsx or .csv"
+            )),
             _ => Err(format!("cannot save .{ext}; use .xlsx or .csv")),
         };
         match result {
             Ok(()) => {
                 self.saved_revision = revision;
-                self.status = match dropped_note {
-                    Some(note) => format!("Saved {}. {note}", path.display()),
-                    None => format!("Saved {}", path.display()),
+                let notes: Vec<&str> = [dropped_note.as_deref(), macros_note]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                self.status = if notes.is_empty() {
+                    format!("Saved {}", path.display())
+                } else {
+                    format!("Saved {}. {}", path.display(), notes.join(" "))
                 };
                 true
             }
@@ -1125,8 +1133,14 @@ impl GridTalkApp {
     }
 }
 
+/// What the Open dialog offers: CSV/TSV and every format
+/// `gridtalk_graph` reads through Gridcraft.
+const OPEN_EXTENSIONS: [&str; 9] = [
+    "csv", "tsv", "xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb", "ods",
+];
+
 /// Hover text for the save buttons: what an .xlsx save keeps.
-const SAVE_HOVER: &str = "Saving .xlsx keeps what was read from the opened file (formatting, merges, tables, charts), with your edits applied; anything it could not read was listed when it opened. .csv and .tsv hold one sheet's cells";
+const SAVE_HOVER: &str = "Saving .xlsx keeps what was read from the opened file (formatting, merges, tables, charts), with your edits applied; anything it could not read was listed when it opened. .csv and .tsv hold one sheet's cells. Macros are kept only in .xlsm; .xls, .xlsb and .ods files are read-only";
 
 /// A status line for edits dropped since `before` (the dropped-edit
 /// count before a flush), or `None` when every edit was applied.
@@ -1395,7 +1409,7 @@ impl eframe::App for GridTalkApp {
             ui.horizontal(|ui| {
                 if ui.button("Open…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Spreadsheets", &["csv", "tsv", "xlsx", "ods"])
+                        .add_filter("Spreadsheets", &OPEN_EXTENSIONS)
                         .pick_file()
                     {
                         self.open(&path);
@@ -1420,6 +1434,7 @@ impl eframe::App for GridTalkApp {
                 {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Excel workbook", &["xlsx"])
+                        .add_filter("Excel macro-enabled workbook", &["xlsm"])
                         .add_filter("CSV", &["csv"])
                         .add_filter("TSV", &["tsv"])
                         .save_file()

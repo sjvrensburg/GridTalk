@@ -144,7 +144,9 @@ Phase 4 — tests and CI (done 2026-11-11):
 
 Phase 5 — features and UX:
 
-- [ ] Accept `.xlsm`, `.xls` and `.xlsb` (the vendored reader supports them); detect encrypted files with `check_encryption`
+- [x] Accept `.xlsm`, `.xltx`, `.xltm`, `.xls` and `.xlsb` (2026-11-11): the Gridcraft reader is chosen from the content (`sniff`), so a mislabelled file opens with a warning and an encrypted one gets a clear "password-protected" error; `.xls` keeps formulas, shared and array ones included; `.xlsm`/`.xltm` macros are kept, never run, and saved only to `.xlsm`/`.xltm` (`to_package_bytes` writes the kind the extension names; the UI says when an `.xlsx` save leaves macros out); `.xls`/`.xlsb` are read-only like `.ods`. Tests build every format in code (`crates/gridtalk-graph/tests/formats.rs`)
+- [ ] `.xlsb` formulas: Gridcraft's XLSB reader is data-only (formulas become their saved results; GridTalk's first warning says what that means for the graph and tools). Needs an XLSB formula (Rgce) decoder, written from MS-XLSB, upstream in Gridcraft or as a GridTalk overlay; check decoded formulas against the saved results. calamine 0.38 was reviewed and rejected: it drops shared and array formulas, table references and newer functions
+- [ ] Opening password-protected workbooks (`gridcraft_xlsx::decrypt` takes the password); for now they are refused with a clear error
 - [ ] CLI: per-subcommand `--help`, `--version`, distinct exit codes, strict argument parsing everywhere, flush after streamed tokens
 - [ ] UI: Ctrl+S/O/F, undo, backend/model editing in Settings, a "Sources:" line on chat answers, notice when old chat messages are dropped
 

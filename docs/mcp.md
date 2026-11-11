@@ -67,7 +67,12 @@ case-insensitively, and cells must lie inside the sheet grid
 
 - `open_workbook`: returns `workbook_id`, `sheets`, `regions` and
   `warnings` (what the file reader skipped or could not import, e.g.
-  an ODS file's formulas, which are imported as their saved results).
+  the formulas of an `.xlsb` or ODS file, which are imported as their
+  saved results: the first warning of an `.xlsb` file says so). Files
+  are read by their content, so an `.xls` that is really an XLSX
+  package opens, with a warning; an encrypted workbook is refused with
+  `open_failed`. `.xls` files keep their formulas; `.xlsm`/`.xltm`
+  macros are kept but never run.
   Opening a path that is already open, however it is spelled,
   returns that session (`reused: true`) instead of a second one.
 - `close_workbook`.
@@ -138,7 +143,7 @@ text: on generated workbooks of 5k to 1.2M cells, the session (the
 Gridcraft workbook, graph, index and recalculated engine) held 12 to
 25 times that, so the estimate is a middle, not a bound. Only
 regular files are read, and never more than the ingestion cap (32
-MiB for CSV/TSV, 256 MiB for XLSX/ODS); an XLSX/ODS package whose
+MiB for CSV/TSV, 256 MiB for the other formats); a zip package whose
 zip directory declares more than 512 MiB unpacked is refused before
 it is unpacked.
 
