@@ -1780,6 +1780,7 @@ dependencies = [
  "gridcraft-model",
  "gridcraft-xlsx",
  "serde",
+ "zip",
 ]
 
 [[package]]

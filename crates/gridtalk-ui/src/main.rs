@@ -10,7 +10,7 @@ mod layout;
 use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
-    valid_adapter_name,
+    valid_adapter_name, write_atomic_bytes,
 };
 use gridtalk_graph::{
     build_graph_cached, load_path, CellEdit, CellValue, Graph, GraphCache, IncrementalSnapshot,
@@ -18,7 +18,7 @@ use gridtalk_graph::{
 };
 use gridtalk_index::HybridIndex as Index;
 use gridtalk_infer::config::Config;
-use gridtalk_infer::{backend_from_config, ChatRequest};
+use gridtalk_infer::{backend_from_config, cleartext_url_warning, cleartext_warning, ChatRequest};
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -133,33 +133,6 @@ fn gridcraft_binary_ui() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Write bytes atomically (unique temp + rename), like prefs save.
-fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let write = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    })();
-    match write {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e.to_string())
-        }
-    }
-}
-
 /// Parsed-value equality for edit-buffer pruning: a formula buffer
 /// matches the stored cell when the expression matches, ignoring
 /// the stored cached value.
@@ -234,26 +207,7 @@ impl UiPrefs {
         }
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                // Atomic + durable: unique temp, fsync, rename, fsync
-                // the directory; clean the temp up on failure.
-                let tmp = p.with_extension(format!("json.tmp-{}", std::process::id()));
-                let result = (|| -> std::io::Result<()> {
-                    use std::io::Write as _;
-                    let mut f = std::fs::File::create(&tmp)?;
-                    f.write_all(text.as_bytes())?;
-                    f.sync_all()?;
-                    drop(f);
-                    std::fs::rename(&tmp, &p)?;
-                    #[cfg(unix)]
-                    if let Some(parent) = p.parent() {
-                        if let Ok(dir) = std::fs::File::open(parent) {
-                            let _ = dir.sync_all();
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    let _ = std::fs::remove_file(&tmp);
+                if let Err(e) = write_atomic_bytes(&p, text.as_bytes()) {
                     eprintln!("gridtalk-ui: warning: cannot save {}: {e}", p.display());
                 }
             }
@@ -371,6 +325,8 @@ pub struct GridTalkApp {
     /// the backend default (all layers / the model's context).
     llm_gpu_layers: Option<u32>,
     llm_n_ctx: Option<u32>,
+    /// The cleartext warning for the config in use, shown in Settings.
+    llm_cleartext: Option<String>,
     /// Whether the two fields above reflect the config file yet
     /// (re-read each time Settings opens).
     llm_settings_loaded: bool,
@@ -462,6 +418,7 @@ impl GridTalkApp {
             show_settings: false,
             llm_gpu_layers: None,
             llm_n_ctx: None,
+            llm_cleartext: None,
             llm_settings_loaded: false,
             config_path,
             show_adapters: false,
@@ -958,6 +915,7 @@ impl GridTalkApp {
                 Config::load(std::path::Path::new(&config_path))
             };
             let backend = backend_from_config(&cfg.inference);
+            let cleartext = cleartext_warning(&cfg.inference);
             let req = ChatRequest {
                 system: format!(
                     "You answer questions about a spreadsheet using only the cited context. Always cite the range.{adapter_prompt}"
@@ -966,10 +924,14 @@ impl GridTalkApp {
                 max_tokens: 512,
             };
             let mut out = String::new();
-            let msg = match backend.stream(&req, &cancel, &mut |tok| out.push_str(tok)) {
+            let mut msg = match backend.stream(&req, &cancel, &mut |tok| out.push_str(tok)) {
                 Ok(()) => (workbook_tag.clone(), backend.name().to_string(), out),
                 Err(e) => (workbook_tag.clone(), "error".to_string(), e.to_string()),
             };
+            // Every answer that travelled over cleartext says so.
+            if let Some(warning) = cleartext {
+                msg.2 = format!("Warning: {warning}\n\n{}", msg.2);
+            }
             let _ = tx.send(msg);
         });
     }
@@ -982,6 +944,7 @@ impl GridTalkApp {
         // u32::MAX is how the backend spells "all layers".
         self.llm_gpu_layers = cfg.inference.n_gpu_layers.filter(|&n| n != u32::MAX);
         self.llm_n_ctx = cfg.inference.n_ctx;
+        self.llm_cleartext = cleartext_warning(&cfg.inference);
         self.llm_settings_loaded = true;
     }
 
@@ -1605,6 +1568,9 @@ impl eframe::App for GridTalkApp {
                             if self.wizard_backend == "openai-compatible" {
                                 ui.label("Base URL (a redacting proxy can live here):");
                                 ui.text_edit_singleline(&mut self.wizard_base_url);
+                                if let Some(warning) = cleartext_url_warning(&self.wizard_base_url) {
+                                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                                }
                             }
                             ui.horizontal(|ui| {
                                 if ui.button("Back").clicked() {
@@ -1734,6 +1700,9 @@ impl eframe::App for GridTalkApp {
                 }
                 ui.label("External endpoints receive cell values verbatim.");
                 ui.label("For sensitive workbooks, use a local model.");
+                if let Some(warning) = &self.llm_cleartext {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("Warning: {warning}"));
+                }
                 ui.separator();
                 self.llm_settings_ui(ui);
                 ui.separator();

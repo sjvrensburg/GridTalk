@@ -39,7 +39,7 @@ The workspace crates form a strict pipeline. Dependencies only point down this l
 - **Gridcraft is vendored, not forked** (0001). `vendor/gridcraft` is a submodule excluded from the workspace and pinned in `UPSTREAM.md` (update that pin when syncing). Depend only on its public model/calc surface and never edit engine internals.
 - **Keep the Gridcraft workbook** (0005): an XLSX/ODS snapshot carries its source workbook, and conversion back overlays only the changed cells.
 - **UI composition, not embedding** (0003). Gridcraft's egui fork is incompatible with GridTalk's egui, so heavy editing happens by launching Gridcraft (`open-in-gridcraft`, `GRIDTALK_GRIDCRAFT_BIN`) and re-snapshotting the file afterwards.
-- The MCP server reserves stdout for JSON-RPC frames, so log to stderr (`docs/mcp.md`).
+- The MCP server reserves stdout for JSON-RPC frames, so log to stderr (`docs/mcp.md`). Only the stdio thread writes frames: tool work runs as a `Job` on a worker thread and comes back as a `Done` that `McpServer::finish` applies to the sessions (`Arc<OpenWorkbook>`), so session state changes only on that thread.
 - `docs/plan.md` is the phased plan with honest checkboxes. Keep it accurate when you land or descope work.
 
 ## Conventions

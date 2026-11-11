@@ -18,7 +18,10 @@
 //! prompt → adapter rules → matched skills → per-workbook sidecar
 //! (`<workbook>.gridtalk.md`, edited next to the spreadsheet).
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
@@ -361,19 +364,19 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    write_atomic_bytes(path, text.as_bytes())
+}
+
+/// Write bytes atomically and durably: an exclusive (`create_new`)
+/// temp file beside `path`, fsync, rename, fsync the directory; the
+/// temp is removed on failure. Shared with the UI's saves.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp-{}-{n}",
-        path.file_name().and_then(|f| f.to_str()).unwrap_or("file"),
-        std::process::id()
-    ));
+    let (tmp, mut f) = create_temp_beside(path).map_err(|e| e.to_string())?;
     // fsync the temp file before rename and the parent directory
     // after, so a power loss cannot lose a committed adapter.
     let result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
@@ -392,6 +395,52 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
             Err(e.to_string())
         }
     }
+}
+
+/// A new, empty temp directory next to `path`. `create_dir` fails on
+/// any existing entry, symlinks included, so a planted name is
+/// retried instead of written through.
+fn create_temp_dir_beside(path: &Path) -> std::io::Result<PathBuf> {
+    let mut last = None;
+    for _ in 0..64 {
+        let tmp = temp_name_beside(path);
+        match std::fs::create_dir(&tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
+}
+
+/// `.<name>.tmp-<pid>-<nanos>-<n>` beside `path`: unlikely to collide,
+/// and every caller opens it exclusively anyway.
+fn temp_name_beside(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(".{name}.tmp-{}-{nanos:x}-{n}", std::process::id()))
+}
+
+/// A new temp file next to `path`, opened with `create_new` (O_EXCL):
+/// a file or symlink planted at the name is never opened or followed,
+/// and the name is retried instead. The caller writes through the
+/// returned handle and never reopens the temp by path.
+fn create_temp_beside(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut last = None;
+    for _ in 0..64 {
+        let tmp = temp_name_beside(path);
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
 }
 
 /// Commit `adapter` as the next version: writes `vN/` and moves
@@ -428,11 +477,12 @@ pub fn commit_version(root: &Path, adapter: &Adapter) -> Result<u32, String> {
         return Err(format!("adapter version v{next} already exists"));
     }
     // Write into a temp dir and rename into place: no partial vN.
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".v{next}.tmp-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(tmp.join("skills")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = create_temp_dir_beside(&vdir).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::create_dir(tmp.join("skills")) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e.to_string());
+    }
     let vdir_tmp = tmp.clone();
     let mut committed = adapter.clone();
     committed.version = next;

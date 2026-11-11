@@ -161,6 +161,33 @@ fn is_loopback_host(host_port: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// The base URL the external backend uses when none is configured.
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+
+/// A warning when the configured external backend talks plain `http`
+/// to a host that is not loopback: spreadsheet passages, cell values
+/// included, then cross the network unencrypted, whether or not an API
+/// key is set (a key is refused outright there). `None` for the local
+/// backend, `https` and loopback hosts.
+pub fn cleartext_warning(cfg: &config::InferenceConfig) -> Option<String> {
+    if cfg.backend != "openai-compatible" {
+        return None;
+    }
+    cleartext_url_warning(cfg.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL))
+}
+
+/// [`cleartext_warning`] for one base URL (the first-run wizard checks
+/// the URL as it is typed). A URL that does not parse gets no warning:
+/// the backend reports it as an error instead.
+pub fn cleartext_url_warning(base_url: &str) -> Option<String> {
+    let url = transport::parse_url(base_url).ok()?;
+    (!url.tls && !is_loopback_host(&url.authority)).then(|| {
+        format!(
+            "{base_url} is plain http to a remote host: spreadsheet passages (cell values included) cross the network unencrypted. Use https, or a proxy on this machine."
+        )
+    })
+}
+
 /// True when `body` contains a complete chunked message: walks
 /// real chunk boundaries (size lines at chunk offsets) and
 /// accepts a terminal 0-chunk with optional trailers.
@@ -509,7 +536,7 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
             base_url: cfg
                 .base_url
                 .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8080/v1".into()),
+                .unwrap_or_else(|| DEFAULT_BASE_URL.into()),
             model: cfg.model.clone().unwrap_or_else(|| "default".into()),
             api_key: cfg
                 .api_key_env
@@ -658,6 +685,33 @@ mod tests {
             EchoBackend.stream(&req, &cancel, &mut |_| {}),
             Err(InferError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn cleartext_warning_covers_remote_http_only() {
+        let cfg = |backend: &str, url: Option<&str>| config::InferenceConfig {
+            backend: backend.into(),
+            base_url: url.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(
+            cleartext_warning(&cfg("openai-compatible", Some("http://203.0.113.9/v1")))
+                .is_some_and(|w| w.contains("unencrypted"))
+        );
+        assert!(
+            cleartext_warning(&cfg("openai-compatible", Some("https://203.0.113.9/v1"))).is_none()
+        );
+        assert!(
+            cleartext_warning(&cfg("openai-compatible", Some("http://localhost:11434/v1")))
+                .is_none()
+        );
+        assert!(
+            cleartext_warning(&cfg("openai-compatible", Some("http://[::1]:8080/v1"))).is_none()
+        );
+        assert!(cleartext_warning(&cfg("openai-compatible", None)).is_none());
+        assert!(cleartext_warning(&cfg("local", Some("http://203.0.113.9/v1"))).is_none());
+        assert!(cleartext_url_warning("http://127.attacker.example/v1").is_some());
+        assert!(cleartext_url_warning("not a url").is_none());
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub enum ModelError {
     Io(std::io::Error),
     Http(String),
     InvalidName(String),
+    /// A model over [`MAX_MODEL_BYTES`].
+    TooLarge(String),
 }
 
 impl std::fmt::Display for ModelError {
@@ -38,6 +40,7 @@ impl std::fmt::Display for ModelError {
             ModelError::Io(e) => write!(f, "io error: {e}"),
             ModelError::Http(m) => write!(f, "download error: {m}"),
             ModelError::InvalidName(m) => write!(f, "invalid model name: {m}"),
+            ModelError::TooLarge(m) => write!(f, "model too large: {m}"),
         }
     }
 }
@@ -314,7 +317,6 @@ pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
     // Grow the header window incrementally up to a 64 MiB cap; a
     // truncated or oversized header errors without ever reading a
     // multi-GB tensor payload into RAM.
-    const HEADER_CAP: u64 = 64 * 1024 * 1024;
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut buf = Vec::new();
@@ -335,6 +337,69 @@ pub fn parse_gguf_file(path: &Path) -> Result<GgufInfo, ModelError> {
 }
 
 use std::io::Seek as _;
+
+/// Largest model accepted by import or download: 64 GiB.
+pub const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Largest GGUF header read, by [`parse_gguf_file`] and while a
+/// download streams in.
+const HEADER_CAP: u64 = 64 * 1024 * 1024;
+
+/// Checks a GGUF header from the first bytes of a download as they
+/// arrive, so a URL that serves HTML, an error page or another file
+/// fails after its first bytes instead of after the whole body. The
+/// header is parsed when the buffered prefix reaches 64 KiB and at
+/// each doubling after that (up to [`HEADER_CAP`]), so the parse
+/// work stays linear in the header size. The finished file is still
+/// validated in full; this check only fails early.
+struct HeaderProbe {
+    head: Vec<u8>,
+    /// The body's declared length (or `u64::MAX` when unknown), so the
+    /// extent checks hold the header to the file it will become.
+    file_len: u64,
+    next_parse: usize,
+    magic_checked: bool,
+    done: bool,
+}
+
+impl HeaderProbe {
+    fn new(file_len: Option<u64>) -> Self {
+        HeaderProbe {
+            head: Vec::new(),
+            file_len: file_len.unwrap_or(u64::MAX),
+            next_parse: 64 * 1024,
+            magic_checked: false,
+            done: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Result<(), ModelError> {
+        if self.done {
+            return Ok(());
+        }
+        let room = (HEADER_CAP as usize).saturating_sub(self.head.len());
+        self.head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        // The magic and version are in the first 8 bytes: check them
+        // at once, then the rest at the doubling thresholds.
+        let magic_due = !self.magic_checked && self.head.len() >= 8;
+        if !magic_due && self.head.len() < self.next_parse {
+            return Ok(());
+        }
+        self.magic_checked |= magic_due;
+        while self.next_parse <= self.head.len() {
+            self.next_parse = self.next_parse.saturating_mul(2);
+        }
+        match parse_gguf_with_len(&self.head, self.file_len) {
+            Ok(_) => {
+                self.done = true;
+                self.head = Vec::new();
+                Ok(())
+            }
+            Err(ModelError::Truncated(_)) if (self.head.len() as u64) < HEADER_CAP => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
 
 /// Best-effort directory fsync (durability after rename).
 fn sync_dir(dir: &Path) {
@@ -467,6 +532,13 @@ impl ModelManager {
     /// leaves a half-written model in the cache.
     pub fn import(&self, src: &Path) -> Result<ModelEntry, ModelError> {
         parse_gguf_file(src)?; // validate the source up front
+        let len = std::fs::metadata(src)?.len();
+        if len > MAX_MODEL_BYTES {
+            return Err(ModelError::TooLarge(format!(
+                "{} is {len} bytes, over the {MAX_MODEL_BYTES}-byte cap",
+                src.display()
+            )));
+        }
         std::fs::create_dir_all(&self.dir)?;
         let file_name = src
             .file_name()
@@ -477,8 +549,15 @@ impl ModelManager {
         let dest = self.dir.join(&name);
         let (tmp, mut tmp_file) = unique_tmp(&self.dir, &name)?;
         let copy_result = (|| -> Result<(u64, GgufInfo), ModelError> {
-            let mut from = std::fs::File::open(src)?;
+            // The cap holds for a source that grows during the copy.
+            let mut from = std::fs::File::open(src)?.take(MAX_MODEL_BYTES + 1);
             let n = std::io::copy(&mut from, &mut tmp_file)?;
+            if n > MAX_MODEL_BYTES {
+                return Err(ModelError::TooLarge(format!(
+                    "{} grew past the {MAX_MODEL_BYTES}-byte cap while it was copied",
+                    src.display()
+                )));
+            }
             tmp_file.sync_all()?;
             drop(tmp_file);
             // Re-validate the copied bytes, not just the source
@@ -596,10 +675,17 @@ impl ModelManager {
         let name = Self::checked_name(name)?;
         let (tmp, mut out) = unique_tmp(&self.dir, &name)?;
         // Stream with a hard size cap (64 GiB) and the total
-        // deadline above; the temp file is deleted on any breach.
-        const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+        // deadline above; the temp file is deleted on any breach,
+        // and on a header that fails to validate as it arrives.
+        if let Some(len) = content_length.filter(|len| *len > MAX_MODEL_BYTES) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ModelError::TooLarge(format!(
+                "the server declares {len} bytes, over the {MAX_MODEL_BYTES}-byte cap"
+            )));
+        }
+        let mut probe = HeaderProbe::new(content_length);
         let copied = (|| -> Result<u64, ModelError> {
-            let mut limited = (&mut body).take(MAX_DOWNLOAD_BYTES + 1);
+            let mut limited = (&mut body).take(MAX_MODEL_BYTES + 1);
             let mut buf = [0u8; 64 * 1024];
             let mut total: u64 = 0;
             loop {
@@ -612,13 +698,16 @@ impl ModelManager {
                         "download exceeded the 2-hour deadline".into(),
                     ));
                 }
+                probe.feed(&buf[..n])?;
                 out.write_all(&buf[..n])?;
                 total += n as u64;
                 if total % (256 * 1024 * 1024) < n as u64 {
                     eprintln!("gridtalk: downloaded {total} bytes…");
                 }
-                if total > MAX_DOWNLOAD_BYTES {
-                    return Err(ModelError::Http("download exceeds the 64 GiB cap".into()));
+                if total > MAX_MODEL_BYTES {
+                    return Err(ModelError::TooLarge(
+                        "download exceeds the 64 GiB cap".into(),
+                    ));
                 }
             }
             out.sync_all()?;
@@ -941,6 +1030,96 @@ mod tests {
         TEST_TLS_CONFIG.with(|c| *c.borrow_mut() = None);
         assert!(err.is_err());
         assert!(!dir.join("t.gguf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_probe_fails_early_and_accepts_split_headers() {
+        // Not a model: fails on its first bytes.
+        let mut probe = HeaderProbe::new(Some(1 << 30));
+        let err = probe.feed(b"<!DOCTYPE html><p>Sign in").unwrap_err();
+        assert!(matches!(err, ModelError::NotGguf(_)), "{err}");
+        // A real header passes however it is split, including one
+        // byte at a time (the magic check fires at byte 8).
+        let gguf = synthetic_gguf("llama");
+        let mut probe = HeaderProbe::new(Some(gguf.len() as u64));
+        for b in &gguf {
+            probe.feed(std::slice::from_ref(b)).unwrap();
+        }
+        // A short header is parsed only at the doubling thresholds,
+        // so a body shorter than 64 KiB is left to the final check.
+        assert!(!probe.done);
+        // A header past the first threshold validates mid-stream.
+        let mut big = Vec::new();
+        big.extend_from_slice(b"GGUF");
+        big.extend_from_slice(&3u32.to_le_bytes());
+        big.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        big.extend_from_slice(&1u64.to_le_bytes()); // kv
+        let key = "general.name";
+        big.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        big.extend_from_slice(key.as_bytes());
+        big.extend_from_slice(&8u32.to_le_bytes()); // string
+        let value = "x".repeat(100_000);
+        big.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        big.extend_from_slice(value.as_bytes());
+        big.resize(big.len() + 200_000, 0);
+        let mut probe = HeaderProbe::new(Some(big.len() as u64));
+        for chunk in big.chunks(4096) {
+            probe.feed(chunk).unwrap();
+        }
+        assert!(probe.done);
+        // A version this reader does not know fails on byte 8.
+        let mut probe = HeaderProbe::new(None);
+        let err = probe
+            .feed(&[b'G', b'G', b'U', b'F', 9, 0, 0, 0])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported GGUF version 9"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn download_stops_at_a_body_that_is_not_gguf() {
+        use crate::transport::{test_support, TEST_TLS_CONFIG};
+        // The server promises a gigabyte and sends an HTML page: the
+        // download fails on the page's first bytes as not a GGUF,
+        // not at the end as a truncated body.
+        let mut page = b"HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n".to_vec();
+        page.extend_from_slice(b"<!DOCTYPE html><html><body>Sign in</body></html>");
+        let (port, cert, _requests) = test_support::serve_tls(vec![page]);
+        TEST_TLS_CONFIG
+            .with(|c| *c.borrow_mut() = Some(test_support::client_config_trusting(&cert)));
+        let dir = std::env::temp_dir().join(format!("gt-html-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mgr = ModelManager::new(dir.clone());
+        let err = mgr
+            .download_http(&format!("https://localhost:{port}/m.gguf"), "m.gguf")
+            .unwrap_err();
+        TEST_TLS_CONFIG.with(|c| *c.borrow_mut() = None);
+        assert!(matches!(err, ModelError::NotGguf(_)), "{err}");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The import cap: a sparse source over 64 GiB is refused before
+    /// any copy (Unix only, where a sparse file costs no disk).
+    #[cfg(unix)]
+    #[test]
+    fn import_refuses_a_source_over_the_cap() {
+        let dir = std::env::temp_dir().join(format!("gt-import-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("huge.gguf");
+        std::fs::write(&src, synthetic_gguf("llama")).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        file.set_len(MAX_MODEL_BYTES + 1).unwrap();
+        drop(file);
+        let mgr = ModelManager::new(dir.join("cache"));
+        let err = mgr.import(&src).unwrap_err();
+        assert!(matches!(err, ModelError::TooLarge(_)), "{err}");
+        assert!(mgr.list().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
