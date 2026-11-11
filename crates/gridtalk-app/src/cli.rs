@@ -306,7 +306,9 @@ pub fn parse(command: &str, args: &[String], flags: &[&'static str]) -> Result<P
 /// With `text_after: Some(n)`, the first argument that is not a flag
 /// once `n` positionals are read starts the free text: it and every
 /// argument after it are text, flag-shaped or not, so a question may
-/// say `--help`. Flags must come before the text.
+/// say `--help`. Flags must come before the text. In the text's slot
+/// a single-dash word (`-5%`) starts the text: only a `--` word there
+/// is taken as a (possibly mistyped) flag.
 pub fn parse_with(
     command: &str,
     args: &[String],
@@ -324,8 +326,9 @@ pub fn parse_with(
             parsed.text.push(arg.clone());
             continue;
         }
-        if !arg.starts_with('-') || arg == "-" {
-            if text_after.is_some_and(|n| parsed.positional.len() >= n) {
+        let text_slot = text_after.is_some_and(|n| parsed.positional.len() >= n);
+        if !arg.starts_with('-') || arg == "-" || (text_slot && !arg.starts_with("--")) {
+            if text_slot {
                 parsed.text.push(arg.clone());
             } else {
                 parsed.positional.push(arg.clone());
@@ -490,6 +493,15 @@ mod tests {
         );
         let p = parse_with("ask", &args(&["book.csv"]), &[], Some(1)).unwrap();
         assert!(p.text().is_empty());
+        // A question may start with a single-dash word; a short option
+        // in a positional slot is still an unknown flag.
+        let p = parse_with("ask", &args(&["book.csv", "-5%", "growth?"]), &[], Some(1)).unwrap();
+        assert_eq!(p.text(), "-5% growth?");
+        let err = parse_with("ask", &args(&["-o", "book.csv", "q"]), &[], Some(1)).unwrap_err();
+        assert!(
+            err.message().unwrap().starts_with("unknown flag -o"),
+            "{err:?}"
+        );
     }
 
     #[test]
