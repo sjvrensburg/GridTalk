@@ -29,7 +29,10 @@ never writes the file). There is no write tool.
   until it returns, and its result is dropped (a file reload it did
   is kept).
 - `--memory-budget <MiB>` (default 4096) caps the estimated memory of
-  the open sessions together; see Sessions.
+  the open sessions together; see Sessions. Workbooks load one at a
+  time (other calls keep running), and a load is charged once it
+  finishes, so the peak can pass the budget by one workbook being
+  built. A load waiting its turn counts toward `--timeout`.
 
 ## Claude Code (`.mcp.json` in your project)
 
@@ -115,7 +118,8 @@ rather than on message text.
   `unknown_sheet`, `no_graph_node`, `evaluation_failed`,
   `invalid_arguments` (e.g. a non-finite what-if value),
   `path_not_allowed` (outside every `--root`), `over_budget` (one
-  workbook's estimate is over `--memory-budget` on its own),
+  workbook's estimate is over `--memory-budget` on its own; when an
+  open session's file grows past it, that session is closed),
   `timeout`, `busy` (four calls are already running, timed-out ones
   included; retry later) and `internal` (a GridTalk bug).
   `gridtalk tools call` prints the same payload.
