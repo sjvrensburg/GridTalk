@@ -1,5 +1,5 @@
-//! GridTalk egui shell: spreadsheet grid + chat on one side, the
-//! lifted graph on the other, with two-way selection sync. This is
+//! GridTalk egui shell: the spreadsheet grid and the lifted graph,
+//! with two-way selection sync, beside a full-height chat column. This is
 //! the Phase 2/4 front end; it renders GridTalk snapshots directly
 //! (the Gridcraft `ui-egui` ribbon remains the long-term editor
 //! surface, see docs/decisions/0001).
@@ -50,11 +50,33 @@ impl ViewMode {
 
 /// Size of a graph node button.
 const GRAPH_NODE_SIZE: egui::Vec2 = egui::vec2(120.0, 18.0);
-/// Initial and minimum height of the chat panel under the grid.
-const CHAT_PANEL_DEFAULT_HEIGHT: f32 = 200.0;
-const CHAT_PANEL_MIN_HEIGHT: f32 = 90.0;
-/// The grid never shrinks below this, however tall chat gets.
+/// Initial and minimum width of the chat column on the right.
+const CHAT_PANEL_DEFAULT_WIDTH: f32 = 380.0;
+const CHAT_PANEL_MIN_WIDTH: f32 = 240.0;
+/// The data side (grid, graph) never narrows below this, however
+/// wide chat gets.
+const DATA_MIN_WIDTH: f32 = 320.0;
+/// Minimum height of the graph under the grid in Split view.
+const GRAPH_PANEL_MIN_HEIGHT: f32 = 120.0;
+/// The grid never shrinks below this, however tall the graph gets.
 const GRID_MIN_HEIGHT: f32 = 120.0;
+/// The whole UI's scale: where it starts, its bounds, and one step of
+/// Ctrl+= / Ctrl+-.
+pub const DEFAULT_ZOOM: f32 = 1.25;
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 3.0;
+const ZOOM_STEP: f32 = 0.1;
+/// The chat input's id, so Ctrl+L can focus it.
+const CHAT_INPUT_ID: &str = "chat-input";
+
+/// `zoom` rounded to a 5% step and kept within bounds; anything that is
+/// not a number is the default.
+pub fn clamp_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return DEFAULT_ZOOM;
+    }
+    ((zoom * 20.0).round() / 20.0).clamp(MIN_ZOOM, MAX_ZOOM)
+}
 /// Bounds for the llama.cpp settings in the Settings window.
 const LLM_MAX_GPU_LAYERS: u32 = 999;
 const LLM_MIN_N_CTX: u32 = 512;
@@ -78,6 +100,13 @@ pub struct UiPrefs {
     /// Read-only mode: cells cannot be edited and saving is off.
     #[serde(default)]
     pub read_only: bool,
+    /// The UI scale; `None` = [`DEFAULT_ZOOM`].
+    #[serde(default)]
+    pub zoom: Option<f32>,
+    /// Where `save` writes, when not the usual [`UiPrefs::path`]
+    /// (tests use a scratch file).
+    #[serde(skip)]
+    pub file: Option<std::path::PathBuf>,
 }
 
 /// GridTalk's config directory: `$GRIDTALK_CONFIG_DIR` when set,
@@ -154,6 +183,10 @@ fn edit_buffer_matches(
 }
 
 impl UiPrefs {
+    /// The saved UI scale, or the default.
+    pub fn zoom(&self) -> f32 {
+        clamp_zoom(self.zoom.unwrap_or(DEFAULT_ZOOM))
+    }
     pub fn path() -> std::path::PathBuf {
         config_dir().join("ui-state.json")
     }
@@ -193,13 +226,14 @@ impl UiPrefs {
                     .get("read_only")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                prefs.zoom = value.get("zoom").and_then(|v| v.as_f64()).map(|z| z as f32);
                 prefs
             }),
             Err(_) => UiPrefs::default(),
         }
     }
     pub fn save(&self) {
-        let p = Self::path();
+        let p = self.file.clone().unwrap_or_else(Self::path);
         if let Some(parent) = p.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!(
@@ -385,6 +419,8 @@ pub struct GridTalkApp {
     /// query at `find_revision`, and the match shown.
     find_open: bool,
     find_focus: bool,
+    /// Focus the chat input next frame (Ctrl+L).
+    chat_focus: bool,
     find_query: String,
     find_matches: Vec<find::Match>,
     find_for: Option<(String, u64)>,
@@ -490,6 +526,7 @@ impl GridTalkApp {
             grid_editor_focus: None,
             find_open: false,
             find_focus: false,
+            chat_focus: false,
             find_query: String::new(),
             find_matches: Vec::new(),
             find_for: None,
@@ -1037,6 +1074,20 @@ impl GridTalkApp {
         if self.find_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.find_open = false;
         }
+        if pressed(Modifiers::COMMAND, Key::L) {
+            self.chat_focus = true;
+        }
+        // Zoom works while typing too, as in a browser. Ctrl+Plus is
+        // Ctrl+Shift+= on many layouts; the extra Shift is ignored.
+        if pressed(Modifiers::COMMAND, Key::Plus) || pressed(Modifiers::COMMAND, Key::Equals) {
+            self.set_zoom(ctx, ctx.zoom_factor() + ZOOM_STEP);
+        }
+        if pressed(Modifiers::COMMAND, Key::Minus) {
+            self.set_zoom(ctx, ctx.zoom_factor() - ZOOM_STEP);
+        }
+        if pressed(Modifiers::COMMAND, Key::Num0) {
+            self.set_zoom(ctx, DEFAULT_ZOOM);
+        }
         let typing_in_field = ctx
             .memory(|m| m.focused())
             .is_some_and(|id| Some(id) != self.grid_editor_focus || self.history.typing());
@@ -1050,6 +1101,16 @@ impl GridTalkApp {
             self.redo();
         } else if pressed(Modifiers::COMMAND, Key::Z) {
             self.undo();
+        }
+    }
+
+    /// Scale the whole UI to `zoom` (clamped) and remember it.
+    fn set_zoom(&mut self, ctx: &egui::Context, zoom: f32) {
+        let zoom = clamp_zoom(zoom);
+        ctx.set_zoom_factor(zoom);
+        if self.prefs.zoom != Some(zoom) {
+            self.prefs.zoom = Some(zoom);
+            self.prefs.save();
         }
     }
 
@@ -1871,7 +1932,9 @@ impl eframe::App for GridTalkApp {
         }
 
         egui::Panel::top("menu").show(ui_root, |ui| {
-            ui.horizontal(|ui| {
+            // Wrapped, so a narrow or zoomed-in window keeps every
+            // button reachable.
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Open…").on_hover_text("Ctrl+O").clicked() {
                     self.open_dialog();
                 }
@@ -1997,9 +2060,29 @@ impl eframe::App for GridTalkApp {
                         self.refresh_adapter_cache();
                     }
                 }
-                ui.label(egui::RichText::new(&self.status).small())
-                    .on_hover_text(&self.status);
+                ui.separator();
+                let zoom = ctx.zoom_factor();
+                if ui.button("−").on_hover_text("Zoom out (Ctrl+-)").clicked() {
+                    self.set_zoom(&ctx, zoom - ZOOM_STEP);
+                }
+                if ui
+                    .button(format!("{:.0}%", zoom * 100.0))
+                    .on_hover_text(format!(
+                        "Reset zoom to {:.0}% (Ctrl+0)",
+                        DEFAULT_ZOOM * 100.0
+                    ))
+                    .clicked()
+                {
+                    self.set_zoom(&ctx, DEFAULT_ZOOM);
+                }
+                if ui.button("+").on_hover_text("Zoom in (Ctrl+=)").clicked() {
+                    self.set_zoom(&ctx, zoom + ZOOM_STEP);
+                }
             });
+        });
+        egui::Panel::bottom("status").show(ui_root, |ui| {
+            ui.add(egui::Label::new(&self.status).truncate())
+                .on_hover_text(&self.status);
         });
 
         if !self.prefs.first_run_done {
@@ -2190,47 +2273,52 @@ impl eframe::App for GridTalkApp {
             });
         }
 
-        match self.sync.mode {
-            ViewMode::GridFull => {
-                egui::CentralPanel::default().show(ui_root, |ui| {
-                    self.grid_and_chat(ui);
-                });
+        // Chat is the app's main way in, so it is a full-height column
+        // in every view. egui reserves its space first, so the grid
+        // and graph fill the rest and can never push it off screen.
+        let max_chat = (ui_root.available_width() - DATA_MIN_WIDTH).max(CHAT_PANEL_MIN_WIDTH);
+        egui::Panel::right("chat")
+            .resizable(true)
+            .default_size(CHAT_PANEL_DEFAULT_WIDTH.min(max_chat))
+            .min_size(CHAT_PANEL_MIN_WIDTH)
+            .max_size(max_chat)
+            .show(ui_root, |ui| self.chat_section(ui));
+        egui::CentralPanel::default().show(ui_root, |ui| {
+            // Above both panes, so find works in the Graph view too
+            // (a match selects its node there).
+            if self.find_open {
+                self.find_bar(ui);
             }
-            ViewMode::GraphFull => {
-                egui::CentralPanel::default().show(ui_root, |ui| {
-                    self.graph_pane(ui);
-                });
-            }
-            ViewMode::Split => {
-                egui::Panel::right("graph")
-                    .resizable(true)
-                    .default_size(420.0)
-                    .show(ui_root, |ui| {
-                        self.graph_pane(ui);
-                    });
-                egui::CentralPanel::default().show(ui_root, |ui| {
-                    self.grid_and_chat(ui);
-                });
-            }
-        }
+            self.data_panes(ui);
+        });
     }
 }
 
 impl GridTalkApp {
-    fn grid_and_chat(&mut self, ui: &mut egui::Ui) {
-        // Chat is a resizable bottom panel; egui reserves its space
-        // before the grid lays out, so the grid fills the rest and
-        // can never push chat off screen.
-        let max_chat = (ui.available_height() - GRID_MIN_HEIGHT).max(CHAT_PANEL_MIN_HEIGHT);
-        egui::Panel::bottom("chat")
-            .resizable(true)
-            .default_size(CHAT_PANEL_DEFAULT_HEIGHT.min(max_chat))
-            .min_size(CHAT_PANEL_MIN_HEIGHT)
-            .max_size(max_chat)
-            .show(ui, |ui| self.chat_section(ui));
-        if self.find_open {
-            self.find_bar(ui);
+    /// The grid, the graph, or both, as the view mode says.
+    fn data_panes(&mut self, ui: &mut egui::Ui) {
+        match self.sync.mode {
+            ViewMode::GridFull => self.grid_pane(ui),
+            ViewMode::GraphFull => self.graph_pane(ui),
+            ViewMode::Split => {
+                // The graph sits under the grid, resizable, and never
+                // squeezes the grid below its minimum.
+                let max_graph =
+                    (ui.available_height() - GRID_MIN_HEIGHT).max(GRAPH_PANEL_MIN_HEIGHT);
+                egui::Panel::bottom("graph")
+                    .resizable(true)
+                    .default_size(
+                        (ui.available_height() * 0.4).clamp(GRAPH_PANEL_MIN_HEIGHT, max_graph),
+                    )
+                    .min_size(GRAPH_PANEL_MIN_HEIGHT)
+                    .max_size(max_graph)
+                    .show(ui, |ui| self.graph_pane(ui));
+                self.grid_pane(ui);
+            }
         }
+    }
+
+    fn grid_pane(&mut self, ui: &mut egui::Ui) {
         // Collect edits/clicks while rendering; apply after.
         let mut pending_edit: Option<CellEdit> = None;
         // An editor that lost focus ends its typing session for undo.
@@ -2523,73 +2611,151 @@ impl GridTalkApp {
 
     /// Chat log and input, drawn in the bottom panel under the grid.
     fn chat_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Chat");
-        let mut clicked_source: Option<RangeRef> = None;
-        // Input row pinned to the bottom, log filling the rest: the
-        // content always uses the panel's full height, so egui never
-        // shrinks the panel to fit it.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.chat_input);
-                let ask_enabled = !self.chat_input.is_empty() && !self.chat_busy;
-                if (ui
-                    .add_enabled(ask_enabled, egui::Button::new("Ask"))
+        ui.horizontal(|ui| {
+            ui.heading("Chat");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.chat.is_empty() && !self.chat_busy,
+                        egui::Button::new("Clear"),
+                    )
+                    .on_hover_text("Remove every message")
                     .clicked()
-                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
-                    && ask_enabled
                 {
-                    self.ask();
+                    self.chat.clear();
+                    self.chat_dropped = 0;
                 }
             });
+        });
+        if !self.workbook_name.is_empty() {
+            ui.weak(format!("Ask about {}", self.workbook_name));
+        }
+        ui.separator();
+        let mut clicked_source: Option<RangeRef> = None;
+        // Input pinned to the bottom, messages filling the rest: the
+        // content always uses the column's full height.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.weak("Enter asks · Shift+Enter adds a line · Ctrl+L focuses");
+            let input_id = egui::Id::unique(CHAT_INPUT_ID);
+            let ask_enabled = !self.chat_input.trim().is_empty() && !self.chat_busy;
+            // Plain Enter asks; take it before the text box would add
+            // a line break.
+            let enter = ui.memory(|m| m.has_focus(input_id))
+                && ui.input_mut(|i| {
+                    !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter)
+                });
+            let mut ask = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+                    if ui
+                        .add_enabled(ask_enabled, egui::Button::new("Ask"))
+                        .clicked()
+                    {
+                        ask = true;
+                    }
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut self.chat_input)
+                            .id(input_id)
+                            .hint_text("Ask a question about this workbook…")
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if std::mem::take(&mut self.chat_focus) {
+                        resp.request_focus();
+                    }
+                });
+            });
+            if (ask || enter) && ask_enabled {
+                self.ask();
+                ui.memory_mut(|m| m.request_focus(input_id));
+            }
             egui::ScrollArea::vertical()
                 .id_salt("chat")
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    if self.chat_dropped > 0 {
-                        ui.weak(format!(
-                            "{} earlier message{} removed: the chat keeps the last {MAX_CHAT}.",
-                            self.chat_dropped,
-                            if self.chat_dropped == 1 {
-                                " was"
-                            } else {
-                                "s were"
-                            }
-                        ));
-                    }
-                    for msg in &self.chat {
-                        ui.label(format!("{}: {}", msg.role, msg.text));
-                        if !msg.sources.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.weak("Sources:");
-                                for range in &msg.sources {
-                                    if ui
-                                        .link(range.a1())
-                                        .on_hover_text("Select these cells")
-                                        .clicked()
-                                    {
-                                        clicked_source = Some(range.clone());
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    if self.chat_busy {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Generating… (on a worker thread; the grid stays live)");
-                            if ui.button("Cancel").clicked() {
-                                if let Some(cancel) = &self.chat_cancel {
-                                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                self.status = "Cancelling generation…".into();
-                            }
-                        });
-                    }
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        self.chat_messages(ui, &mut clicked_source);
+                    });
                 });
         });
         if let Some(range) = clicked_source {
             self.select_source(&range);
+        }
+    }
+
+    /// The chat log: each message under who sent it, with links to
+    /// the cells an answer cites.
+    fn chat_messages(&mut self, ui: &mut egui::Ui, clicked_source: &mut Option<RangeRef>) {
+        if self.chat.is_empty() && !self.chat_busy {
+            ui.add_space(8.0);
+            ui.weak(if self.workbook_name.is_empty() {
+                "Open a workbook, then ask about it here."
+            } else {
+                "Ask about the data, for example \"What is the total of Qty?\". \
+                 Answers cite the cells they come from; click one to select it."
+            });
+        }
+        if self.chat_dropped > 0 {
+            ui.weak(format!(
+                "{} earlier message{} removed: the chat keeps the last {MAX_CHAT}.",
+                self.chat_dropped,
+                if self.chat_dropped == 1 {
+                    " was"
+                } else {
+                    "s were"
+                }
+            ));
+        }
+        for msg in &self.chat {
+            let visuals = ui.visuals();
+            let (who, colour, fill) = match msg.role.as_str() {
+                "you" => ("You", visuals.strong_text_color(), visuals.faint_bg_color),
+                "error" => ("Error", visuals.error_fg_color, egui::Color32::TRANSPARENT),
+                "gridtalk" => (
+                    "GridTalk",
+                    visuals.hyperlink_color,
+                    egui::Color32::TRANSPARENT,
+                ),
+                // An answer names the backend that wrote it.
+                backend => (backend, visuals.hyperlink_color, egui::Color32::TRANSPARENT),
+            };
+            egui::Frame::new()
+                .fill(fill)
+                .corner_radius(4.0)
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(who).strong().color(colour));
+                    ui.label(&msg.text);
+                    if !msg.sources.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak("Sources:");
+                            for range in &msg.sources {
+                                if ui
+                                    .link(range.a1())
+                                    .on_hover_text("Select these cells")
+                                    .clicked()
+                                {
+                                    *clicked_source = Some(range.clone());
+                                }
+                            }
+                        });
+                    }
+                });
+            ui.add_space(4.0);
+        }
+        if self.chat_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Generating…");
+                if ui.button("Cancel").clicked() {
+                    if let Some(cancel) = &self.chat_cancel {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.status = "Cancelling generation…".into();
+                }
+            });
         }
     }
 
@@ -2773,10 +2939,21 @@ fn main() -> eframe::Result<()> {
         app.open(std::path::Path::new(path));
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 760.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]),
         ..Default::default()
     };
-    eframe::run_native("GridTalk", options, Box::new(|_cc| Ok(Box::new(app))))
+    let zoom = app.prefs.zoom();
+    eframe::run_native(
+        "GridTalk",
+        options,
+        Box::new(move |cc| {
+            // GridTalk handles the zoom keys itself, so the zoom is
+            // saved and Ctrl+0 returns to GridTalk's default.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            cc.egui_ctx.set_zoom_factor(zoom);
+            Ok(Box::new(app))
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -2792,7 +2969,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("in.csv");
         std::fs::write(&source, text).unwrap();
-        let mut app = GridTalkApp::with_prefs(UiPrefs::default());
+        // Prefs go to the scratch folder, never the real ui-state.json.
+        let mut app = GridTalkApp::with_prefs(UiPrefs {
+            file: Some(dir.join("ui-state.json")),
+            ..UiPrefs::default()
+        });
         app.open(&source);
         (app, dir)
     }
@@ -3190,6 +3371,59 @@ mod tests {
         );
         // Only removals on an empty file write nothing.
         assert_eq!(merge_inference_config("", &[("n_ctx", None)]), "\n");
+    }
+
+    #[test]
+    fn zoom_keys_scale_the_ui_and_the_zoom_is_saved() {
+        let (mut app, dir) = app_with("zoom", "Item,Qty\nApples,2\n");
+        let ctx = egui::Context::default();
+        // A new zoom takes effect when the next pass begins.
+        let zoom = |ctx: &egui::Context| {
+            ctx.begin_pass(RawInput::default());
+            ctx.end_pass().textures_delta.clear();
+            ctx.zoom_factor()
+        };
+        ctx.set_zoom_factor(app.prefs.zoom());
+        assert_eq!(zoom(&ctx), DEFAULT_ZOOM);
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Equals);
+        assert_eq!(zoom(&ctx), 1.35);
+        // Ctrl+Plus arrives with Shift on many layouts.
+        press(
+            &mut app,
+            &ctx,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Key::Plus,
+        );
+        assert_eq!(zoom(&ctx), 1.45);
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Minus);
+        assert_eq!(zoom(&ctx), 1.35);
+        let saved: UiPrefs =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("ui-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.zoom(), 1.35);
+        // Ctrl+0 returns to GridTalk's default, not egui's 100%.
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::Num0);
+        assert_eq!(zoom(&ctx), DEFAULT_ZOOM);
+        // Zoom stays within bounds.
+        for _ in 0..40 {
+            press(&mut app, &ctx, Modifiers::COMMAND, Key::Minus);
+            zoom(&ctx);
+        }
+        assert_eq!(zoom(&ctx), MIN_ZOOM);
+        // Ctrl+L asks for the chat input's focus.
+        press(&mut app, &ctx, Modifiers::COMMAND, Key::L);
+        assert!(app.chat_focus);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_zoom_is_clamped_and_defaults_when_missing() {
+        let old: UiPrefs = serde_json::from_str(r#"{"mode_by_workbook":{}}"#).unwrap();
+        assert_eq!(old.zoom(), DEFAULT_ZOOM);
+        let huge: UiPrefs = serde_json::from_str(r#"{"mode_by_workbook":{},"zoom":40}"#).unwrap();
+        assert_eq!(huge.zoom(), MAX_ZOOM);
+        assert_eq!(clamp_zoom(f32::NAN), DEFAULT_ZOOM);
+        assert_eq!(clamp_zoom(1.26), 1.25);
     }
 
     #[test]
