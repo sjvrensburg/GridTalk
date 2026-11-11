@@ -9,6 +9,7 @@ mod find;
 mod history;
 mod layout;
 
+use egui::{Key, KeyboardShortcut, Modifiers};
 use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
@@ -378,6 +379,8 @@ pub struct GridTalkApp {
     chat_dropped: usize,
     /// Grid edits that undo and redo walk through.
     history: History,
+    /// The grid cell editor that had the keyboard last frame, if any.
+    grid_editor_focus: Option<egui::Id>,
     /// The find bar (Ctrl+F): open, its query, the matches for that
     /// query at `find_revision`, and the match shown.
     find_open: bool,
@@ -484,6 +487,7 @@ impl GridTalkApp {
             chat_sources: Vec::new(),
             chat_dropped: 0,
             history: History::default(),
+            grid_editor_focus: None,
             find_open: false,
             find_focus: false,
             find_query: String::new(),
@@ -1012,11 +1016,11 @@ impl GridTalkApp {
 
     /// Keyboard shortcuts: Ctrl+S save, Ctrl+O open, Ctrl+F find,
     /// Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo (Cmd on macOS), Escape
-    /// closes the find bar. Undo and redo act on grid edits only when
-    /// no text field has the keyboard, so a cell editor keeps egui's
-    /// own text undo while it is being typed in.
+    /// closes the find bar. Undo and redo act on grid edits unless a
+    /// text field is being typed in, so a cell editor keeps egui's own
+    /// text undo while it is being typed in; a grid cell that was only
+    /// clicked into (not typed in yet) has no text to undo.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, KeyboardShortcut, Modifiers};
         let pressed = |modifiers: Modifiers, key: Key| {
             ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(modifiers, key)))
         };
@@ -1033,7 +1037,10 @@ impl GridTalkApp {
         if self.find_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.find_open = false;
         }
-        if ctx.memory(|m| m.focused().is_some()) {
+        let typing_in_field = ctx
+            .memory(|m| m.focused())
+            .is_some_and(|id| Some(id) != self.grid_editor_focus || self.history.typing());
+        if typing_in_field {
             return;
         }
         // Redo first: Ctrl+Z would also match Ctrl+Shift+Z.
@@ -1047,43 +1054,42 @@ impl GridTalkApp {
     }
 
     fn undo(&mut self) {
-        if self.is_read_only() {
-            self.status = "Read-only mode is on: nothing is undone.".into();
-            return;
-        }
-        match self.history.undo() {
-            Some(change) => {
-                let cell = format!(
-                    "{}!{}{}",
-                    change.sheet,
-                    gridtalk_graph::col_name(change.col),
-                    change.row + 1
-                );
-                self.apply_change(&change.sheet, change.row, change.col, change.before);
-                self.status = format!("Undid the edit of {cell} (Ctrl+Y redoes it).");
-            }
-            None => self.status = "Nothing to undo.".into(),
-        }
+        self.step_history(true);
     }
 
     fn redo(&mut self) {
+        self.step_history(false);
+    }
+
+    /// Undo (`back`) or redo one grid edit.
+    fn step_history(&mut self, back: bool) {
         if self.is_read_only() {
-            self.status = "Read-only mode is on: nothing is redone.".into();
+            let verb = if back { "undone" } else { "redone" };
+            self.status = format!("Read-only mode is on: nothing is {verb}.");
             return;
         }
-        match self.history.redo() {
-            Some(change) => {
-                let cell = format!(
-                    "{}!{}{}",
-                    change.sheet,
-                    gridtalk_graph::col_name(change.col),
-                    change.row + 1
-                );
-                self.apply_change(&change.sheet, change.row, change.col, change.after);
-                self.status = format!("Redid the edit of {cell}.");
-            }
-            None => self.status = "Nothing to redo.".into(),
+        let change = if back {
+            self.history.undo()
+        } else {
+            self.history.redo()
+        };
+        let Some(change) = change else {
+            self.status = format!("Nothing to {}.", if back { "undo" } else { "redo" });
+            return;
+        };
+        let cell = gridtalk_graph::CellRef {
+            sheet: change.sheet.clone(),
+            row: change.row,
+            col: change.col,
         }
+        .a1();
+        let value = if back { change.before } else { change.after };
+        self.apply_change(&change.sheet, change.row, change.col, value);
+        self.status = if back {
+            format!("Undid the edit of {cell} (Ctrl+Y redoes it).")
+        } else {
+            format!("Redid the edit of {cell}.")
+        };
     }
 
     /// Set a cell for undo or redo: record the edit (not in the
@@ -1158,8 +1164,20 @@ impl GridTalkApp {
         };
         let key = (self.find_query.clone(), inc.revision);
         if self.find_for.as_ref() != Some(&key) {
-            self.find_matches = find::find_cells(inc.snapshot(), &self.find_query);
-            self.find_pos = 0;
+            let snapshot = inc.snapshot();
+            self.find_matches = find::find_cells(snapshot, &self.find_query);
+            // An edit re-runs the search: carry on from the selected
+            // match, if it still is one, instead of the first.
+            let selected = self.sync.selected_range.as_ref().and_then(|sel| {
+                let s = snapshot
+                    .sheets
+                    .iter()
+                    .position(|sh| gridtalk_graph::sheet_name_eq(&sh.name, &sel.sheet))?;
+                (sel.r0 == sel.r1 && sel.c0 == sel.c1).then_some((s, sel.r0, sel.c0))
+            });
+            self.find_pos = selected
+                .and_then(|m| self.find_matches.binary_search(&m).ok())
+                .unwrap_or(0);
             self.find_for = Some(key);
         }
     }
@@ -1349,7 +1367,9 @@ impl GridTalkApp {
         self.status = match write_inference_config(&path, &updates) {
             Ok(()) => {
                 // The cleartext warning follows the saved backend.
-                self.load_llm_settings();
+                // Only it is reloaded: unsaved GPU-layer and context
+                // edits in the section below must survive this save.
+                self.llm_cleartext = cleartext_warning(&Config::load(&path).inference);
                 format!(
                     "Backend saved to {}; it answers the next question.",
                     path.display()
@@ -2215,6 +2235,7 @@ impl GridTalkApp {
         let mut pending_edit: Option<CellEdit> = None;
         // An editor that lost focus ends its typing session for undo.
         let mut typing_ended = false;
+        let mut focused_editor: Option<egui::Id> = None;
         let mut clicked_cell: Option<(String, usize, usize)> = None;
         // Sheet tabs need the sheet list; take names from the cached
         // sheet plus the snapshot sheet count via inc (names only).
@@ -2349,6 +2370,9 @@ impl GridTalkApp {
                                 // editor even once its debounced edit
                                 // lands as a formula.
                                 let editing = ui.memory(|m| m.has_focus(editor_id));
+                                if editing {
+                                    focused_editor = Some(editor_id);
+                                }
                                 let show_value = is_formula && !show_formulas && !editing;
                                 if read_only || show_value {
                                     // Not editable here: a clickable,
@@ -2482,6 +2506,7 @@ impl GridTalkApp {
         if typing_ended {
             self.history.end_typing();
         }
+        self.grid_editor_focus = focused_editor;
     }
 
     /// An edit typed into the grid: recorded for undo with the value
@@ -2757,7 +2782,7 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{Event, Key, Modifiers, RawInput};
+    use egui::{Event, RawInput};
     use gridtalk_graph::parse_delimited;
 
     /// An app with `text` open as `in.csv` in a fresh scratch folder.
@@ -2908,6 +2933,25 @@ mod tests {
     }
 
     #[test]
+    fn find_carries_on_from_the_selected_match_after_an_edit() {
+        let (mut app, dir) = app_with("find-edit", "Item,Qty\nfig,1\nfig,2\nfig,3\n");
+        app.find_query = "fig".into();
+        app.find_step(true);
+        app.find_step(true);
+        assert_eq!(app.status, "Match 2 of 3.");
+        // An edit elsewhere re-runs the search; Next goes on to the third.
+        let inc = app.inc.as_mut().unwrap();
+        inc.record_edit(typed(9.0), std::time::Instant::now());
+        inc.flush();
+        app.find_step(true);
+        assert_eq!(
+            app.sync.selected_range.as_ref().unwrap().a1(),
+            "Sheet1!A4:A4"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn chat_sources_select_their_range_and_dropped_messages_are_counted() {
         let (mut app, dir) = app_with("chat", "Item,Qty\nApples,2\n");
         let range = RangeRef {
@@ -2955,6 +2999,8 @@ mod tests {
         app.set_base_url = "http://203.0.113.5/v1".into();
         app.set_model = "qwen".into();
         app.set_api_key_env = "MY_KEY".into();
+        // An unsaved context-size edit in the model section.
+        app.llm_n_ctx = Some(8192);
         app.save_backend_settings();
         assert!(app.status.starts_with("Backend saved"), "{}", app.status);
         let text = std::fs::read_to_string(&config).unwrap();
@@ -2968,9 +3014,10 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line} missing:\n{text}");
         }
-        // Reloaded from the file, with the plain-http warning.
-        assert_eq!(app.set_model, "qwen");
+        // The plain-http warning follows the saved backend; unsaved
+        // model settings are kept.
         assert!(app.llm_cleartext.is_some());
+        assert_eq!(app.llm_n_ctx, Some(8192));
         // A local backend needs a .gguf file that exists.
         app.set_backend = "local".into();
         app.set_model_path = dir.join("missing.gguf").display().to_string();

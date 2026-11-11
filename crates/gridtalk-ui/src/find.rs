@@ -9,9 +9,9 @@ pub const MAX_MATCHES: usize = 10_000;
 /// A matching cell: sheet index, row, column.
 pub type Match = (usize, usize, usize);
 
-/// The cells whose shown value, or formula text, contains `query`
-/// (ignoring case), sheet by sheet in reading order. A blank query
-/// matches nothing.
+/// The cells whose shown value, or formula text as typed (`=SUM(..)`),
+/// contains `query` (ignoring case), sheet by sheet in reading order.
+/// A blank query matches nothing.
 pub fn find_cells(wb: &WorkbookSnapshot, query: &str) -> Vec<Match> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
@@ -24,7 +24,7 @@ pub fn find_cells(wb: &WorkbookSnapshot, query: &str) -> Vec<Match> {
                 let hit = match cell {
                     CellValue::Empty => false,
                     CellValue::Formula { expr, .. } => {
-                        expr.to_lowercase().contains(&needle)
+                        format!("={expr}").to_lowercase().contains(&needle)
                             || cell.display().to_lowercase().contains(&needle)
                     }
                     _ => cell.display().to_lowercase().contains(&needle),
@@ -56,6 +56,12 @@ mod tests {
         assert_eq!(find_cells(&wb, "APPLE"), [(0, 1, 0), (0, 2, 0), (1, 0, 0)]);
         // Formula text is searched, not only the value.
         assert_eq!(find_cells(&wb, "b2*"), [(0, 2, 1)]);
+        // A formula with a saved result is found by its `=` text too.
+        *wb.sheets[1].cell_mut(0, 1) = CellValue::Formula {
+            expr: "SUM(Data!B2)".into(),
+            cached: Some(Box::new(CellValue::Number(2.0))),
+        };
+        assert_eq!(find_cells(&wb, "=sum("), [(1, 0, 1)]);
         assert!(find_cells(&wb, "   ").is_empty());
         assert!(find_cells(&wb, "zebra").is_empty());
     }

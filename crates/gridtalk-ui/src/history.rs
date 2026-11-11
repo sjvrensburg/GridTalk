@@ -62,6 +62,11 @@ impl History {
         }
     }
 
+    /// Whether a cell is being typed into (its change is still open).
+    pub fn typing(&self) -> bool {
+        self.typing
+    }
+
     /// The cell being typed into lost focus: the next edit, even of
     /// the same cell, is a new change.
     pub fn end_typing(&mut self) {
