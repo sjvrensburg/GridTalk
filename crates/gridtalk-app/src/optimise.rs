@@ -142,6 +142,23 @@ fn card_best_effort(root: &std::path::Path, name: &str, entry: &str) {
     }
 }
 
+/// Why a round failed: scoring (the backend, or tasks it failed) or
+/// committing the accepted version to disk.
+#[derive(Debug)]
+pub enum OptimiseError {
+    Scoring(String),
+    Commit(String),
+}
+
+impl std::fmt::Display for OptimiseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptimiseError::Scoring(e) => write!(f, "scoring failed: {e}"),
+            OptimiseError::Commit(e) => write!(f, "committing the adapter failed: {e}"),
+        }
+    }
+}
+
 /// One optimise round: score the current adapter (train+dev),
 /// try candidates on train best-first, gate each on dev until one
 /// passes, and commit or record rejection in CARD.md.
@@ -152,7 +169,7 @@ pub fn optimise_round(
     backend: &dyn ChatBackend,
     current: &Adapter,
     round: usize,
-) -> Result<RoundOutcome, String> {
+) -> Result<RoundOutcome, OptimiseError> {
     let train_n = workbook_tasks.iter().filter(|t| t.split == "train").count();
     let dev_n = workbook_tasks.iter().filter(|t| t.split == "dev").count();
     // Memoise identical adapter evaluations within the round.
@@ -213,7 +230,7 @@ pub fn optimise_round(
                 &current.name,
                 &format!("\n## Round {round}: SCORE FAILED\n\n- error: {e}\n"),
             );
-            Err(e)
+            Err(OptimiseError::Scoring(e))
         }
     };
     let (baseline_train_opt, baseline_results) =
@@ -282,7 +299,7 @@ pub fn optimise_round(
                             dev_acc * 100.0
                         ),
                     );
-                    return Err(e);
+                    return Err(OptimiseError::Commit(e));
                 }
             };
             let mut entry = format!(
