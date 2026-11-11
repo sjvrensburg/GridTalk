@@ -10,7 +10,7 @@ mod layout;
 use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
     adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
-    valid_adapter_name,
+    valid_adapter_name, write_atomic_bytes,
 };
 use gridtalk_graph::{
     build_graph_cached, load_path, CellEdit, CellValue, Graph, GraphCache, IncrementalSnapshot,
@@ -23,8 +23,7 @@ use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -132,67 +131,6 @@ fn gridcraft_binary_ui() -> Option<std::path::PathBuf> {
         }
     }
     None
-}
-
-/// Write bytes atomically and durably: an exclusive temp file beside
-/// `path`, fsync, rename, fsync the directory; the temp is removed on
-/// failure.
-fn write_atomic_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    let (tmp, mut f) = create_temp_beside(path).map_err(|e| e.to_string())?;
-    let write = (|| -> std::io::Result<()> {
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    })();
-    match write {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e.to_string())
-        }
-    }
-}
-
-/// A new temp file beside `path`, opened with `create_new` (O_EXCL):
-/// a file or symlink planted at the name is never opened or followed,
-/// and another name is tried instead. Callers write through the
-/// returned handle and never reopen the temp by path.
-fn create_temp_beside(path: &std::path::Path) -> std::io::Result<(PathBuf, std::fs::File)> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
-    for _ in 0..64 {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let tmp = path.with_file_name(format!(".{name}.tmp-{}-{nanos:x}-{n}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => return Ok((tmp, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "could not create a unique temp file beside {}",
-            path.display()
-        ),
-    ))
 }
 
 /// Parsed-value equality for edit-buffer pruning: a formula buffer

@@ -138,19 +138,25 @@ impl OpenWorkbook {
     /// (`None` when it did not). The path must still resolve inside
     /// the roots: a directory swapped for a symlink after the open is
     /// caught here.
-    fn fresh(&self, roots: &[PathBuf]) -> Result<Option<Box<OpenWorkbook>>, String> {
+    fn fresh(&self, roots: &[PathBuf]) -> Result<Option<Box<OpenWorkbook>>, (ErrorKind, String)> {
         let unavailable = || {
-            format!(
-                "workbook {} was deleted or became unreadable",
-                self.path.display()
+            (
+                ErrorKind::WorkbookUnavailable,
+                format!(
+                    "workbook {} was deleted or became unreadable",
+                    self.path.display()
+                ),
             )
         };
         let resolved = std::fs::canonicalize(&self.path).map_err(|_| unavailable())?;
         if !path_allowed(roots, &resolved) {
-            return Err(format!(
-                "workbook {} now resolves to {}, outside the server's --root directories",
-                self.path.display(),
-                resolved.display()
+            return Err((
+                ErrorKind::PathNotAllowed,
+                format!(
+                    "workbook {} now resolves to {}, outside the server's --root directories",
+                    self.path.display(),
+                    resolved.display()
+                ),
             ));
         }
         // Stat first (cheap): unchanged stat means no re-read at
@@ -172,7 +178,8 @@ impl OpenWorkbook {
                 return Ok(None);
             }
         }
-        let mut reloaded = OpenWorkbook::load(&resolved)?;
+        let mut reloaded =
+            OpenWorkbook::load(&resolved).map_err(|e| (ErrorKind::WorkbookUnavailable, e))?;
         reloaded.path = self.path.clone();
         Ok(Some(Box::new(reloaded)))
     }
@@ -272,6 +279,11 @@ enum Done {
     /// its file changed.
     Session {
         id: String,
+        /// The session the call started from: a reload replaces the
+        /// session only while it is still this one, so a slow (or
+        /// timed-out) call never installs an older revision over a
+        /// newer reload.
+        base: Arc<OpenWorkbook>,
         reload: Option<Box<OpenWorkbook>>,
         result: Result<Value, RpcError>,
     },
@@ -561,10 +573,21 @@ impl McpServer {
                 // missing when its directory is inside the roots, so
                 // the error never says what exists outside them.
                 let resolved = std::fs::canonicalize(&requested).map_err(|e| {
-                    let parent_inside = requested
-                        .parent()
-                        .and_then(|p| std::fs::canonicalize(p).ok())
-                        .is_some_and(|p| path_allowed(&self.options.roots, &p));
+                    // Without roots every path is allowed, so a missing
+                    // one is simply missing. A bare file name's parent
+                    // is "", which means the current directory.
+                    let parent_inside = self.options.roots.is_empty()
+                        || requested
+                            .parent()
+                            .map(|p| {
+                                if p.as_os_str().is_empty() {
+                                    Path::new(".")
+                                } else {
+                                    p
+                                }
+                            })
+                            .and_then(|p| std::fs::canonicalize(p).ok())
+                            .is_some_and(|p| path_allowed(&self.options.roots, &p));
                     (e, parent_inside)
                 });
                 let path = match resolved {
@@ -600,12 +623,13 @@ impl McpServer {
                     let open = Arc::clone(&self.workbooks[&id]);
                     let roots = self.options.roots.clone();
                     return Ok(Call::Later(Box::new(move || match open.fresh(&roots) {
-                        Err(e) => Done::Failed(tool_error(ErrorKind::WorkbookUnavailable, e)),
+                        Err((kind, e)) => Done::Failed(tool_error(kind, e)),
                         Ok(reload) => {
                             let mut payload = open_payload(&id, reload.as_deref().unwrap_or(&open));
                             payload["reused"] = json!(true);
                             Done::Session {
                                 id,
+                                base: open,
                                 reload,
                                 result: structured_result(payload, false),
                             }
@@ -661,9 +685,7 @@ impl McpServer {
                 Ok(Call::Later(Box::new(move || {
                     let reload = match open.fresh(&roots) {
                         Ok(reload) => reload,
-                        Err(e) => {
-                            return Done::Failed(tool_error(ErrorKind::WorkbookUnavailable, e))
-                        }
+                        Err((kind, e)) => return Done::Failed(tool_error(kind, e)),
                     };
                     let current = reload.as_deref().unwrap_or(&open);
                     let result = current.tools().call(&req);
@@ -677,6 +699,7 @@ impl McpServer {
                     }
                     Done::Session {
                         id,
+                        base: open,
                         reload,
                         result: structured_result(data, !result.ok),
                     }
@@ -697,11 +720,21 @@ impl McpServer {
     fn finish(&mut self, done: Done) -> Result<Value, RpcError> {
         match done {
             Done::Failed(result) => result,
-            Done::Session { id, reload, result } => {
+            Done::Session {
+                id,
+                base,
+                reload,
+                result,
+            } => {
                 // A session closed or evicted while the call ran stays
-                // gone; the call still gets its answer.
+                // gone, and one another call already replaced keeps
+                // its newer revision; the call still gets its answer.
                 if let Some(new) = reload {
-                    if self.workbooks.contains_key(&id) {
+                    if self
+                        .workbooks
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &base))
+                    {
                         self.workbooks.insert(id.clone(), Arc::from(new));
                         let evicted = self.make_room(0, 0, Some(&id));
                         if !evicted.is_empty() {
@@ -1001,28 +1034,30 @@ fn serve(
                     None => server.finish_late(done),
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                let expired: Vec<u64> = waiting
-                    .iter()
-                    .filter(|(_, (_, deadline))| *deadline <= now)
-                    .map(|(ticket, _)| *ticket)
-                    .collect();
-                for ticket in expired {
-                    if let Some((id, _)) = waiting.remove(&ticket) {
-                        let late = tool_error(
-                            ErrorKind::Timeout,
-                            format!(
-                                "the call did not finish within {}s (gridtalk mcp --timeout); it runs on and its result will be dropped. Narrow the request, e.g. a smaller range",
-                                timeout.as_secs()
-                            ),
-                        );
-                        write_frame(stdout, &response(id, late))?;
-                    }
-                }
-            }
+            // Expired calls are answered below, after every event.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             // The server holds a sender, so the channel never closes.
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Sweep on every pass, not only when the inbox goes quiet: a
+        // steady stream of frames would otherwise hold back timeouts.
+        let now = Instant::now();
+        let expired: Vec<u64> = waiting
+            .iter()
+            .filter(|(_, (_, deadline))| *deadline <= now)
+            .map(|(ticket, _)| *ticket)
+            .collect();
+        for ticket in expired {
+            if let Some((id, _)) = waiting.remove(&ticket) {
+                let late = tool_error(
+                    ErrorKind::Timeout,
+                    format!(
+                        "the call did not finish within {}s (gridtalk mcp --timeout); it runs on and its result will be dropped. Narrow the request, e.g. a smaller range",
+                        timeout.as_secs()
+                    ),
+                );
+                write_frame(stdout, &response(id, late))?;
+            }
         }
     }
     match closed {
@@ -1343,6 +1378,25 @@ mod tests {
             assert_eq!(
                 denied["result"]["structuredContent"]["error"]["kind"], "path_not_allowed",
                 "{denied}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `--root` a missing file is missing (`open_failed`),
+    /// even when its directory is missing too or it is a bare name.
+    #[test]
+    fn missing_paths_without_roots_are_open_failed() {
+        let dir = scratch("noroots");
+        let mut server = started(McpOptions::default());
+        for path in [
+            dir.join("no-such-dir").join("a.csv"),
+            PathBuf::from("gt-no-such-file-for-mcp-test.csv"),
+        ] {
+            let missing = rpc(&mut server, open_call(1, &path));
+            assert_eq!(
+                missing["result"]["structuredContent"]["error"]["kind"], "open_failed",
+                "{missing}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

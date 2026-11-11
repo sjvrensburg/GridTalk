@@ -954,7 +954,11 @@ pub fn gridcraft_binary() -> Option<std::path::PathBuf> {
 /// Warn (once per invocation) before passages leave the machine.
 fn warn_if_external(cfg: &Config) {
     if cfg.inference.backend == "openai-compatible" {
-        let url = cfg.inference.base_url.as_deref().unwrap_or("");
+        let url = cfg
+            .inference
+            .base_url
+            .as_deref()
+            .unwrap_or(gridtalk_infer::DEFAULT_BASE_URL);
         eprintln!(
             "gridtalk: note: external backend {url} will receive spreadsheet passages (including cell values) verbatim. Use a local model or a redacting proxy if that is not acceptable."
         );

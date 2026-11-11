@@ -364,12 +364,19 @@ pub fn list_adapters(root: &Path) -> Vec<String> {
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    write_atomic_bytes(path, text.as_bytes())
+}
+
+/// Write bytes atomically and durably: an exclusive (`create_new`)
+/// temp file beside `path`, fsync, rename, fsync the directory; the
+/// temp is removed on failure. Shared with the UI's saves.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let (tmp, mut f) = create_temp_beside(path).map_err(|e| e.to_string())?;
     // fsync the temp file before rename and the parent directory
     // after, so a power loss cannot lose a committed adapter.
     let result = (|| -> std::io::Result<()> {
-        f.write_all(text.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
