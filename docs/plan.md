@@ -136,11 +136,11 @@ Phase 3 — hardening (done 2026-11-10):
 - [x] Unpacked-size pre-scan of XLSX/ODS packages before Gridcraft parses them: the zip directory may declare at most 512 MiB. It reads only the directory, so a package that understates its sizes still passes; Gridcraft's reader then counts what it really unpacks (512 MiB per part, 1 GiB in all)
 - [x] `create_new` temp files (adapter files and version directories, UI prefs, config and saves); 64 GiB model import cap, also for a source that grows while copied; cleartext-`http` warning to remote hosts even without an API key (CLI, every UI chat answer, Settings and the first-run wizard); GGUF header checked while a download streams in (the magic and version on the first 8 bytes, the full header from 64 KiB, at each doubling)
 
-Phase 4 — tests and CI:
+Phase 4 — tests and CI (done 2026-11-11):
 
-- [ ] Subprocess MCP stdio test (handshake, open, error shapes, exit codes)
-- [ ] Synthetic `.xlsx` fixtures generated in tests; tests for the 4M-cell, 32 MiB and 256 MiB caps and empty workbooks
-- [ ] pytest step for `scripts/hermit`; MSRV `cargo test` if CI time allows
+- [x] Subprocess MCP stdio test (`crates/gridtalk-app/tests/mcp_stdio.rs`): runs the `gridtalk` binary to check calls refused before `initialize`, the handshake, a notification getting no reply, `tools/list`, an open/`get_cells`/reopen/close session under `--root`, tool errors (`unknown_workbook`, `path_not_allowed`) versus protocol errors (`unknown_tool`, a bad argument, an unknown method, a frame that is not JSON), a final request without a newline, exit 0 at end of input with nothing extra on stdout, and exit 1 with a `gridtalk:` message and no frames for bad flags
+- [x] Synthetic `.xlsx` files generated in tests with Gridcraft's writer (`crates/gridtalk-graph/tests/limits.rs`): values and formulas round-trip; the 4M-cell cap at and one row past the boundary, at Excel's last cell, and summed across sheets; the 32 MiB and 256 MiB file caps at and one byte past the cap (CSV, XLSX, ODS); empty workbooks (one or several empty sheets, an empty CSV, an empty sheet next to a filled one) load, build an empty graph and save
+- [x] CI runs `pytest scripts/hermit` (a `conftest.py` stands in for `hermit-harness`, so only a pinned pytest is installed), and the MSRV job runs `cargo test --workspace` on 1.95 instead of `cargo check`
 
 Phase 5 — features and UX:
 

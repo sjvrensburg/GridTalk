@@ -447,9 +447,9 @@ impl From<std::io::Error> for IngestError {
 }
 
 /// Ingestion cap for CSV/TSV files.
-const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_DELIMITED_BYTES: u64 = 32 * 1024 * 1024;
 /// Ingestion cap for XLSX/ODS packages.
-const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Largest total unpacked size an XLSX/ODS package may declare: room
 /// for a sheet at [`MAX_SNAPSHOT_CELLS`] plus its strings and styles,

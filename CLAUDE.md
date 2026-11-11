@@ -16,7 +16,8 @@ cargo test --locked --workspace
 
 - Single crate: `cargo test --locked -p gridtalk-graph`
 - Single test: `cargo test --locked -p gridtalk-graph <test_name_substring>`
-- MSRV is 1.95 (`rust-version` in the workspace); CI also runs `cargo check` on that toolchain, so don't use newer std/language features.
+- MSRV is 1.95 (`rust-version` in the workspace); CI also runs `cargo test` on that toolchain, so don't use newer std/language features.
+- CI also runs the Python mirror tests: `python -m pytest scripts/hermit -q` (only pytest needed; `conftest.py` stubs `hermit-harness` when it isn't installed).
 - Build prerequisites: the `vendor/gridcraft` submodule must be checked out (`git submodule update --init`), because `gridtalk-graph` path-depends on it. `gridtalk-infer` builds llama.cpp with Vulkan, so it needs the Vulkan SDK (`glslc`, headers, SPIRV-Headers) and CMake. The first build is slow.
 - Run the CLI: `cargo run -p gridtalk-app -- <command>` (binary `gridtalk`; `gridtalk help` lists commands such as `ask`, `investigate`, `graph`, `tools`, `mcp`, `bench`, `optimise`, `adapter`, `models`, `generate`). Desktop UI: `cargo run -p gridtalk-ui`. Sample inputs are in `tests/fixtures/`.
 - `.mcp.json` launches `gridtalk mcp`, so it needs a `gridtalk` binary on `PATH`. Install it with `cargo install --locked --path crates/gridtalk-app`. Without `--locked`, `cargo install` ignores `Cargo.lock` and pulls a newer `llama-cpp-sys-2` than the one paired with the pinned `llama-cpp-2`.

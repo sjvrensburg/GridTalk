@@ -77,9 +77,9 @@ jobs:
       - run: cargo test --locked --workspace
 
   msrv:
-    # The declared rust-version (1.95) must actually build: check
-    # the pure-Rust crates on exactly that toolchain. (The native
-    # llama.cpp/egui build is covered by the stable jobs above.)
+    # The declared rust-version (1.95) must build and pass the tests
+    # on exactly that toolchain. It runs alongside the stable jobs, so
+    # it adds no wall-clock time while the Windows job is the longest.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -108,4 +108,19 @@ jobs:
           echo "$SDK_DIR/bin" >> "$GITHUB_PATH"
           echo "CMAKE_PREFIX_PATH=$SDK_DIR" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$SDK_DIR/lib" >> "$GITHUB_ENV"
-      - run: cargo check --locked -p gridtalk-adapter -p gridtalk-graph -p gridtalk-index -p gridtalk-infer -p gridtalk-app -p gridtalk-ui
+      - run: cargo test --locked --workspace
+
+  hermit:
+    # The Python mirrors of the bench parsers and judge in
+    # scripts/hermit. conftest.py stands in for hermit-harness, so
+    # only a pinned pytest is installed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: pytest scripts/hermit
+        shell: bash
+        run: |
+          python3 --version
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet pytest==9.2.0
+          /tmp/venv/bin/python -m pytest scripts/hermit -q

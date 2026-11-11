@@ -1,3 +1,4 @@
 /target
 *.gguf
 /models/
+__pycache__/
