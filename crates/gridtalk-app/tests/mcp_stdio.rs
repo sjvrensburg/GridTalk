@@ -19,6 +19,34 @@ fn fixtures() -> PathBuf {
         .unwrap()
 }
 
+const PREFIX: &str = "gt-mcp-stdio";
+
+/// A fresh scratch directory, removed with everything in it when the
+/// guard drops, so a failing assertion leaves nothing behind either.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("{PREFIX}-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `gridtalk mcp` with these arguments, isolated from the user's
 /// config.
 fn gridtalk_mcp(args: &[&str]) -> Command {
@@ -213,12 +241,11 @@ fn a_session_over_stdio() {
         json!({"workbook_id": "wb-nope", "range": "A1"}),
     );
     assert_eq!(tool_error_kind(&unknown), "unknown_workbook");
-    let outside =
-        std::env::temp_dir().join(format!("gt-mcp-stdio-outside-{}.csv", std::process::id()));
+    let elsewhere = Scratch::new("outside");
+    let outside = elsewhere.join("outside.csv");
     std::fs::write(&outside, "A\n1\n").unwrap();
     let denied = server.call(9, "open_workbook", json!({"path": outside}));
     assert_eq!(tool_error_kind(&denied), "path_not_allowed");
-    let _ = std::fs::remove_file(&outside);
     // A protocol error is a JSON-RPC error, with the kind in `data`.
     let no_tool = server.call(10, "format_disk", json!({}));
     assert_eq!(no_tool["error"]["code"], -32602, "{no_tool}");

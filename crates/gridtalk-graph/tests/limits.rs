@@ -54,11 +54,32 @@ fn parse_error<T>(result: Result<T, IngestError>) -> String {
     }
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("gt-limits-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+const PREFIX: &str = "gt-limits";
+
+/// A fresh scratch directory, removed with everything in it when the
+/// guard drops, so a failing assertion leaves nothing behind either.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("{PREFIX}-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A file of `len` zero bytes (sparse where the filesystem allows).
@@ -131,7 +152,7 @@ fn the_cell_cap_counts_the_densified_grid() {
 #[test]
 fn file_size_caps_are_inclusive() {
     let _heavy = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = scratch("size");
+    let dir = Scratch::new("size");
     for (name, cap) in [
         ("at.csv", MAX_DELIMITED_BYTES),
         ("at.tsv", MAX_DELIMITED_BYTES),
@@ -153,12 +174,11 @@ fn file_size_caps_are_inclusive() {
     let junk = dir.join("junk.xlsx");
     zeros(&junk, 4096);
     assert!(load_path(&junk).is_err());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn empty_workbooks_load_and_build_an_empty_graph() {
-    let dir = scratch("empty");
+    let dir = Scratch::new("empty");
     let blank_csv = dir.join("blank.csv");
     std::fs::write(&blank_csv, "").unwrap();
     let cases = [
@@ -206,5 +226,4 @@ fn empty_workbooks_load_and_build_an_empty_graph() {
     assert_eq!(graph.region_sheets, vec![1]);
     let passage = render_passage(&mixed.sheets[1], &graph.regions[0]);
     assert!(passage.contains("Apples"), "{passage}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
