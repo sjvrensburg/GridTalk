@@ -219,16 +219,57 @@ pub fn is_help(arg: &str) -> bool {
     arg == "--help" || arg == "-h"
 }
 
-/// Arguments split into positionals and `--flag value` pairs.
+/// How a flag is written on the command line.
+#[derive(Clone, Copy, Debug)]
+pub enum Flag {
+    /// `--name <value>`, at most once.
+    Value(&'static str),
+    /// `--name <value>`, any number of times (`mcp --root`).
+    Repeated(&'static str),
+    /// `--name` with no value, at most once (`mcp --allow-write`).
+    Switch(&'static str),
+}
+
+impl Flag {
+    fn name(self) -> &'static str {
+        match self {
+            Flag::Value(n) | Flag::Repeated(n) | Flag::Switch(n) => n,
+        }
+    }
+}
+
+/// Arguments split into positionals, flags and free text.
 #[derive(Debug)]
 pub struct Parsed {
     pub positional: Vec<String>,
-    flags: BTreeMap<&'static str, String>,
+    /// Each flag given, with its values (none for a switch).
+    flags: BTreeMap<&'static str, Vec<String>>,
+    /// The free text (see [`parse_with`]), word by word.
+    text: Vec<String>,
 }
 
 impl Parsed {
+    /// A `Value` flag's value.
     pub fn flag(&self, name: &str) -> Option<&str> {
-        self.flags.get(name).map(String::as_str)
+        self.flags
+            .get(name)
+            .and_then(|v| v.first())
+            .map(String::as_str)
+    }
+
+    /// Every value of a `Repeated` flag, in order.
+    pub fn values(&self, name: &str) -> &[String] {
+        self.flags.get(name).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// Whether a `Switch` was given.
+    pub fn switch(&self, name: &str) -> bool {
+        self.flags.contains_key(name)
+    }
+
+    /// The free text, its words joined by spaces.
+    pub fn text(&self) -> String {
+        self.text.join(" ")
     }
 
     /// The positionals: one for each of `required` (named in the error
@@ -250,30 +291,65 @@ impl Parsed {
     }
 }
 
-/// Parse `args` strictly: every `--flag` must be one of `flags`, given
-/// once, with a value that is not itself a flag. A short option
-/// (`-o`) is an unknown flag, not a file name; a lone `-` and anything
-/// else is a positional.
+/// [`parse_with`] for commands whose flags all take one value, once,
+/// and that take no free text.
 pub fn parse(command: &str, args: &[String], flags: &[&'static str]) -> Result<Parsed, CliError> {
+    let flags: Vec<Flag> = flags.iter().map(|f| Flag::Value(f)).collect();
+    parse_with(command, args, &flags, None)
+}
+
+/// Parse `args` strictly against `flags`: an unknown flag, a value
+/// flag without a value (or with a flag as its value) and a flag given
+/// twice that may not repeat are usage errors. A short option (`-o`)
+/// is an unknown flag, not a file name; a lone `-` is a positional.
+///
+/// With `text_after: Some(n)`, the first argument that is not a flag
+/// once `n` positionals are read starts the free text: it and every
+/// argument after it are text, flag-shaped or not, so a question may
+/// say `--help`. Flags must come before the text. In the text's slot
+/// a single-dash word (`-5%`) starts the text: only a `--` word there
+/// is taken as a (possibly mistyped) flag.
+pub fn parse_with(
+    command: &str,
+    args: &[String],
+    flags: &[Flag],
+    text_after: Option<usize>,
+) -> Result<Parsed, CliError> {
     let mut parsed = Parsed {
         positional: Vec::new(),
         flags: BTreeMap::new(),
+        text: Vec::new(),
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        if !arg.starts_with('-') || arg == "-" {
-            parsed.positional.push(arg.clone());
+        if !parsed.text.is_empty() {
+            parsed.text.push(arg.clone());
             continue;
         }
-        let Some(name) = flags.iter().copied().find(|f| f == arg) else {
+        let text_slot = text_after.is_some_and(|n| parsed.positional.len() >= n);
+        if !arg.starts_with('-') || arg == "-" || (text_slot && !arg.starts_with("--")) {
+            if text_slot {
+                parsed.text.push(arg.clone());
+            } else {
+                parsed.positional.push(arg.clone());
+            }
+            continue;
+        }
+        let Some(flag) = flags.iter().copied().find(|f| f.name() == arg) else {
             return Err(usage(command, format!("unknown flag {arg}")));
         };
-        let value = rest
-            .next()
-            .filter(|v| !v.starts_with("--"))
-            .ok_or_else(|| usage(command, format!("{name} needs a value")))?;
-        if parsed.flags.insert(name, value.clone()).is_some() {
+        let name = flag.name();
+        let given = parsed.flags.contains_key(name);
+        if given && !matches!(flag, Flag::Repeated(_)) {
             return Err(usage(command, format!("{name} given twice")));
+        }
+        let values = parsed.flags.entry(name).or_default();
+        if !matches!(flag, Flag::Switch(_)) {
+            let value = rest
+                .next()
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| usage(command, format!("{name} needs a value")))?;
+            values.push(value.clone());
         }
     }
     Ok(parsed)
@@ -357,6 +433,75 @@ mod tests {
             .unwrap_err();
         assert!(err.message().unwrap().starts_with("missing <c>"), "{err:?}");
         assert_eq!(p.positionals("graph", &["<file>"], 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repeated_flags_switches_and_free_text() {
+        let flags = [
+            Flag::Repeated("--root"),
+            Flag::Switch("--allow-write"),
+            Flag::Value("--timeout"),
+        ];
+        let p = parse_with(
+            "mcp",
+            &args(&["--root", "a", "--allow-write", "--root", "b"]),
+            &flags,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.values("--root"), ["a", "b"]);
+        assert!(p.switch("--allow-write"));
+        assert!(!p.switch("--timeout"));
+        assert_eq!(p.flag("--timeout"), None);
+        for (bad, why) in [
+            (
+                &["--allow-write", "--allow-write"][..],
+                "--allow-write given twice",
+            ),
+            (
+                &["--timeout", "1", "--timeout", "2"][..],
+                "--timeout given twice",
+            ),
+            (&["--root"][..], "--root needs a value"),
+        ] {
+            let err = parse_with("mcp", &args(bad), &flags, None).unwrap_err();
+            assert!(err.message().unwrap().starts_with(why), "{err:?}");
+        }
+        // Free text starts at the first word after the positionals;
+        // flags before it are parsed, flag-shaped words in it are text.
+        let adapter = [Flag::Value("--adapter")];
+        let p = parse_with(
+            "investigate",
+            &args(&["book.csv", "--adapter", "fin", "what", "is", "--help"]),
+            &adapter,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(p.positional, ["book.csv"]);
+        assert_eq!(p.flag("--adapter"), Some("fin"));
+        assert_eq!(p.text(), "what is --help");
+        let err = parse_with(
+            "ask",
+            &args(&["book.csv", "--adaptor", "x", "q"]),
+            &adapter,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.message().unwrap().starts_with("unknown flag --adaptor"),
+            "{err:?}"
+        );
+        let p = parse_with("ask", &args(&["book.csv"]), &[], Some(1)).unwrap();
+        assert!(p.text().is_empty());
+        // A question may start with a single-dash word; a short option
+        // in a positional slot is still an unknown flag.
+        let p = parse_with("ask", &args(&["book.csv", "-5%", "growth?"]), &[], Some(1)).unwrap();
+        assert_eq!(p.text(), "-5% growth?");
+        let err = parse_with("ask", &args(&["-o", "book.csv", "q"]), &[], Some(1)).unwrap_err();
+        assert!(
+            err.message().unwrap().starts_with("unknown flag -o"),
+            "{err:?}"
+        );
     }
 
     #[test]

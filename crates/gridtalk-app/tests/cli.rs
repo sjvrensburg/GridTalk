@@ -148,10 +148,38 @@ fn usage_errors_exit_2_and_name_the_problem() {
             vec!["ask", "--adapter", "x", "question"],
             "unknown flag --adapter",
         ),
+        // Flags may come before the file; the first word after it
+        // starts the question.
         (
             vec!["investigate", "--adapter", "x", "question"],
-            "expected the file",
+            "missing the question",
         ),
+        (
+            vec!["investigate", &demo, "--adaptor", "fin", "total?"],
+            "unknown flag --adaptor",
+        ),
+        (
+            vec!["investigate", &demo, "--adapter", "../x", "total?"],
+            "invalid adapter name",
+        ),
+        (
+            vec![
+                "investigate",
+                &demo,
+                "--adapter",
+                "a",
+                "--adapter",
+                "b",
+                "q",
+            ],
+            "--adapter given twice",
+        ),
+        (
+            vec!["mcp", "--allow-write", "--allow-write"],
+            "--allow-write given twice",
+        ),
+        (vec!["mcp", "stray"], "unexpected argument"),
+        (vec!["mcp", "--root"], "--root needs a value"),
         (
             vec!["investigate", &demo, "--adapter"],
             "--adapter needs a value",
@@ -239,6 +267,20 @@ fn input_backend_and_tool_failures_have_their_own_codes() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    // optimise scores through the same backend (its adapters live
+    // beside the config, in this scratch directory).
+    let output = Command::new(env!("CARGO_BIN_EXE_gridtalk"))
+        .args(["optimise", &demo, "--rounds", "1"])
+        .env("GRIDTALK_CONFIG", &config)
+        .env_remove("GRIDTALK_CONFIG_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("scoring failed"),
+        "{}",
+        stderr(&output)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

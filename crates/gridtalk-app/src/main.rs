@@ -67,21 +67,16 @@ fn main() {
 }
 
 /// The file argument and the free text after it (`ask`, `generate`).
-fn file_and_text<'a>(
+fn file_and_text(
     cmd: &str,
-    rest: &'a [String],
+    rest: &[String],
     first: &str,
     what: &str,
-) -> Result<(&'a str, String), CliError> {
-    let file = rest
-        .first()
-        .ok_or_else(|| cli::usage(cmd, format!("missing <{first}>")))?;
-    // These commands take no flags: one before the text is a typo,
-    // not the start of it.
-    if let Some(flag) = rest.iter().take(2).find(|a| a.starts_with("--")) {
-        return Err(cli::usage(cmd, format!("unknown flag {flag}")));
-    }
-    let text = rest[1..].join(" ");
+) -> Result<(String, String), CliError> {
+    // No flags: one before the text is a typo, not the start of it.
+    let parsed = cli::parse_with(cmd, rest, &[], Some(1))?;
+    let file = parsed.positionals(cmd, &[&format!("<{first}>")], 0)?[0].clone();
+    let text = parsed.text();
     if text.trim().is_empty() {
         return Err(cli::usage(cmd, format!("missing the {what}")));
     }
@@ -160,7 +155,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
     match cmd {
         "ask" => {
             let (file, question) = file_and_text(cmd, rest, "file", "question")?;
-            let (wb, graph) = workbook_and_graph(file)?;
+            let (wb, graph) = workbook_and_graph(&file)?;
             // The same hybrid (lexical + vector) retrieval as chat,
             // investigate and MCP.
             let index = HybridIndex::build(&wb, &graph);
@@ -387,7 +382,11 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     backend.as_ref(),
                     &current,
                     round,
-                )?;
+                )
+                .map_err(|e| match e {
+                    optimise::OptimiseError::Scoring(_) => CliError::Backend(e.to_string()),
+                    optimise::OptimiseError::Commit(_) => CliError::Other(e.to_string()),
+                })?;
                 if let Some(note) = &outcome.note {
                     println!("round {round}: {note}; stopping");
                     break;
@@ -561,38 +560,15 @@ fn run(args: &[String]) -> Result<(), CliError> {
             }
         }
         "investigate" => {
-            let file = rest
-                .first()
-                .ok_or_else(|| cli::usage(cmd, "missing <file>"))?;
-            if file.starts_with("--") {
-                return Err(cli::usage(cmd, format!("expected the file before {file}")));
-            }
             // --adapter is a flag only before the question starts;
             // inside the question it is literal text.
-            let mut adapter_name: Option<String> = None;
-            let mut question_words: Vec<String> = Vec::new();
-            let mut words = rest[1..].iter();
-            while let Some(word) = words.next() {
-                if question_words.is_empty() && word == "--adapter" {
-                    if adapter_name.is_some() {
-                        return Err(cli::usage(cmd, "--adapter given twice"));
-                    }
-                    adapter_name = Some(
-                        words
-                            .next()
-                            .filter(|v| !v.starts_with("--"))
-                            .ok_or_else(|| cli::usage(cmd, "--adapter needs a value"))?
-                            .clone(),
-                    );
-                } else if question_words.is_empty() && word.starts_with("--") {
-                    // A mistyped flag must not silently become the
-                    // question (and run unadapted).
-                    return Err(cli::usage(cmd, format!("unknown flag {word}")));
-                } else {
-                    question_words.push(word.clone());
-                }
+            let parsed = cli::parse_with(cmd, rest, &[cli::Flag::Value("--adapter")], Some(1))?;
+            let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
+            let adapter_name = parsed.flag("--adapter");
+            if let Some(name) = adapter_name {
+                valid_adapter_arg(cmd, name)?;
             }
-            let question = question_words.join(" ");
+            let question = parsed.text();
             if question.trim().is_empty() {
                 return Err(cli::usage(cmd, "missing the question"));
             }
@@ -607,7 +583,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
             let cfg = config_from_env();
             let backend = backend_from_config(&cfg.inference);
             warn_if_external(&cfg);
-            let cli_adapter = adapter_name.as_deref().map(load_named_adapter);
+            let cli_adapter = adapter_name.map(load_named_adapter);
             let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
             let inv = investigate::investigate_with(
                 &question,
@@ -650,7 +626,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
             let (model, prompt) = file_and_text(cmd, rest, "model.gguf", "prompt")?;
             // A model that is not there is an input error (exit 3),
             // not a backend failure.
-            if !std::path::Path::new(model).is_file() {
+            if !std::path::Path::new(&model).is_file() {
                 return Err(CliError::Input(format!("{model}: no such model file")));
             }
             let backend = gridtalk_infer::llama_backend::LlamaCppBackend {
@@ -684,50 +660,52 @@ fn run(args: &[String]) -> Result<(), CliError> {
             // --allow-write is accepted for forward compatibility;
             // there are no write tools yet either way (what_if is
             // simulation-only), so it currently changes nothing.
-            // --root repeats, so this does not use cli::parse.
+            let parsed = cli::parse_with(
+                cmd,
+                rest,
+                &[
+                    cli::Flag::Repeated("--root"),
+                    cli::Flag::Value("--timeout"),
+                    cli::Flag::Value("--memory-budget"),
+                    cli::Flag::Switch("--allow-write"),
+                ],
+                None,
+            )?;
+            parsed.positionals(cmd, &[], 0)?;
             let mut options = mcp::McpOptions::default();
-            let mut args = rest.iter();
-            while let Some(arg) = args.next() {
-                let mut value = |flag: &str| {
-                    args.next()
-                        .filter(|v| !v.starts_with("--"))
-                        .ok_or_else(|| cli::usage(cmd, format!("{flag} needs a value")))
-                        .cloned()
-                };
-                match arg.as_str() {
-                    "--allow-write" => eprintln!(
-                        "gridtalk: warning: --allow-write is a no-op (no write tools exist yet)"
-                    ),
-                    "--root" => options
-                        .add_root(std::path::Path::new(&value("--root")?))
-                        .map_err(|e| cli::usage(cmd, e))?,
-                    "--timeout" => {
-                        let secs = value("--timeout")?;
-                        let secs: u64 = secs
-                            .parse()
-                            .ok()
-                            .filter(|s| (1..=86_400).contains(s))
-                            .ok_or_else(|| {
-                                cli::usage(
-                                    cmd,
-                                    format!("--timeout must be 1 to 86400 seconds, got {secs}"),
-                                )
-                            })?;
-                        options.call_timeout = std::time::Duration::from_secs(secs);
-                    }
-                    "--memory-budget" => {
-                        let mib = value("--memory-budget")?;
-                        let mib: u64 = mib
-                            .parse()
-                            .ok()
-                            .filter(|m| (1..=1 << 30).contains(m))
-                            .ok_or_else(|| {
-                                cli::usage(cmd, format!("--memory-budget must be a positive number of MiB, got {mib}"))
-                            })?;
-                        options.memory_budget = mib << 20;
-                    }
-                    other => return Err(cli::usage(cmd, format!("unknown argument {other}"))),
-                }
+            if parsed.switch("--allow-write") {
+                eprintln!("gridtalk: warning: --allow-write is a no-op (no write tools exist yet)");
+            }
+            for root in parsed.values("--root") {
+                options
+                    .add_root(std::path::Path::new(root))
+                    .map_err(|e| cli::usage(cmd, e))?;
+            }
+            if let Some(secs) = parsed.flag("--timeout") {
+                let secs: u64 = secs
+                    .parse()
+                    .ok()
+                    .filter(|s| (1..=86_400).contains(s))
+                    .ok_or_else(|| {
+                        cli::usage(
+                            cmd,
+                            format!("--timeout must be 1 to 86400 seconds, got {secs}"),
+                        )
+                    })?;
+                options.call_timeout = std::time::Duration::from_secs(secs);
+            }
+            if let Some(mib) = parsed.flag("--memory-budget") {
+                let mib: u64 = mib
+                    .parse()
+                    .ok()
+                    .filter(|m| (1..=1 << 30).contains(m))
+                    .ok_or_else(|| {
+                        cli::usage(
+                            cmd,
+                            format!("--memory-budget must be a positive number of MiB, got {mib}"),
+                        )
+                    })?;
+                options.memory_budget = mib << 20;
             }
             Ok(mcp::serve_stdio(options)?)
         }
