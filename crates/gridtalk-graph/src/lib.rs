@@ -606,9 +606,6 @@ pub fn load_gridcraft_bytes(
     Ok(snapshot)
 }
 
-/// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
-/// canonical text; the cached value (when Gridcraft has one) is kept
-/// alongside so passages can show both.
 /// Cap on densified snapshot cells per sheet (and per workbook): a
 /// sparse XLSX with a single cell at XFD1048576 must not allocate a
 /// billion-cell grid.
@@ -618,6 +615,9 @@ pub const MAX_SNAPSHOT_CELLS: usize = 4_000_000;
 pub const EXCEL_MAX_ROWS: usize = 1 << 20;
 pub const EXCEL_MAX_COLS: usize = 1 << 14;
 
+/// Convert a Gridcraft `Workbook` into a snapshot. Formulas keep their
+/// canonical text; the cached value (when Gridcraft has one) is kept
+/// alongside so passages can show both.
 pub fn from_gridcraft_workbook(
     name: &str,
     wb: &gridcraft_model::Workbook,
@@ -630,23 +630,32 @@ pub fn from_gridcraft_workbook(
             max_row = max_row.max(addr.row as usize);
             max_col = max_col.max(addr.col as usize);
         }
-        let area = (max_row as u64 + 1).saturating_mul(max_col as u64 + 1);
-        total_cells = total_cells.saturating_add(area);
-        if total_cells > MAX_SNAPSHOT_CELLS as u64 {
-            return Err(IngestError::Parse(format!(
-                "workbook is too sparse to snapshot ({total_cells} densified cells > {MAX_SNAPSHOT_CELLS} across all sheets)"
-            )));
-        }
+        // An empty sheet densifies to no cells at all.
+        let empty = sheet.cells.iter().next().is_none();
+        let area = if empty {
+            0
+        } else {
+            (max_row as u64 + 1).saturating_mul(max_col as u64 + 1)
+        };
+        // The per-sheet check comes first: the running total is never
+        // below `area`, so checked second it could never fire.
         if area > MAX_SNAPSHOT_CELLS as u64 {
             return Err(IngestError::Parse(format!(
                 "sheet {} is too sparse to snapshot ({area} cells > {MAX_SNAPSHOT_CELLS}); trim empty rows/columns at the edges",
                 sheet.name
             )));
         }
-        let mut cells = vec![vec![CellValue::Empty; max_col + 1]; max_row + 1];
-        if sheet.cells.iter().next().is_none() {
-            cells = Vec::new();
+        total_cells = total_cells.saturating_add(area);
+        if total_cells > MAX_SNAPSHOT_CELLS as u64 {
+            return Err(IngestError::Parse(format!(
+                "workbook is too sparse to snapshot ({total_cells} densified cells > {MAX_SNAPSHOT_CELLS} across all sheets)"
+            )));
         }
+        let mut cells = if empty {
+            Vec::new()
+        } else {
+            vec![vec![CellValue::Empty; max_col + 1]; max_row + 1]
+        };
         for (addr, cell) in sheet.cells.iter() {
             cells[addr.row as usize][addr.col as usize] = snapshot_cell(cell);
         }

@@ -111,14 +111,14 @@ fn the_cell_cap_counts_the_densified_grid() {
     drop(at_cap);
     // One row more is over it.
     let over = parse_error(load_xlsx(&xlsx(&["S"], vec![(0, 2000, 1999, number(1.0))])));
-    assert!(over.contains("too sparse"), "{over}");
+    assert!(over.contains("sheet S is too sparse"), "{over}");
     // Excel's last cell (XFD1048576) is refused before any grid is
     // allocated.
     let far = parse_error(load_xlsx(&xlsx(
         &["S"],
         vec![(0, (1 << 20) - 1, (1 << 14) - 1, number(1.0))],
     )));
-    assert!(far.contains("too sparse"), "{far}");
+    assert!(far.contains("sheet S is too sparse"), "{far}");
     // The cap covers the whole workbook: two sheets under it each are
     // over it together.
     let both = parse_error(load_xlsx(&xlsx(
@@ -134,6 +134,7 @@ fn file_size_caps_are_inclusive() {
     let dir = scratch("size");
     for (name, cap) in [
         ("at.csv", MAX_DELIMITED_BYTES),
+        ("at.tsv", MAX_DELIMITED_BYTES),
         ("at.xlsx", MAX_PACKAGE_BYTES),
         ("at.ods", MAX_PACKAGE_BYTES),
     ] {

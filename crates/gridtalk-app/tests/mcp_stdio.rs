@@ -2,9 +2,15 @@
 //! and error shapes over stdin/stdout, and how the process exits.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// How long to wait for a frame before failing instead of hanging.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,11 +32,24 @@ fn gridtalk_mcp(args: &[&str]) -> Command {
     command
 }
 
-/// A running server and the frames it has written.
+/// A running server and the frames it has written. Threads drain
+/// stdout and stderr, so a quiet server fails a read instead of
+/// hanging it, and a chatty stderr never fills its pipe. Dropping it
+/// (a failed test included) kills a server that is still running.
 struct Server {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdout: Receiver<String>,
+    stderr: Option<JoinHandle<String>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Server {
@@ -42,11 +61,33 @@ impl Server {
             .spawn()
             .unwrap();
         let stdin = child.stdin.take();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let (tx, stdout) = mpsc::channel();
+        // Lines are decoded lossily, so a frame that is not UTF-8
+        // fails the JSON check with its text instead of ending the
+        // reader as if stdout had closed.
+        thread::spawn(move || {
+            let mut line = Vec::new();
+            while matches!(out.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim_end_matches(['\n', '\r']).to_string();
+                if tx.send(text).is_err() {
+                    break;
+                }
+                line.clear();
+            }
+        });
+        let mut err = child.stderr.take().unwrap();
+        let stderr = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = err.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
         Server {
             child,
             stdin,
             stdout,
+            stderr: Some(stderr),
         }
     }
 
@@ -59,9 +100,13 @@ impl Server {
     /// The next frame on stdout, which must be one JSON object on one
     /// line.
     fn read(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self.stdout.read_line(&mut line).unwrap();
-        assert!(n > 0, "the server closed stdout");
+        let line = match self.stdout.recv_timeout(FRAME_TIMEOUT) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("no frame within {FRAME_TIMEOUT:?}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the server closed stdout"),
+        };
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("not a JSON frame ({e}): {line}"))
     }
 
@@ -78,17 +123,24 @@ impl Server {
         self.request(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments}}))
     }
 
-    /// Close stdin and wait: what else the server wrote, and how it
-    /// exited.
-    fn finish(mut self) -> (Vec<String>, Output) {
+    /// Close stdin and wait: what else the server wrote, how it
+    /// exited and its stderr.
+    fn finish(mut self) -> (Vec<String>, ExitStatus, String) {
         drop(self.stdin.take());
-        let rest: Vec<String> = self
-            .stdout
-            .lines()
-            .map(|line| line.unwrap())
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        (rest, self.child.wait_with_output().unwrap())
+        let mut rest = Vec::new();
+        loop {
+            match self.stdout.recv_timeout(FRAME_TIMEOUT) {
+                Ok(line) if line.trim().is_empty() => {}
+                Ok(line) => rest.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the server did not exit within {FRAME_TIMEOUT:?} of end of input");
+                }
+            }
+        }
+        let status = self.child.wait().unwrap();
+        let stderr = self.stderr.take().unwrap().join().unwrap();
+        (rest, status, stderr)
     }
 }
 
@@ -161,7 +213,8 @@ fn a_session_over_stdio() {
         json!({"workbook_id": "wb-nope", "range": "A1"}),
     );
     assert_eq!(tool_error_kind(&unknown), "unknown_workbook");
-    let outside = std::env::temp_dir().join("gt-mcp-stdio-outside.csv");
+    let outside =
+        std::env::temp_dir().join(format!("gt-mcp-stdio-outside-{}.csv", std::process::id()));
     std::fs::write(&outside, "A\n1\n").unwrap();
     let denied = server.call(9, "open_workbook", json!({"path": outside}));
     assert_eq!(tool_error_kind(&denied), "path_not_allowed");
@@ -189,10 +242,9 @@ fn a_session_over_stdio() {
 
     // End of input ends the server cleanly, with nothing left unsaid
     // on stdout and its log on stderr.
-    let (rest, output) = server.finish();
+    let (rest, status, stderr) = server.finish();
     assert!(rest.is_empty(), "unexpected frames: {rest:?}");
-    assert!(output.status.success(), "{:?}", output.status);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(status.success(), "{status:?}");
     assert!(stderr.contains("serving on stdio"), "{stderr}");
 }
 
@@ -205,12 +257,12 @@ fn a_request_without_a_newline_before_eof_is_answered() {
         r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-03-26"}}}}"#
     )
     .unwrap();
-    let (frames, output) = server.finish();
+    let (frames, status, _) = server.finish();
     assert_eq!(frames.len(), 1, "{frames:?}");
     let init: Value = serde_json::from_str(&frames[0]).unwrap();
     assert_eq!(init["id"], 1);
     assert!(init["result"]["protocolVersion"].is_string(), "{init}");
-    assert!(output.status.success(), "{:?}", output.status);
+    assert!(status.success(), "{status:?}");
 }
 
 #[test]
