@@ -62,6 +62,11 @@ struct OpenWorkbook {
 /// the estimate, so 16 is a middle, not a bound.
 const SESSION_BYTES_PER_SNAPSHOT_BYTE: u64 = 16;
 
+/// Held while a workbook loads, so one load runs at a time however
+/// many calls do: the budget is charged only once a load finishes, and
+/// this keeps the peak above it to one workbook being built.
+static LOADING: Mutex<()> = Mutex::new(());
+
 impl OpenWorkbook {
     fn stat_of(path: &Path) -> Option<(SystemTime, u64, i64)> {
         std::fs::metadata(path).ok().and_then(|m| {
@@ -106,6 +111,7 @@ impl OpenWorkbook {
     /// Load the file at `path`, which the caller has canonicalised
     /// and checked against the roots.
     fn load(path: &Path) -> Result<Self, String> {
+        let _loading = LOADING.lock().unwrap_or_else(|e| e.into_inner());
         // Stat before reading, so a write landing between the two
         // leaves a stale stamp (forcing a reload), never a fresh
         // stamp on stale content. The file is read once: the same
@@ -735,6 +741,23 @@ impl McpServer {
                         .get(&id)
                         .is_some_and(|current| Arc::ptr_eq(current, &base))
                     {
+                        // A file that grew past the whole budget is
+                        // refused like a new open: the old revision is
+                        // stale, so the session closes.
+                        let budget = self.options.memory_budget;
+                        if new.bytes > budget {
+                            self.workbooks.remove(&id);
+                            self.order.retain(|x| x != &id);
+                            return tool_error(
+                                ErrorKind::OverBudget,
+                                format!(
+                                    "{} changed and now needs an estimated {} MiB, over the server's {} MiB memory budget (gridtalk mcp --memory-budget); session {id} was closed",
+                                    new.path.display(),
+                                    new.bytes.div_ceil(1 << 20),
+                                    budget >> 20
+                                ),
+                            );
+                        }
                         self.workbooks.insert(id.clone(), Arc::from(new));
                         let evicted = self.make_room(0, 0, Some(&id));
                         if !evicted.is_empty() {
@@ -1435,6 +1458,42 @@ mod tests {
             json!([first_id]),
             "{second}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session whose file grows past the whole budget is closed with
+    /// `over_budget` on its next call, and other sessions are kept.
+    #[test]
+    fn reload_over_budget_closes_the_session() {
+        let dir = scratch("regrow");
+        let a = dir.join("a.csv");
+        let b = dir.join("b.csv");
+        std::fs::write(&a, "Item,Qty\nApples,2\n").unwrap();
+        std::fs::write(&b, "Item,Qty\nPlums,3\n").unwrap();
+        let small = OpenWorkbook::load(&a).unwrap().bytes + OpenWorkbook::load(&b).unwrap().bytes;
+        let mut server = started(McpOptions {
+            memory_budget: small,
+            ..McpOptions::default()
+        });
+        let id_a = rpc(&mut server, open_call(1, &a))["result"]["structuredContent"]["workbook_id"]
+            .clone();
+        let id_b = rpc(&mut server, open_call(2, &b))["result"]["structuredContent"]["workbook_id"]
+            .clone();
+        let rows: String = (0..200).map(|i| format!("Item{i},{i}\n")).collect();
+        std::fs::write(&a, format!("Item,Qty\n{rows}")).unwrap();
+        let call = |id: u64, wb: &Value| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "graph_overview", "arguments": {"workbook_id": wb}}});
+        let grown = rpc(&mut server, call(3, &id_a));
+        assert_eq!(
+            grown["result"]["structuredContent"]["error"]["kind"], "over_budget",
+            "{grown}"
+        );
+        let gone = rpc(&mut server, call(4, &id_a));
+        assert_eq!(
+            gone["result"]["structuredContent"]["error"]["kind"],
+            "unknown_workbook"
+        );
+        let kept = rpc(&mut server, call(5, &id_b));
+        assert_eq!(kept["result"]["isError"], false, "{kept}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
