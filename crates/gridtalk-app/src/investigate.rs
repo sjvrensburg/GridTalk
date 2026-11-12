@@ -6,7 +6,8 @@
 
 pub use crate::tools::parse_cell_ref;
 use crate::tools::Tools;
-use gridtalk_graph::CellValue;
+use gridtalk_graph::{CellValue, NodeKind};
+use gridtalk_index::{history_prompt, standalone_query, ChatTurn};
 use gridtalk_infer::{ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -50,6 +51,35 @@ pub fn investigate_with(
     adapter: Option<&gridtalk_adapter::Adapter>,
     sidecar: Option<&str>,
 ) -> Result<Investigation, gridtalk_infer::InferError> {
+    investigate_with_context(
+        question,
+        tools,
+        backend,
+        max_steps,
+        adapter,
+        sidecar,
+        &[],
+        None,
+    )
+}
+
+/// [`investigate_with`] with the conversation so far and the
+/// caller's current selection. A follow-up is condensed against
+/// `history` into a stand-alone query before searching (see
+/// [`standalone_query`]) and the turns ride along in the prompt;
+/// a `selection` range is read (`expand`, `get_cells`) and its
+/// results lead the prompt, ahead of the search results.
+#[allow(clippy::too_many_arguments)]
+pub fn investigate_with_context(
+    question: &str,
+    tools: &Tools,
+    backend: &dyn ChatBackend,
+    max_steps: usize,
+    adapter: Option<&gridtalk_adapter::Adapter>,
+    sidecar: Option<&str>,
+    history: &[ChatTurn],
+    selection: Option<&str>,
+) -> Result<Investigation, gridtalk_infer::InferError> {
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
         let result = tools.execute(tool, args);
@@ -70,15 +100,18 @@ pub fn investigate_with(
         });
     }
 
+    // A follow-up is searched in its stand-alone form: the
+    // history's questions supply the words its pronouns stand for.
+    let standalone = standalone_query(question, history);
     // Citations come from the structured hits, never scraped from
     // display text. The search step reuses this one search (it is
     // recorded in the trail, not re-executed).
     let top_k = adapter.map(|a| a.top_k).unwrap_or(3);
-    let hits = tools.hybrid.search(question, top_k);
+    let hits = tools.hybrid.search(&standalone, top_k);
     let mut citations: Vec<String> = hits.iter().map(|h| h.range.a1()).collect();
     let top_range = citations.first().cloned();
     let search_result = if hits.is_empty() {
-        format!("no regions matched \"{question}\"")
+        format!("no regions matched \"{standalone}\"")
     } else {
         hits.iter()
             .map(|h| format!("[{}] score {:.3}", h.range.a1(), h.score))
@@ -87,51 +120,72 @@ pub fn investigate_with(
     };
     trail.push(TrailStep {
         tool: "search".into(),
-        args: format!("q={question}"),
+        args: format!("q={standalone}"),
         result: search_result.clone(),
     });
 
     let mut context = format!("search results:\n{search_result}");
-    // Adapter knob: a question naming a cell gets that cell's
-    // formulas/cells directly, even when retrieval missed it.
-    if adapter.is_some_and(|a| a.ref_context) && trail.len() < max_steps {
-        if let Some(clean) = qualified_refs(question).into_iter().next() {
-            let formulas = run("list_formulas", &format!("range={clean}"), &mut trail);
-            context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
-            if trail.len() < max_steps {
-                let cells = run("get_cells", &format!("range={clean}"), &mut trail);
-                context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
+    // Ranges already expanded or read, so no step repeats one.
+    let mut expanded_ranges: Vec<String> = Vec::new();
+    let mut cells_read: Vec<String> = Vec::new();
+    // Planned reads the step budget dropped, named in the prompt
+    // at the end instead of silently absent.
+    let mut skipped: Vec<&str> = Vec::new();
+    // A citation must name a sheet the workbook actually has.
+    let range_sheet_exists = |range: &str| -> bool {
+        crate::tools::parse_range_uncapped(range)
+            .is_some_and(|(sheet, ..)| tools.sheet_for(&sheet).is_some())
+    };
+    // The selection is read next but leads the prompt (assembled
+    // at the end): "what feeds this?" stands on it, not on the
+    // search that its three words happen to match.
+    let mut selection_section = String::new();
+    if let Some(sel) = selection.filter(|s| !s.trim().is_empty()) {
+        let canonical = crate::tools::parse_range_uncapped(sel).map(|(sheet, r0, c0, r1, c1)| {
+            let sheet = tools
+                .sheet_for(&sheet)
+                .map(|sh| sh.name.clone())
+                .unwrap_or(sheet);
+            gridtalk_graph::RangeRef {
+                sheet,
+                r0,
+                c0,
+                r1,
+                c1,
             }
-            // Directly-read ref_context cells are citations too —
-            // but only when the named sheet actually exists (the
-            // tool calls above return error text for a bad sheet).
-            let sheet_ok = parse_cell_ref(&clean).is_some_and(|(sheet_name, r, c)| {
-                tools
-                    .sheet_for(&sheet_name)
-                    .is_some_and(|sh| r < sh.cells.len() && c < sh.max_col())
-            });
-            if sheet_ok && !citations.contains(&clean) {
-                citations.push(clean.clone());
+            .a1()
+        });
+        let sel = canonical.as_deref().unwrap_or(sel);
+        if trail.len() < max_steps {
+            let expanded = run("expand", &format!("range={sel}"), &mut trail);
+            selection_section.push_str(&format!("selected {sel} (graph):\n{expanded}"));
+            expanded_ranges.push(sel.to_string());
+        }
+        if trail.len() < max_steps {
+            let cells = run("get_cells", &format!("range={sel}"), &mut trail);
+            if !selection_section.is_empty() {
+                selection_section.push_str("\n\n");
             }
+            selection_section.push_str(&format!("selected {sel} (cells):\n{cells}"));
+            cells_read.push(sel.to_string());
+        }
+        // Cite the selection only when its sheet exists and a
+        // step actually read it.
+        if canonical.is_some()
+            && range_sheet_exists(sel)
+            && !selection_section.is_empty()
+            && !citations.iter().any(|c| c == sel)
+        {
+            citations.push(sel.to_string());
         }
     }
-    if let Some(range) = &top_range {
-        if trail.len() < max_steps {
-            let expanded = run("expand", &format!("range={range}"), &mut trail);
-            context.push_str(&format!("\n\ngraph expansion:\n{expanded}"));
-        }
-        if trail.len() < max_steps {
-            let cells = run("get_cells", &format!("range={range}"), &mut trail);
-            context.push_str(&format!("\n\ncells:\n{cells}"));
-        }
-        if trail.len() < max_steps {
-            let formulas = run("list_formulas", &format!("range={range}"), &mut trail);
-            context.push_str(&format!("\n\nformulas:\n{formulas}"));
-        }
-    }
-
-    // What-if: "what if B2 is 10" / "what if B2 = 10"
+    // What-if: "what if B2 is 10" / "what if B2 = 10". It runs
+    // before the named-reference reads below: the question asked
+    // for it explicitly, so the step budget must not starve it.
     let lower = question.to_lowercase();
+    if lower.contains("what if") && trail.len() >= max_steps {
+        context.push_str("\n\nwhat-if: skipped — the step budget was already spent.");
+    }
     if lower.contains("what if") && trail.len() < max_steps {
         if let Some((cell, value)) = parse_what_if(question) {
             // With an explicit target the what-if runs even when
@@ -222,12 +276,156 @@ pub fn investigate_with(
         }
     }
 
+    // A question naming a cell gets that cell's formulas/cells
+    // directly, even when retrieval ranked something else first
+    // (a title cell, say). This is the default; an adapter that
+    // learned otherwise (`ref_context = false`) still turns it off.
+    let named_refs: Vec<String> = if adapter.is_none_or(|a| a.ref_context) {
+        // The current question's refs first; refs carried in from
+        // the history by condensation only fill what is left, so
+        // they can never truncate away the cell just asked about.
+        let mut refs: Vec<String> = Vec::new();
+        for r in qualified_refs(question)
+            .into_iter()
+            .chain(qualified_refs(&standalone))
+        {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+        refs.truncate(3);
+        refs
+    } else {
+        Vec::new()
+    };
+    for clean in &named_refs {
+        if trail.len() >= max_steps {
+            skipped.push("some named references");
+            break;
+        }
+        let formulas = run("list_formulas", &format!("range={clean}"), &mut trail);
+        context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
+        if trail.len() < max_steps && !cells_read.iter().any(|done| same_range(done, clean)) {
+            let cells = run("get_cells", &format!("range={clean}"), &mut trail);
+            context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
+            cells_read.push(clean.clone());
+        }
+        // Directly-read named cells are citations too — but only
+        // when the named sheet actually exists (the tool calls
+        // above return error text for a bad sheet).
+        let sheet_ok = parse_cell_ref(clean).is_some_and(|(sheet_name, r, c)| {
+            tools
+                .sheet_for(&sheet_name)
+                .is_some_and(|sh| r < sh.cells.len() && c < sh.max_col())
+        });
+        if sheet_ok && !citations.iter().any(|c| same_range(c, clean)) {
+            citations.push(clean.clone());
+        }
+    }
+
+    // Expand the column the question is about, not only the
+    // region search ranked first: a named cell's column, and any
+    // column whose heading the question uses. `expand` on a
+    // column answers "what does this read / what reads this"
+    // outright, with headings and ranges.
+    let mut expand_targets: Vec<String> = Vec::new();
+    for r in named_refs
+        .iter()
+        .chain(columns_asked_about(question, tools.graph).iter())
+        .chain(columns_asked_about(&standalone, tools.graph).iter())
+    {
+        // A named cell and its own column expand to the same
+        // node; one of the two steps is enough.
+        let covered = expand_targets
+            .iter()
+            .chain(expanded_ranges.iter())
+            .any(|done| ranges_nested(done, r));
+        if !covered {
+            expand_targets.push(r.clone());
+        }
+    }
+    for range in expand_targets.into_iter().take(3) {
+        if trail.len() >= max_steps {
+            skipped.push("some column expansions");
+            break;
+        }
+        let expanded = run("expand", &format!("range={range}"), &mut trail);
+        context.push_str(&format!("\n\ncolumn expansion {range}:\n{expanded}"));
+        expanded_ranges.push(range.clone());
+        if range_sheet_exists(&range) && !citations.iter().any(|c| same_range(c, &range)) {
+            citations.push(range);
+        }
+    }
+    // Workbook-scoped questions ("what is this workbook?", "are
+    // there hidden sheets?") stand on the sheet/region list, which
+    // no single region's cells carry. The current question decides,
+    // not words an earlier turn happened to use; the list is capped
+    // in the prompt like a search passage.
+    if asks_about_the_workbook(question) {
+        if trail.len() < max_steps {
+            let info = run("workbook_info", "", &mut trail);
+            let info = truncate_chars(&info, 4_000);
+            context.push_str(&format!("\n\nworkbook:\n{info}"));
+        } else {
+            skipped.push("the workbook sheet list");
+        }
+    }
+    if let Some(range) = &top_range {
+        let mut top_done = true;
+        if !expanded_ranges.iter().any(|done| same_range(done, range)) {
+            if trail.len() < max_steps {
+                let expanded = run("expand", &format!("range={range}"), &mut trail);
+                context.push_str(&format!("\n\ngraph expansion:\n{expanded}"));
+                expanded_ranges.push(range.clone());
+            } else {
+                top_done = false;
+            }
+        }
+        if !cells_read.iter().any(|done| same_range(done, range)) {
+            if trail.len() < max_steps {
+                let cells = run("get_cells", &format!("range={range}"), &mut trail);
+                context.push_str(&format!("\n\ncells:\n{cells}"));
+                cells_read.push(range.clone());
+            } else {
+                top_done = false;
+            }
+        }
+        if trail.len() < max_steps {
+            let formulas = run("list_formulas", &format!("range={range}"), &mut trail);
+            context.push_str(&format!("\n\nformulas:\n{formulas}"));
+        } else {
+            top_done = false;
+        }
+        if !top_done {
+            skipped.push("some reads of the top region");
+        }
+    }
+    if !skipped.is_empty() {
+        context.push_str(&format!(
+            "\n\nnote: the step budget ({max_steps}) was spent before {} could be read.",
+            skipped.join(" and ")
+        ));
+    }
+    if !selection_section.is_empty() {
+        context = format!("{selection_section}\n\n{context}");
+    }
+
     let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
-    system.push_str(&gridtalk_adapter::prompt_text(adapter, question, sidecar));
+    system.push_str(&gridtalk_adapter::prompt_text(
+        adapter,
+        &standalone,
+        sidecar,
+    ));
     let system = gridtalk_adapter::cap_prompt(system);
+    let mut user = history_prompt(history);
+    user.push_str(&format!("Question: {question}\n"));
+    if standalone != question {
+        user.push_str(&format!("(searched as: {standalone})\n"));
+    }
+    user.push_str(&format!("\nTool results:\n{context}"));
     let req = ChatRequest {
         system,
-        user: format!("Question: {question}\n\nTool results:\n{context}"),
+        user,
         max_tokens: 512,
     };
     let cancel = Arc::new(AtomicBool::new(false));
@@ -256,6 +454,148 @@ pub fn investigate_with(
         trail,
         citations,
     })
+}
+
+/// Whether either range contains the other on the same sheet, so
+/// expanding both would reach the same graph node twice.
+fn ranges_nested(a: &str, b: &str) -> bool {
+    let (Some((sa, ar0, ac0, ar1, ac1)), Some((sb, br0, bc0, br1, bc1))) = (
+        crate::tools::parse_range_uncapped(a),
+        crate::tools::parse_range_uncapped(b),
+    ) else {
+        return a == b;
+    };
+    if !gridtalk_graph::sheet_name_eq(&sa, &sb) {
+        return false;
+    }
+    let a_holds_b = ar0 <= br0 && ac0 <= bc0 && ar1 >= br1 && ac1 >= bc1;
+    let b_holds_a = br0 <= ar0 && bc0 <= ac0 && br1 >= ar1 && bc1 >= ac1;
+    if !(a_holds_b || b_holds_a) {
+        return false;
+    }
+    // Containment implies the same node only when the ranges are
+    // equal, or the inner range is a single cell (its smallest
+    // covering node is its column) and the outer one spans that
+    // one column: a region contains its columns, but the Region
+    // node and a Column node carry different edges.
+    let single = |r0: usize, c0: usize, r1: usize, c1: usize| r0 == r1 && c0 == c1;
+    (ar0, ac0, ar1, ac1) == (br0, bc0, br1, bc1)
+        || (single(br0, bc0, br1, bc1) && ac0 == ac1)
+        || (single(ar0, ac0, ar1, ac1) && bc0 == bc1)
+}
+
+/// Whether two ranges name the same cells, however spelled
+/// (`Sheet1!D2` and the canonical `Sheet1!D2:D2`, `sheet1!$D$2`).
+fn same_range(a: &str, b: &str) -> bool {
+    match (
+        crate::tools::parse_range_uncapped(a),
+        crate::tools::parse_range_uncapped(b),
+    ) {
+        (Some((sa, ar0, ac0, ar1, ac1)), Some((sb, br0, bc0, br1, bc1))) => {
+            gridtalk_graph::sheet_name_eq(&sa, &sb) && (ar0, ac0, ar1, ac1) == (br0, bc0, br1, bc1)
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether `needle` occurs in `haystack` not flanked by word
+/// characters (alphanumeric or `_`), so "yes" is not found in
+/// "yesterday" nor "6" in "36".
+pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !word(c));
+        let after_ok = haystack[end..].chars().next().is_none_or(|c| !word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// Column ranges whose heading the question uses ("what reads
+/// its **Hrs** column?"), most specific first: a column on a sheet
+/// the question also names beats a same-named column elsewhere,
+/// and a longer heading beats a shorter one it contains. At most
+/// two, so a question naming common words cannot spend the whole
+/// step budget on expansions.
+fn columns_asked_about(question: &str, graph: &gridtalk_graph::Graph) -> Vec<String> {
+    let lower = question.to_lowercase();
+    let mut found: Vec<(bool, usize, String)> = Vec::new();
+    for node in &graph.nodes {
+        if node.kind != NodeKind::Column {
+            continue;
+        }
+        let label = node.label.trim().to_lowercase();
+        // One-letter headings and plain function words ("It",
+        // "To") match half the dictionary.
+        const STOPWORDS: [&str; 18] = [
+            "it", "to", "of", "in", "on", "or", "and", "for", "the", "a", "an", "is", "are", "was",
+            "has", "had", "per", "via",
+        ];
+        if label.chars().count() < 2
+            || STOPWORDS.contains(&label.as_str())
+            || !contains_word(&lower, &label)
+        {
+            continue;
+        }
+        let Some(range) = &node.range else { continue };
+        let sheet_named = contains_word(&lower, &range.sheet.to_lowercase());
+        found.push((sheet_named, label.len(), range.a1()));
+    }
+    found.sort_by(|a, b| b.cmp(a));
+    let mut out: Vec<String> = Vec::new();
+    for (_, _, a1) in found {
+        if !out.contains(&a1) {
+            out.push(a1);
+        }
+        if out.len() == 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether the question is about the workbook as a whole — its
+/// sheets, their count, or hidden tabs — rather than one region.
+/// Word-based, so "a hidden cost" or "the table" does not fire it,
+/// while "the third tab" and "how many worksheets" do.
+fn asks_about_the_workbook(question: &str) -> bool {
+    let words: Vec<String> = question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    let has = |w: &str| words.iter().any(|x| x == w);
+    let sheetish = ["sheet", "sheets", "worksheet", "worksheets", "tab", "tabs"]
+        .iter()
+        .any(|w| has(w));
+    has("workbook")
+        || (has("hidden") && (sheetish || has("workbook")))
+        || (sheetish
+            && (has("many")
+                || has("which")
+                || has("what")
+                || has("list")
+                || has("tab")
+                || has("tabs")))
+        || (has("this") && has("file"))
+}
+
+/// `text` cut to at most `max` chars on a char boundary.
+fn truncate_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((byte, _)) => &text[..byte],
+        None => text,
+    }
 }
 
 /// All sheet-qualified cell refs in a question, in order,
@@ -549,6 +889,194 @@ mod tests {
             calc: &gridtalk_graph::eval::EvalCache::new(),
         };
         assert!(investigate("provision?", &tools, &FailBackend, 8).is_err());
+    }
+
+    #[test]
+    fn named_cells_are_read_by_default_and_columns_expand() {
+        let (wb, g, hybrid) = fixture();
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        // No adapter: the cell the question names is still read.
+        let inv = investigate(
+            "does the total in Sheet1!D2 agree?",
+            &tools,
+            &EchoBackend,
+            12,
+        )
+        .unwrap();
+        assert!(
+            inv.trail
+                .iter()
+                .any(|s| s.tool == "get_cells" && s.args == "range=Sheet1!D2"),
+            "{:?}",
+            inv.trail.iter().map(|s| &s.args).collect::<Vec<_>>()
+        );
+        assert!(inv
+            .trail
+            .iter()
+            .any(|s| s.tool == "list_formulas" && s.args == "range=Sheet1!D2"));
+        assert!(inv.citations.contains(&"Sheet1!D2".to_string()));
+        // The column a question is about gets expanded, and the
+        // expansion names what it reads (Qty and Price).
+        let inv =
+            investigate("what does the Total column read?", &tools, &EchoBackend, 12).unwrap();
+        let col = inv
+            .trail
+            .iter()
+            .find(|s| s.tool == "expand" && s.args == "range=Sheet1!D1:D3")
+            .expect("the Total column is expanded");
+        assert!(col.result.contains("Qty"), "{}", col.result);
+        assert!(col.result.contains("Price"), "{}", col.result);
+        // A workbook-scoped question reads the sheet list.
+        let inv = investigate("are there any hidden sheets?", &tools, &EchoBackend, 12).unwrap();
+        assert!(inv.trail.iter().any(|s| s.tool == "workbook_info"));
+        assert!(inv.answer.contains("sheet Sheet1"), "{}", inv.answer);
+    }
+
+    #[test]
+    fn follow_ups_and_the_selection_reach_the_prompt() {
+        let (wb, g, hybrid) = fixture();
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let history = [ChatTurn {
+            question: "What does Sheet1 hold?".into(),
+            answer: "Items with a Total column [Sheet1!A1:D3].".into(),
+        }];
+        let inv = investigate_with_context(
+            "and what reads its Total column?",
+            &tools,
+            &EchoBackend,
+            14,
+            None,
+            None,
+            &history,
+            Some("Sheet1!B1:B3"),
+        )
+        .unwrap();
+        // The follow-up was searched in stand-alone form.
+        assert_eq!(inv.trail[0].tool, "search");
+        assert!(
+            inv.trail[0].args.contains("What does Sheet1 hold?"),
+            "{}",
+            inv.trail[0].args
+        );
+        // The history rides in the prompt (the echo backend echoes it).
+        assert!(inv.answer.contains("Conversation so far:"));
+        assert!(inv.answer.contains("Items with a Total column"));
+        // The selection was read and leads the tool results.
+        let selected = inv
+            .answer
+            .find("selected Sheet1!B1:B3")
+            .expect("selection read");
+        let search = inv.answer.find("search results:").expect("search shown");
+        assert!(selected < search, "selection leads the prompt");
+        assert!(inv.citations.contains(&"Sheet1!B1:B3".to_string()));
+    }
+
+    #[test]
+    fn default_budget_still_runs_what_if_and_never_cites_missing_sheets() {
+        let (wb, g, hybrid) = fixture();
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        // The production budget (8), a selection, and two named
+        // refs: the explicitly asked what-if must still run.
+        let inv = investigate_with_context(
+            "what if Sheet1!B2 is 10, what happens to Sheet1!D2?",
+            &tools,
+            &EchoBackend,
+            8,
+            None,
+            None,
+            &[],
+            Some("Sheet1!B1:B3"),
+        )
+        .unwrap();
+        assert!(
+            inv.trail.iter().any(|s| s.tool == "what_if"),
+            "{:?}",
+            inv.trail.iter().map(|s| &s.tool).collect::<Vec<_>>()
+        );
+        // A selection on a sheet that does not exist is read as an
+        // error, never cited.
+        let inv = investigate_with_context(
+            "what feeds this?",
+            &tools,
+            &EchoBackend,
+            8,
+            None,
+            None,
+            &[],
+            Some("Missing!A1:B2"),
+        )
+        .unwrap();
+        assert!(
+            !inv.citations.iter().any(|c| c.contains("Missing")),
+            "{:?}",
+            inv.citations
+        );
+        // Nor is a named cell on a missing sheet.
+        let inv = investigate("what is Nope!A1 worth?", &tools, &EchoBackend, 8).unwrap();
+        assert!(
+            !inv.citations.iter().any(|c| c.contains("Nope")),
+            "{:?}",
+            inv.citations
+        );
+        // History refs cannot crowd out the current question's ref.
+        let history = [ChatTurn {
+            question: "What are Sheet1!A1, Sheet1!B2 and Sheet1!C2?".into(),
+            answer: "Headings and inputs.".into(),
+        }];
+        let inv = investigate_with_context(
+            "and Sheet1!D2?",
+            &tools,
+            &EchoBackend,
+            12,
+            None,
+            None,
+            &history,
+            None,
+        )
+        .unwrap();
+        assert!(
+            inv.citations.contains(&"Sheet1!D2".to_string()),
+            "{:?}",
+            inv.citations
+        );
+        // Workbook triggers are word-based.
+        assert!(!asks_about_the_workbook(
+            "is there a hidden cost in Sheet1!D2?"
+        ));
+        assert!(asks_about_the_workbook("what is on the third tab?"));
+        assert!(asks_about_the_workbook("how many worksheets are there?"));
+        assert!(asks_about_the_workbook("are there any hidden sheets?"));
+    }
+
+    #[test]
+    fn nested_ranges_count_only_when_they_expand_to_one_node() {
+        // A cell and its own column expand to the column node.
+        assert!(ranges_nested("Sheet1!D1:D3", "Sheet1!D2"));
+        assert!(ranges_nested("Sheet1!D2", "Sheet1!D1:D3"));
+        // A region holds the cell, but the cell expands to its
+        // column, not the region.
+        assert!(!ranges_nested("Sheet1!A1:D3", "Sheet1!D2"));
+        assert!(!ranges_nested("Sheet1!D2", "Sheet1!A1:D3"));
+        assert!(ranges_nested("Sheet1!A1:D3", "sheet1!A1:D3"));
+        // One cell however spelled.
+        assert!(same_range("Sheet1!D2", "Sheet1!D2:D2"));
+        assert!(same_range("sheet1!$D$2", "Sheet1!D2"));
+        assert!(!same_range("Sheet1!D2", "Sheet1!D3"));
     }
 
     #[test]

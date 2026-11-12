@@ -79,9 +79,102 @@ def test_text_present_mirrors_judge_text():
     assert not mod._text_present("anything", "")
 
 
+def test_score_judges_want_tasks_and_skips_citation():
+    task = {"id": "t1", "kind": "column_reads", "question": "What does this column read?",
+            "want": ["Rate per Hour", "Staff!C4:C44"]}
+    out = mod.RunOutput(output="It reads the rate per hour from Staff.",
+                        extra={"tool_results": "depends_on Rate per Hour (Staff!C4:C44)"})
+    hit = mod.score(task, out)
+    assert hit.extra["passed"] is True
+    assert hit.extra["citation_hit"] is None  # no citation to hit
+    # Echoing the question is not enough: no tool result carried it.
+    task2 = dict(task, question="Does it read Rate per Hour?")
+    echo = mod.RunOutput(output="It reads the Rate per Hour.",
+                         extra={"tool_results": 'no regions matched "Does it read Rate per Hour?"'})
+    assert mod.score(task2, echo).extra["passed"] is False
+
+
+def test_prepare_data_accepts_want_without_expected(tmp_path):
+    tasks = [{"id": "t-0001", "kind": "check_agrees", "question": "Does it agree?",
+              "want": ["yes"], "split": "dev"}]
+    src = tmp_path / "tasks.json"
+    src.write_text(json.dumps(tasks))
+    mod.prepare_data(src, tmp_path / "data")
+
+
 def test_score_judges_text_tasks_by_expected_text():
     task = {"id": "t1", "expected": 0.0, "expected_text": "big", "citation": "Sheet1!C2"}
     hit = mod.score(task, mod.RunOutput(output="It becomes big (Sheet1!C2)."))
     assert hit.extra["passed"] is True
     miss = mod.score(task, mod.RunOutput(output="0"))
     assert miss.extra["passed"] is False
+
+
+def test_want_mirrors_rust_word_bounds_and_history_strip():
+    # Same cases as bench.rs want_tasks_score_sentences_and_need_tool_support.
+    assert not mod._want_present("No: yesterday it disagrees.", ["yes", "agrees"],
+                                 "yesterday it disagrees", "Does it agree?")
+    assert not mod._want_present("36", ["6"], "6 -> 36", "q")
+    history = [{"question": "What does the Labour tab hold?", "answer": "Timesheets."}]
+    assert not mod._want_present(
+        "Labour (searched as: What does the Labour tab hold?. and its Hrs?)",
+        ["Labour"],
+        'no regions matched "What does the Labour tab hold?. and its Hrs?"',
+        "and its Hrs?",
+        history,
+    )
+    assert mod._want_present("It reads Labour.", ["Labour"], "region Labour!A1:C9", "q", history)
+
+
+def _fake_gridtalk(tmp_path, monkeypatch, stdout):
+    """A stand-in `gridtalk` that prints `stdout` and records its argv."""
+    script = tmp_path / "gridtalk"
+    script.write_text(
+        f"#!{sys.executable}\nimport sys, json\n"
+        f"open({str(tmp_path / 'argv.json')!r}, 'w').write(json.dumps(sys.argv))\n"
+        f"sys.stdout.write({stdout!r})\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("GRIDTALK_BIN", str(script))
+
+
+def test_run_counts_only_tool_results_as_carried(tmp_path, monkeypatch):
+    stdout = (
+        "[tool] search (q=does it read Rate per Hour?) -> no regions matched\n"
+        "[tool] get_cells (range=Staff!C4:C44) -> Staff!C4 = 12\n"
+        "\ncitations: Staff!C4:C44\n"
+        "\n--- answer (echo-local) ---\nIt reads Rate per Hour (Staff!C4:C44).\n"
+    )
+    _fake_gridtalk(tmp_path, monkeypatch, stdout)
+    task = {"id": "t1", "question": "q", "workbook": "book.xlsx",
+            "want": ["Rate per Hour", "Staff!C4:C44"]}
+    out = mod.run(task)
+    assert out.extra["tool_results"] == "no regions matched\nStaff!C4 = 12"
+    # Only the args and the citations line carried the wanted strings.
+    assert mod.score(task, out).extra["passed"] is False
+
+
+def test_run_removes_the_history_file_even_when_writing_fails(tmp_path, monkeypatch):
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    _fake_gridtalk(tmp_path, monkeypatch, "")
+    task = {"id": "t1", "question": "q", "workbook": "book.xlsx",
+            "history": [{"question": object(), "answer": "a"}]}
+    out = mod.run(task)
+    assert "error" in out.extra
+    assert not list(tmp_path.glob("*-gridtalk-history.json"))
+    # A serialisable history is passed to the CLI, then removed.
+    task["history"] = [{"question": "What is Total?", "answer": "Qty times Price."}]
+    mod.run(task)
+    argv = json.loads((tmp_path / "argv.json").read_text())
+    assert "--history-file" in argv
+    assert not list(tmp_path.glob("*-gridtalk-history.json"))
+
+
+def test_unjudgeable_expected_stays_out_of_citation_precision():
+    out = mod.RunOutput(output="5")
+    assert mod.score({"id": "t1", "expected": "n/a"}, out).extra["citation_hit"] is None
+    assert mod.score({"id": "t1", "expected": True}, out).extra["citation_hit"] is None
+    cited = {"id": "t1", "expected": "n/a", "citation": "Sheet1!B2"}
+    assert mod.score(cited, out).extra["citation_hit"] is False

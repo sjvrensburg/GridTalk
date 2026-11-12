@@ -50,16 +50,35 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
     cmd = [_gridtalk_bin(), "investigate", str(workbook)]
     if task.get("gridtalk_adapter"):
         cmd += ["--adapter", str(task["gridtalk_adapter"])]
-    cmd.append(str(task["question"]))
+    if task.get("selection"):
+        cmd += ["--selection", str(task["selection"])]
+    history_file = None
     started = time.time()
     try:
+        if task.get("history"):
+            # Earlier turns ride in a JSON file, as the CLI takes
+            # them. Created inside the try, so the finally below
+            # removes it even when writing it fails.
+            import tempfile
+
+            fd, history_file = tempfile.mkstemp(suffix="-gridtalk-history.json")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(task["history"], fh)
+            cmd += ["--history-file", history_file]
+        cmd.append(str(task["question"]))
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError) as exc:
         return RunOutput(
             output="",
             wall_s=time.time() - started,
             extra={"error": f"could not run gridtalk CLI: {exc}"},
         )
+    finally:
+        if history_file:
+            try:
+                os.unlink(history_file)
+            except OSError:
+                pass
     wall = time.time() - started
     if proc.returncode != 0:
         return RunOutput(
@@ -84,12 +103,25 @@ def run(task: dict, adapter: Path | None = None) -> RunOutput:
     citations_text = "\n".join(
         line for line in pre_marker.splitlines() if line.strip().startswith("citations:")
     )
+    # Only tool *results* count as carried, as in bench.rs: the CLI
+    # prints `[tool] name (args) -> result` and keeps " -> " out of
+    # the args, so the first " -> " starts the result. Args (which
+    # quote the question) and the citations line are left out.
+    tool_results = "\n".join(
+        line.split(" -> ", 1)[1]
+        for line in pre_marker.splitlines()
+        if line.startswith("[tool] ") and " -> " in line
+    )
     return RunOutput(
         output=answer,
         wall_s=wall,
         extra={
             "stdout_tail": text[-500:],
             "stdout": citations_text,
+            # The trail (tool steps before the answer marker): a
+            # `want` score needs a tool result to have carried the
+            # wanted string, mirroring bench.rs `judge_want`.
+            "tool_results": tool_results,
             "stderr_tail": proc.stderr.strip()[-500:],
         },
     )
@@ -366,7 +398,64 @@ def _text_present(answer: str, expected: str) -> bool:
     return _only_citations_follow(answer[last:])
 
 
+def _bounded(haystack: str, needle: str) -> bool:
+    """`needle` occurs in `haystack` not flanked by word characters
+    (alphanumeric or `_`), as bench.rs `judge_want`'s `bounded`."""
+
+    def word(c: str) -> bool:
+        return c.isalnum() or c == "_"
+
+    start = haystack.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        before_ok = start == 0 or not word(haystack[start - 1])
+        after_ok = end == len(haystack) or not word(haystack[end])
+        if before_ok and after_ok:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _want_present(answer: str, want, tool_results: str, question: str, history=None) -> bool:
+    """Mirror of bench.rs `judge_want`: any one wanted string is in
+    the answer (case-blind, not flanked by word characters) and a
+    tool result carried it. The question and every history question
+    are stripped from the tool results first, because a no-match
+    result quotes back the condensed query built from them. bench.rs
+    strips that condensed query too; it is joined from these same
+    pieces (each history question cut to 500 characters), so
+    stripping the pieces strips it."""
+    answer = answer.lower()
+    carried = tool_results.lower()
+    strips = [str(question)]
+    for turn in history or []:
+        if isinstance(turn, dict):
+            q = str(turn.get("question", "")).strip()
+            strips += [q, q[:500]]
+    for s in strips:
+        s = s.strip().lower()
+        if s:
+            carried = carried.replace(s, " ")
+    for w in want or []:
+        w = str(w).strip().lower()
+        if w and _bounded(answer, w) and _bounded(carried, w):
+            return True
+    return False
+
+
 def score(task: dict, output: RunOutput) -> JudgeResult:
+    want = [w for w in (task.get("want") or []) if isinstance(w, str) and w.strip()]
+    if want:
+        # An answer that is not a single value (bench.rs `want`).
+        extra = getattr(output, "extra", None) or {}
+        passed = _want_present(
+            str(output.output),
+            want,
+            str(extra.get("tool_results", "")),
+            str(task.get("question", "")),
+            task.get("history") if isinstance(task.get("history"), list) else None,
+        )
+        return _judged(task, output, passed, f"wanted any of {want!r} {'found' if passed else 'missing'}")
     text = task.get("expected_text")
     if isinstance(text, str) and text.strip():
         # A text or boolean answer (bench.rs `expected_text`).
@@ -377,7 +466,7 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
         return JudgeResult(
             score=0.0,
             feedback=f"task {task.get('id', '?')}: bool expected value is not numeric",
-            extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
+            extra={"passed": False, "citation_hit": _unjudged_citation(task), "kind": task.get("kind")},
         )
     try:
         expected = float(raw)
@@ -390,7 +479,7 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
         return JudgeResult(
             score=0.0,
             feedback=f"task {task.get('id', '?')}: unparseable expected value {raw!r}",
-            extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
+            extra={"passed": False, "citation_hit": _unjudged_citation(task), "kind": task.get("kind")},
         )
     import math as _math
 
@@ -398,7 +487,7 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
         return JudgeResult(
             score=0.0,
             feedback=f"task {task.get('id', '?')}: non-finite expected value {raw!r}",
-            extra={"passed": False, "citation_hit": False, "kind": task.get("kind")},
+            extra={"passed": False, "citation_hit": _unjudged_citation(task), "kind": task.get("kind")},
         )
     got = _final_number(str(output.output))
     tol = max(abs(expected) * 0.001, 0.005)
@@ -406,13 +495,26 @@ def score(task: dict, output: RunOutput) -> JudgeResult:
     return _judged(task, output, passed, f"expected {expected}, final number {got}")
 
 
+def _unjudged_citation(task: dict):
+    """`citation_hit` for a task whose answer could not be judged: a
+    miss when it expects a citation, otherwise None so it stays out
+    of citation precision (bench.rs maps only cited tasks to a miss)."""
+    return False if task.get("citation") else None
+
+
 def _judged(task: dict, output: RunOutput, passed: bool, feedback: str) -> JudgeResult:
     """The result for a judged answer, with its citation check."""
     extra = getattr(output, "extra", None) or {}
-    cited = _citation_present(str(output.output), task, extra) if task.get("citation") else False
+    if task.get("citation"):
+        cited = _citation_present(str(output.output), task, extra)
+        note = f"citation {'hit' if cited else 'miss'}"
+    else:
+        # No cell to cite: stay out of citation precision, as in bench.rs.
+        cited = None
+        note = "no citation expected"
     return JudgeResult(
         score=1.0 if passed else 0.0,
-        feedback=f"{feedback}; citation {'hit' if cited else 'miss'}",
+        feedback=f"{feedback}; {note}",
         extra={"passed": passed, "citation_hit": cited, "kind": task.get("kind")},
     )
 
@@ -427,8 +529,10 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
         raise ValueError("bench output must be a JSON array of task rows")
     seen: set[str] = set()
     for row in rows:
-        if not isinstance(row, dict) or not row.get("id") or "question" not in row or "expected" not in row:
-            raise ValueError("each bench row needs id/question/expected")
+        if not isinstance(row, dict) or not row.get("id") or "question" not in row:
+            raise ValueError("each bench row needs id/question")
+        if "expected" not in row and not row.get("expected_text") and not row.get("want"):
+            raise ValueError("each bench row needs expected, expected_text or want")
         if not isinstance(row["id"], str) or not row["id"]:
             raise ValueError("bench task id must be a non-empty string")
         if (
@@ -444,20 +548,41 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             not isinstance(row["expected_text"], str) or not row["expected_text"].strip()
         ):
             raise ValueError(f"task {row['id']}: expected_text must be a non-empty string")
-        exp = row["expected"]
-        if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
-            raise ValueError(f"task {row['id']}: expected must be a number or numeric string")
-        if isinstance(exp, str) and _final_number(exp) is None:
-            raise ValueError(f"task {row['id']}: expected {exp!r} is not numeric")
-        if isinstance(exp, (int, float)):
-            import math
+        if row.get("want") is not None and (
+            not isinstance(row["want"], list)
+            or not row["want"]
+            or any(not isinstance(w, str) or not w.strip() for w in row["want"])
+        ):
+            raise ValueError(f"task {row['id']}: want must be a non-empty list of strings")
+        if row.get("selection") is not None and (
+            not isinstance(row["selection"], str) or "!" not in row["selection"]
+        ):
+            raise ValueError(f"task {row['id']}: selection must be a range like Sheet1!A1:B2")
+        if row.get("history") is not None and (
+            not isinstance(row["history"], list)
+            or any(
+                not isinstance(t, dict)
+                or not isinstance(t.get("question"), str)
+                or not isinstance(t.get("answer"), str)
+                for t in row["history"]
+            )
+        ):
+            raise ValueError(f"task {row['id']}: history must be a list of question/answer turns")
+        if "expected" in row:
+            exp = row["expected"]
+            if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
+                raise ValueError(f"task {row['id']}: expected must be a number or numeric string")
+            if isinstance(exp, str) and _final_number(exp) is None:
+                raise ValueError(f"task {row['id']}: expected {exp!r} is not numeric")
+            if isinstance(exp, (int, float)):
+                import math
 
-            try:
-                finite = math.isfinite(exp)
-            except OverflowError:  # huge int like 10**400
-                finite = False
-            if not finite:
-                raise ValueError(f"task {row['id']}: expected must be finite")
+                try:
+                    finite = math.isfinite(exp)
+                except OverflowError:  # huge int like 10**400
+                    finite = False
+                if not finite:
+                    raise ValueError(f"task {row['id']}: expected must be finite")
         if row["id"] in seen:
             raise ValueError(f"duplicate bench task id: {row['id']}")
         seen.add(row["id"])

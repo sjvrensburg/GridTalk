@@ -184,6 +184,16 @@ fn usage_errors_exit_2_and_name_the_problem() {
             vec!["investigate", &demo, "--adapter"],
             "--adapter needs a value",
         ),
+        (
+            vec![
+                "investigate",
+                &demo,
+                "--selection",
+                "nowhere",
+                "what feeds this?",
+            ],
+            "--selection must be a range",
+        ),
         (vec!["generate", "model.gguf"], "missing the prompt"),
         (vec!["mcp", "--timeout", "0"], "--timeout must be"),
         (vec!["graph", "-o", "x"], "unknown flag -o"),
@@ -301,4 +311,70 @@ fn commands_succeed_with_exit_0() {
         0,
     ));
     assert!(cells.contains("\"ok\": true"), "{cells}");
+    // A selection and a follow-up's history reach investigate:
+    // the trail reads the selected range, and the searched
+    // question carries the earlier turn's words.
+    let dir = no_config().with_extension("history");
+    std::fs::create_dir_all(&dir).unwrap();
+    let turns = dir.join("turns.json");
+    std::fs::write(
+        &turns,
+        r#"[{"question":"What does Sheet1 hold?","answer":"Items and totals."}]"#,
+    )
+    .unwrap();
+    let out = stdout(&expect(
+        &[
+            "investigate",
+            &demo,
+            "--selection",
+            "Sheet1!A1:B2",
+            "--history-file",
+            turns.to_str().unwrap(),
+            "and what feeds this?",
+        ],
+        0,
+    ));
+    assert!(out.contains("range=Sheet1!A1:B2"), "{out}");
+    assert!(out.contains("What does Sheet1 hold?"), "{out}");
+    // A selection on a sheet the workbook lacks is read (as an
+    // error) but never cited, and " -> " in the question stays out
+    // of the args, so a trail line's first " -> " starts its result.
+    let out = stdout(&expect(
+        &[
+            "investigate",
+            &demo,
+            "--selection",
+            "Missing!A1:B2",
+            "what feeds this -> that?",
+        ],
+        0,
+    ));
+    let citations = out
+        .lines()
+        .find(|l| l.starts_with("citations:"))
+        .unwrap_or_default();
+    assert!(!citations.contains("Missing"), "{out}");
+    for line in out.lines().filter(|l| l.starts_with("[tool] ")) {
+        let (head, _) = line.split_once(" -> ").unwrap();
+        assert!(head.ends_with(')'), "{line}");
+    }
+    // A history file of the wrong shape is unreadable input (3).
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, r#"{"question":"x"}"#).unwrap();
+    let err = expect(
+        &[
+            "investigate",
+            &demo,
+            "--history-file",
+            bad.to_str().unwrap(),
+            "and it?",
+        ],
+        3,
+    );
+    assert!(
+        stderr(&err).contains("invalid history file"),
+        "{}",
+        stderr(&err)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

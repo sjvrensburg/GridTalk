@@ -42,7 +42,9 @@ pub struct Adapter {
     pub max_steps: usize,
     /// When a question names a cell (Sheet1!D2), include that
     /// cell's formulas/cells in the context even if retrieval
-    /// missed it. Off by default; the optimiser can learn it.
+    /// missed it. On by default, as it is with no adapter in play,
+    /// so a fresh adapter never reads less than none; an adapter
+    /// whose `adapter.toml` says `ref_context = false` turns it off.
     pub ref_context: bool,
     pub skills: Vec<Skill>,
 }
@@ -55,7 +57,7 @@ impl Adapter {
             rules: String::new(),
             top_k: 3,
             max_steps: 8,
-            ref_context: false,
+            ref_context: true,
             skills: Vec::new(),
         }
     }
@@ -170,7 +172,7 @@ fn clean_value(raw: &str) -> String {
 }
 
 fn parse_knobs(text: &str) -> (u32, usize, usize, bool) {
-    parse_knobs_seeded(text, 3, 8, false)
+    parse_knobs_seeded(text, 3, 8, true)
 }
 
 fn parse_knobs_seeded(

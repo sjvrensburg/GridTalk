@@ -77,7 +77,10 @@ case-insensitively, and cells must lie inside the sheet grid
   Opening a path that is already open, however it is spelled,
   returns that session (`reused: true`) instead of a second one.
 - `close_workbook`.
-- `workbook_info`: sheets with their sizes, defined names, regions,
+- `workbook_info`: sheets with their sizes and `visibility`
+  (`visible`, `hidden` or `veryHidden`, as the file records it —
+  also on `open_workbook`'s sheets and on the sheet nodes of
+  `graph_overview`), defined names, regions,
   load warnings and the tools' limits (`range_cells` 10,000,
   `search_limit` 25, `expand_edges` 200). Call it first.
 - `search`: hybrid lexical + embedding, ranges with `vector_only`

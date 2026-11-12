@@ -76,8 +76,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "investigate",
-        usage: &["gridtalk investigate <file> [--adapter <name>] <question...>"],
-        summary: "Answer with the tool-using planner (search, get_cells, what_if...), printing each tool step and the citations. --adapter must come before the question.",
+        usage: &["gridtalk investigate <file> [--adapter <name>] [--selection <Sheet!A1:B2>] [--history-file <turns.json>] <question...>"],
+        summary: "Answer with the tool-using planner (search, get_cells, what_if...), printing each tool step and the citations. Flags must come before the question. --selection names the range selected when asking (\"what feeds this?\"); --history-file is a JSON array of earlier {\"question\", \"answer\"} turns a follow-up is condensed against.",
     },
     Command {
         name: "graph",

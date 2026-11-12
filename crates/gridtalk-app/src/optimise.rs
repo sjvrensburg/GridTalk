@@ -98,7 +98,7 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
     }
     let citation_misses = results
         .iter()
-        .filter(|r| !r.passed && r.error.is_none() && !r.citation_hit)
+        .filter(|r| !r.passed && r.error.is_none() && r.citation_hit == Some(false))
         .count();
     if citation_misses > 0 && current.top_k < 8 {
         let mut a = current.clone();
@@ -119,6 +119,36 @@ pub fn propose(current: &Adapter, results: &[TaskResult]) -> Vec<Candidate> {
             label: format!("knob:max_steps=16 ({no_trail} tasks with no tool trail)"),
             adapter: a,
         });
+    }
+    // Hand-written tasks of any other kind (check_agrees,
+    // column_reads, …) are usually judged by `want`: the answer
+    // must name what the tools found, not just a number.
+    let other_fail = results
+        .iter()
+        .filter(|r| {
+            !r.passed
+                && r.error.is_none()
+                && !matches!(r.kind.as_str(), "formula_result" | "what_if" | "cell_value")
+        })
+        .count();
+    if other_fail > 0 {
+        push_rule(
+            &mut out,
+            current,
+            "rule:name-findings",
+            "- Name in the answer the columns, cells, ranges or sheets the tool results show, using their exact labels.",
+            &format!("{other_fail} failures of other kinds"),
+        );
+        // Their reads (named refs, columns, the selection) share one
+        // step budget; a starved budget leaves the answer short.
+        if current.max_steps < 16 && !out.iter().any(|c| c.label.starts_with("knob:max_steps")) {
+            let mut a = current.clone();
+            a.max_steps = 16;
+            out.push(Candidate {
+                label: format!("knob:max_steps=16 ({other_fail} failures of other kinds)"),
+                adapter: a,
+            });
+        }
     }
     out
 }
@@ -484,5 +514,53 @@ mod tests {
         let card = std::fs::read_to_string(root.join("demo/CARD.md")).unwrap();
         assert!(card.contains("ACCEPTED"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failing_tasks_of_other_kinds_get_a_candidate() {
+        let result = |kind: &str, steps: usize| TaskResult {
+            id: "t1".into(),
+            kind: kind.into(),
+            split: "train".into(),
+            passed: false,
+            citation_hit: None,
+            latency_ms: 0.0,
+            trail_steps: steps,
+            error: None,
+        };
+        let current = Adapter::empty("demo");
+        let labels: Vec<String> = propose(&current, &[result("column_reads", 8)])
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("rule:name-findings")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("knob:max_steps=16")),
+            "{labels:?}"
+        );
+        // One max_steps candidate even when the no-trail cluster fires too.
+        let labels: Vec<String> = propose(&current, &[result("column_reads", 1)])
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|l| l.starts_with("knob:max_steps"))
+                .count(),
+            1
+        );
+        // Generated kinds keep their own clusters only.
+        let labels: Vec<String> = propose(&current, &[result("cell_value", 8)])
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert!(
+            !labels.iter().any(|l| l.starts_with("rule:name-findings")),
+            "{labels:?}"
+        );
     }
 }

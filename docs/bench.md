@@ -66,6 +66,52 @@ right regions. That 0% is the floor a real model must beat, and
 the formula-result/what-if trail gaps are what Phase D adapters
 target.
 
+## Hand-written tasks
+
+A task file passed with `--tasks` may also ask the questions
+generation cannot — "what is this sheet for?", "what does this
+column read?" — whose right answer names several things in a
+sentence. Such a task carries a `want` list instead of a single
+value:
+
+```json
+{"id": "t0001", "kind": "column_reads", "split": "dev",
+ "question": "What does the Total column read?",
+ "want": ["Rate per Hour", "Staff!C4:C44"]}
+```
+
+Any one `want` string in the answer marks it right (matched
+case-blind, and not inside a longer word or number: `yes` does not
+match "yesterday", `6` does not match "36"), with one extra rule: a
+tool result in the trail must have carried the string too, so an
+answer that only echoes the question does not pass. Tool *results*
+count, not their arguments; the question, its condensed follow-up
+form and the history questions are stripped from them first,
+because a no-match search result quotes them back. The judge is
+deterministic and cannot read a stance: "it does NOT read Rate per
+Hour" still passes `want: ["Rate per Hour"]`, so want the thing a
+right answer names, not a yes/no. `kind` is a free string for such
+tasks.
+A task with no ground truth at all (no non-blank `want` or
+`expected_text`, and no `expected` for a hand-written kind) is
+judged against `expected`'s default of 0; `bench run` warns about
+each such task. Under the echo backend (no model configured) the
+answer is the prompt itself, so want tasks pass whenever retrieval
+found the string; the CARD says so, and those scores are not a
+model floor.
+A task scored by `want` or `expected_text` needs no `expected`,
+and a task with no cell to cite ("How many sheets are there?")
+needs no `citation` — it simply stays out of citation precision
+(the CARD shows `n/a` where no task in a split carries one).
+
+A task may also carry the setting it was asked in: `history`, a
+list of earlier `{"question", "answer"}` turns a follow-up is
+condensed against before searching, and `selection`, the range
+selected when asking ("what feeds this?"), which is read ahead
+of the search results. `gridtalk investigate` takes the same
+setting as `--history-file <turns.json>` and
+`--selection <Sheet!A1:B2>`; hermit's `run` passes both through.
+
 Tasks come from a file only when you pass `--tasks`; the split is
 assigned by a stable hash of the task (not position), generation
 samples evenly across the workbook when `--max` caps the pool,

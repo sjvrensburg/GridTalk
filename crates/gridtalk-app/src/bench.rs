@@ -6,7 +6,7 @@
 //! over the tasks and writes a CARD.md score report, for the echo
 //! backend (the floor) or the configured local model.
 
-use crate::investigate::investigate_with;
+use crate::investigate::{contains_word, investigate_with_context};
 use crate::tools::Tools;
 use gridtalk_graph::eval::{EvalCache, Value};
 use gridtalk_graph::lineage::Lineage;
@@ -17,21 +17,42 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchTask {
     pub id: String,
-    /// cell_value | formula_result | what_if
+    /// cell_value | formula_result | what_if, or a free string for
+    /// hand-written tasks (`check_agrees`, `sheet_purpose`, …).
     pub kind: String,
     /// train | dev — dev is never optimised against directly.
     pub split: String,
     pub question: String,
     /// Deterministic expected numeric answer (0 when the answer is
-    /// text; see `expected_text`).
+    /// text; see `expected_text`). Task files scored by
+    /// `expected_text` or `want` may omit it.
+    #[serde(default)]
     pub expected: f64,
-    /// Range the answer must cite (e.g. Sheet1!D2).
-    pub citation: String,
+    /// Range the answer must cite (e.g. Sheet1!D2). A task with no
+    /// cell to cite ("How many sheets are there?") omits it and
+    /// stays out of citation precision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation: Option<String>,
     /// For a text or boolean answer, the value as the cell shows it
     /// (`TRUE`, `big`); it is judged by [`judge_text`] instead of
     /// `expected`. Absent in task files written before typed tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_text: Option<String>,
+    /// For an answer that is not a single value ("What does this
+    /// column read?"): strings any one of which marks the answer
+    /// right, matched case-blind by [`judge_want`]. Takes
+    /// precedence over `expected_text`/`expected` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub want: Vec<String>,
+    /// Earlier turns of the conversation, for follow-up questions
+    /// ("and what reads its Hrs column?"): the run condenses the
+    /// question against them before searching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<gridtalk_index::ChatTurn>,
+    /// The range selected when the question was asked
+    /// ("what feeds this?"), read ahead of the search results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
 }
 
 /// A task's ground truth: a number, or text as the cell displays it.
@@ -250,8 +271,11 @@ pub fn generate_tasks_ex(
                 kind,
                 question,
                 expected,
-                citation,
+                citation: Some(citation),
                 expected_text,
+                want: Vec::new(),
+                history: Vec::new(),
+                selection: None,
             }
         })
         .collect();
@@ -375,6 +399,44 @@ pub fn judge_text(answer: &str, expected: &str) -> bool {
     only_citations_follow(&answer[end..])
 }
 
+/// Judge for [`BenchTask::want`]: any one wanted string appears in
+/// the answer (case-blind) **and** a tool result carried it, so an
+/// answer that only echoes the question cannot pass. The question,
+/// its condensed stand-alone form and every history question are
+/// stripped from the tool results first, because a
+/// "no regions matched" result quotes the stand-alone form back.
+/// A match must not be flanked by word characters, so "yes"
+/// inside "yesterday" and "6" inside "36" do not count; negation
+/// ("does NOT read X") still passes — a deterministic judge
+/// cannot read it, and task authors should want the thing named,
+/// not the stance. Phrases and ranges ("Rate per Hour",
+/// "Staff!C4:C44") match anywhere in a sentence, unlike the
+/// single stated values [`judge_text`] and [`judge_number`] expect.
+pub fn judge_want(
+    answer: &str,
+    want: &[String],
+    tool_results: &str,
+    question: &str,
+    history: &[gridtalk_index::ChatTurn],
+) -> bool {
+    let answer = answer.to_lowercase();
+    let mut carried = tool_results.to_lowercase();
+    let standalone = gridtalk_index::standalone_query(question, history);
+    for strip in std::iter::once(question)
+        .chain(std::iter::once(standalone.as_str()))
+        .chain(history.iter().map(|t| t.question.as_str()))
+    {
+        let strip = strip.trim().to_lowercase();
+        if !strip.is_empty() {
+            carried = carried.replace(&strip, " ");
+        }
+    }
+    want.iter()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .any(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
+}
+
 /// Whether `rest` holds nothing but citations (any token with a `!`,
 /// quoted sheet names included), punctuation and citation words.
 fn only_citations_follow(rest: &str) -> bool {
@@ -397,7 +459,9 @@ pub struct TaskResult {
     pub kind: String,
     pub split: String,
     pub passed: bool,
-    pub citation_hit: bool,
+    /// `None` when the task has no citation to hit; such tasks
+    /// stay out of citation precision.
+    pub citation_hit: Option<bool>,
     pub latency_ms: f64,
     pub trail_steps: usize,
     /// Backend/investigation error, when the task could not run.
@@ -480,15 +544,18 @@ impl BenchReport {
         }
     }
     pub fn citation_precision(&self, split: &str) -> Option<f64> {
+        // Only tasks with a citation to hit count, either way.
         let rs: Vec<&TaskResult> = self
             .results
             .iter()
-            .filter(|r| split == "all" || r.split == split)
+            .filter(|r| (split == "all" || r.split == split) && r.citation_hit.is_some())
             .collect();
         if rs.is_empty() {
             None
         } else {
-            Some(rs.iter().filter(|r| r.citation_hit).count() as f64 / rs.len() as f64)
+            Some(
+                rs.iter().filter(|r| r.citation_hit == Some(true)).count() as f64 / rs.len() as f64,
+            )
         }
     }
     fn mean_latency(&self, split: &str) -> Option<f64> {
@@ -530,21 +597,53 @@ pub fn run_bench_with(
         let started = std::time::Instant::now();
         // A backend error fails that one task; the run still
         // produces a (partial) CARD for the rest.
-        let (passed, cited, steps, error) =
-            match investigate_with(&task.question, tools, backend, max_steps, adapter, None) {
-                Ok(inv) => (
-                    // Blank text falls back to the number, as
-                    // hermit's score() does.
+        let (passed, cited, steps, error) = match investigate_with_context(
+            &task.question,
+            tools,
+            backend,
+            max_steps,
+            adapter,
+            None,
+            &task.history,
+            task.selection.as_deref(),
+        ) {
+            Ok(inv) => (
+                // A `want` list scores answers that are not a
+                // single value; below it, blank text falls back
+                // to the number, as hermit's score() does.
+                if task.want.iter().any(|w| !w.trim().is_empty()) {
+                    let tool_results = inv
+                        .trail
+                        .iter()
+                        .map(|s| s.result.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    judge_want(
+                        &inv.answer,
+                        &task.want,
+                        &tool_results,
+                        &task.question,
+                        &task.history,
+                    )
+                } else {
                     match task.expected_text.as_deref() {
                         Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
                         _ => judge_number(&inv.answer, task.expected),
-                    },
-                    citation_hit(&inv.citations, &task.citation, &inv.answer),
-                    inv.trail.len(),
-                    None,
-                ),
-                Err(e) => (false, false, 0, Some(e.to_string())),
-            };
+                    }
+                },
+                task.citation
+                    .as_deref()
+                    .map(|c| citation_hit(&inv.citations, c, &inv.answer)),
+                inv.trail.len(),
+                None,
+            ),
+            Err(e) => (
+                false,
+                task.citation.as_ref().map(|_| false),
+                0,
+                Some(e.to_string()),
+            ),
+        };
         results.push(TaskResult {
             id: task.id.clone(),
             kind: task.kind.clone(),
@@ -597,6 +696,12 @@ pub fn render_card_with_skipped(
     ));
     out.push_str("Ground truth is deterministic (cell values / evaluator\n");
     out.push_str("results); no LLM judges any task.\n\n");
+    if report.backend == "echo-local" {
+        out.push_str(
+            "Note: the echo backend echoes its context instead of answering, \
+             so these scores (want tasks especially) are not a model floor.\n\n",
+        );
+    }
     out.push_str(
         "| Split | Tasks | Accuracy | Citation precision (answer-cited) | Mean latency (ms) |\n",
     );
@@ -610,10 +715,15 @@ pub fn render_card_with_skipped(
         if n == 0 {
             continue;
         }
+        // No task in the split carries a citation: say so instead
+        // of printing a precision of 0%.
+        let precision = match report.citation_precision(split) {
+            Some(p) => format!("{:.1}%", p * 100.0),
+            None => "n/a".into(),
+        };
         out.push_str(&format!(
-            "| {split} | {n} | {:.1}% | {:.1}% | {:.0} |\n",
+            "| {split} | {n} | {:.1}% | {precision} | {:.0} |\n",
             report.accuracy(split).unwrap_or(0.0) * 100.0,
-            report.citation_precision(split).unwrap_or(0.0) * 100.0,
             report.mean_latency(split).unwrap_or(0.0)
         ));
     }
@@ -633,7 +743,11 @@ pub fn render_card_with_skipped(
             } else {
                 "FAIL"
             },
-            if r.citation_hit { "yes" } else { "no" },
+            match r.citation_hit {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "n/a",
+            },
             r.trail_steps
         ));
     }
@@ -685,19 +799,19 @@ mod tests {
         // D2 = B2*C2 = 6 is a formula-result task.
         let f = a
             .iter()
-            .find(|t| t.kind == "formula_result" && t.citation == "Sheet1!D2")
+            .find(|t| t.kind == "formula_result" && t.citation.as_deref() == Some("Sheet1!D2"))
             .expect("formula task for D2");
         assert_eq!(f.expected, 6.0);
         // What-if: B2 2 -> 12 makes D2 = 36.
         let w = a
             .iter()
-            .find(|t| t.kind == "what_if" && t.citation == "Sheet1!D2")
+            .find(|t| t.kind == "what_if" && t.citation.as_deref() == Some("Sheet1!D2"))
             .expect("what-if task for D2");
         assert_eq!(w.expected, 36.0);
         // Value recall: B2 itself is 2.
         let v = a
             .iter()
-            .find(|t| t.kind == "cell_value" && t.citation == "Sheet1!B2")
+            .find(|t| t.kind == "cell_value" && t.citation.as_deref() == Some("Sheet1!B2"))
             .expect("value task for B2");
         assert_eq!(v.expected, 2.0);
     }
@@ -762,7 +876,7 @@ mod tests {
         let what_if = |cell: &str| {
             tasks
                 .iter()
-                .find(|t| t.kind == "what_if" && t.citation == cell)
+                .find(|t| t.kind == "what_if" && t.citation.as_deref() == Some(cell))
                 .unwrap_or_else(|| panic!("no what-if task for {cell}: {tasks:#?}"))
         };
         // 3D: Jan!A2 1 -> 11 makes the Q1 total 1+2+3 = 6 into 16.
@@ -781,7 +895,7 @@ mod tests {
             .ends_with("Answer with just the resulting value."));
         let result = tasks
             .iter()
-            .find(|t| t.kind == "formula_result" && t.citation == "Summary!C2")
+            .find(|t| t.kind == "formula_result" && t.citation.as_deref() == Some("Summary!C2"))
             .expect("a text formula-result task");
         assert_eq!(result.expected_text.as_deref(), Some("small"));
         // A blank result has no formula-result task, but a what-if
@@ -789,7 +903,7 @@ mod tests {
         assert_eq!(what_if("Summary!D2").expected_text.as_deref(), Some("big"));
         assert!(!tasks
             .iter()
-            .any(|t| t.kind == "formula_result" && t.citation == "Summary!D2"));
+            .any(|t| t.kind == "formula_result" && t.citation.as_deref() == Some("Summary!D2")));
         // Task files written before typed tasks still load.
         let old: BenchTask = serde_json::from_str(
             r#"{"id":"t0001","kind":"cell_value","split":"dev","question":"q","expected":2.0,"citation":"Sheet1!B2"}"#,
@@ -834,6 +948,116 @@ mod tests {
     }
 
     #[test]
+    fn want_tasks_score_sentences_and_need_tool_support() {
+        let want = vec!["Rate per Hour".to_string(), "Staff!C4:C44".to_string()];
+        let carried = "depends_on Employee Code, Rate per Hour (Staff!C4:C44)";
+        // Any one wanted string, case-blind, anywhere in a sentence.
+        assert!(judge_want(
+            "It reads the rate per hour from Staff.",
+            &want,
+            carried,
+            "What does this column read?",
+            &[]
+        ));
+        // In the answer but carried by no tool result: the answer
+        // may only be echoing the question.
+        assert!(!judge_want(
+            "It reads the Rate per Hour.",
+            &want,
+            "depends_on Employee Code",
+            "Does it read Rate per Hour?",
+            &[]
+        ));
+        // A tool result that merely echoes the question back does
+        // not count as carrying the string either.
+        assert!(!judge_want(
+            "It reads the Rate per Hour.",
+            &want,
+            "no regions matched \"Does it read Rate per Hour?\"",
+            "Does it read Rate per Hour?",
+            &[]
+        ));
+        assert!(!judge_want("It reads hours.", &want, carried, "q", &[]));
+        // Word-flanked substrings do not count.
+        let yes = vec!["yes".to_string(), "agrees".to_string()];
+        assert!(!judge_want(
+            "No: yesterday it disagrees.",
+            &yes,
+            "yesterday it disagrees",
+            "Does it agree?",
+            &[]
+        ));
+        assert!(!judge_want("36", &["6".to_string()], "6 -> 36", "q", &[]));
+        // A want word carried only by a history question, quoted
+        // back in a no-hit search result, does not pass.
+        let history = [gridtalk_index::ChatTurn {
+            question: "What does the Labour tab hold?".into(),
+            answer: "Timesheets.".into(),
+        }];
+        assert!(!judge_want(
+            "Labour (searched as: What does the Labour tab hold?. and its Hrs?)",
+            &["Labour".to_string()],
+            "no regions matched \"What does the Labour tab hold?. and its Hrs?\"",
+            "and its Hrs?",
+            &history
+        ));
+        // A task file needs neither `expected` nor `citation` when
+        // it carries `want`, and its kind is a free string.
+        let task: BenchTask = serde_json::from_str(
+            r#"{"id":"t0001","kind":"check_agrees","split":"dev","question":"Does the check agree?","want":["yes","agrees"]}"#,
+        )
+        .unwrap();
+        assert_eq!(task.citation, None);
+        assert_eq!(task.want.len(), 2);
+        // Neither does an expected_text task need `expected`.
+        let task: BenchTask = serde_json::from_str(
+            r#"{"id":"t0002","kind":"formula_result","split":"dev","question":"q","expected_text":"big"}"#,
+        )
+        .unwrap();
+        assert_eq!(task.expected_text.as_deref(), Some("big"));
+        // Generated tasks still round-trip with their citation.
+        let old: BenchTask = serde_json::from_str(
+            r#"{"id":"t0001","kind":"cell_value","split":"dev","question":"q","expected":2.0,"citation":"Sheet1!B2"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.citation.as_deref(), Some("Sheet1!B2"));
+        assert!(old.want.is_empty());
+    }
+
+    #[test]
+    fn tasks_without_a_citation_leave_citation_precision() {
+        let report = BenchReport {
+            workbook: "w".into(),
+            backend: "b".into(),
+            results: vec![
+                TaskResult {
+                    id: "t1".into(),
+                    kind: "cell_value".into(),
+                    split: "train".into(),
+                    passed: true,
+                    citation_hit: Some(true),
+                    latency_ms: 0.0,
+                    trail_steps: 1,
+                    error: None,
+                },
+                TaskResult {
+                    id: "t2".into(),
+                    kind: "sheet_purpose".into(),
+                    split: "train".into(),
+                    passed: true,
+                    citation_hit: None,
+                    latency_ms: 0.0,
+                    trail_steps: 1,
+                    error: None,
+                },
+            ],
+        };
+        // Only the task with a citation counts towards precision.
+        assert_eq!(report.citation_precision("all"), Some(1.0));
+        assert_eq!(report.accuracy("all"), Some(1.0));
+    }
+
+    #[test]
     fn judge_extracts_numbers_without_llm() {
         assert!(judge_number("The answer is 6.", 6.0));
         assert!(judge_number("Total: 1,200 units", 1200.0));
@@ -867,6 +1091,41 @@ mod tests {
     }
 
     #[test]
+    fn want_task_with_selection_and_history_scores_by_its_want() {
+        let (wb, g, hybrid) = fixture();
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        // Asked about the selected Total column, as a follow-up:
+        // the answer names what it reads in a sentence, and there
+        // is no single cell to cite.
+        let task: BenchTask = serde_json::from_str(
+            r#"{"id":"t0001","kind":"column_reads","split":"train",
+                "question":"and what does it read?",
+                "want":["Qty"],
+                "selection":"Sheet1!D1:D3",
+                "history":[{"question":"What is the Total column?","answer":"A product of two inputs."}]}"#,
+        )
+        .unwrap();
+        let report =
+            run_bench(std::slice::from_ref(&task), &tools, &EchoBackend, "all", 14).unwrap();
+        assert!(report.results[0].passed, "{:?}", report.results[0]);
+        assert_eq!(report.results[0].citation_hit, None);
+        assert_eq!(report.citation_precision("all"), None);
+        // The setting is load-bearing: without the selection and
+        // history forwarding, the same task does not pass.
+        let mut bare = task.clone();
+        bare.selection = None;
+        bare.history = Vec::new();
+        let report =
+            run_bench(std::slice::from_ref(&bare), &tools, &EchoBackend, "all", 14).unwrap();
+        assert!(!report.results[0].passed, "{:?}", report.results[0]);
+    }
+
+    #[test]
     fn echo_backend_run_scores_and_writes_card() {
         let (wb, g, hybrid) = fixture();
         let tools = Tools {
@@ -886,7 +1145,7 @@ mod tests {
         // Echo may luck into a pass when the expected value is the
         // last number in the echoed context; what matters here is
         // that every task is scored and citations are tracked.
-        assert!(report.results.iter().any(|r| r.citation_hit));
+        assert!(report.results.iter().any(|r| r.citation_hit == Some(true)));
         let card = render_card(&report, tasks.len());
         assert!(card.contains("train"));
         assert!(card.contains("dev"));

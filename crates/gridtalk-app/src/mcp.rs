@@ -852,7 +852,7 @@ fn open_payload(id: &str, open: &OpenWorkbook) -> Value {
         .wb
         .sheets
         .iter()
-        .map(|s| json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col()}))
+        .map(|s| json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col(), "visibility": s.visibility.as_str()}))
         .collect();
     let regions: Vec<Value> = open
         .graph
@@ -1262,6 +1262,7 @@ mod tests {
         };
         let first = open(&mut server, &path);
         assert_eq!(first["reused"], false);
+        assert_eq!(first["sheets"][0]["visibility"], "visible");
         // The same file under another spelling reuses the session.
         let again = open(&mut server, &dir.join(".").join("book.csv"));
         assert_eq!(again["reused"], true);

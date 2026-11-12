@@ -505,13 +505,36 @@ fn run(args: &[String]) -> Result<(), CliError> {
                                     t.id, t.split
                                 );
                             }
-                            if !matches!(
+                            // `kind` is a free string: hand-written
+                            // tasks (check_agrees, …) name their own.
+                            // But a task needs ground truth: with no
+                            // non-blank want/expected_text it is judged
+                            // against `expected`, which defaults to 0
+                            // when the file omits it — a truncated
+                            // hand-written task would score as a
+                            // 0-task instead of being caught here.
+                            let blank_want =
+                                !t.want.is_empty() && t.want.iter().all(|w| w.trim().is_empty());
+                            if blank_want {
+                                eprintln!(
+                                    "gridtalk: warning: task {} has only blank want strings; they are ignored",
+                                    t.id
+                                );
+                            }
+                            let generated_kind = matches!(
                                 t.kind.as_str(),
                                 "cell_value" | "formula_result" | "what_if"
-                            ) {
+                            );
+                            let no_truth = !generated_kind
+                                && t.want.iter().all(|w| w.trim().is_empty())
+                                && t.expected_text
+                                    .as_deref()
+                                    .is_none_or(|x| x.trim().is_empty())
+                                && t.expected == 0.0;
+                            if no_truth {
                                 eprintln!(
-                                    "gridtalk: warning: task {} has unknown kind {:?}",
-                                    t.id, t.kind
+                                    "gridtalk: warning: task {} has no non-blank want or expected_text; it is judged against expected = 0 (the default when the file omits it)",
+                                    t.id
                                 );
                             }
                             if !seen.insert(t.id.clone()) {
@@ -560,14 +583,44 @@ fn run(args: &[String]) -> Result<(), CliError> {
             }
         }
         "investigate" => {
-            // --adapter is a flag only before the question starts;
-            // inside the question it is literal text.
-            let parsed = cli::parse_with(cmd, rest, &[cli::Flag::Value("--adapter")], Some(1))?;
+            // Flags are flags only before the question starts;
+            // inside the question they are literal text.
+            let parsed = cli::parse_with(
+                cmd,
+                rest,
+                &[
+                    cli::Flag::Value("--adapter"),
+                    cli::Flag::Value("--selection"),
+                    cli::Flag::Value("--history-file"),
+                ],
+                Some(1),
+            )?;
             let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
             let adapter_name = parsed.flag("--adapter");
             if let Some(name) = adapter_name {
                 valid_adapter_arg(cmd, name)?;
             }
+            let selection = parsed.flag("--selection");
+            if let Some(sel) = selection {
+                if tools::parse_range_uncapped(sel).is_none() {
+                    return Err(cli::usage(
+                        cmd,
+                        format!("--selection must be a range like Sheet1!A1:B2, got {sel:?}"),
+                    ));
+                }
+            }
+            let history: Vec<gridtalk_index::ChatTurn> = match parsed.flag("--history-file") {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|e| CliError::Input(format!("{path}: {e}")))?;
+                    serde_json::from_str(&text).map_err(|e| {
+                        CliError::Input(format!(
+                            "invalid history file {path} (a JSON array of {{\"question\", \"answer\"}} turns): {e}"
+                        ))
+                    })?
+                }
+                None => Vec::new(),
+            };
             let question = parsed.text();
             if question.trim().is_empty() {
                 return Err(cli::usage(cmd, "missing the question"));
@@ -585,13 +638,15 @@ fn run(args: &[String]) -> Result<(), CliError> {
             warn_if_external(&cfg);
             let cli_adapter = adapter_name.map(load_named_adapter);
             let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
-            let inv = investigate::investigate_with(
+            let inv = investigate::investigate_with_context(
                 &question,
                 &tools,
                 backend.as_ref(),
                 cli_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
                 cli_adapter.as_ref(),
                 sidecar.as_deref(),
+                &history,
+                selection,
             )
             .map_err(|e| CliError::Backend(format!("backend failed: {e}")))?;
             for step in &inv.trail {
@@ -599,8 +654,11 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     "[tool] {} ({}) -> {}",
                     step.tool,
                     // Args carry the raw question: flatten newlines
-                    // so they cannot forge citations/answer markers.
-                    step.args.replace('\n', " | "),
+                    // so they cannot forge citations/answer markers,
+                    // and keep " -> " out so a line's first " -> "
+                    // always starts its result (hermit's judge
+                    // counts only results as carried).
+                    step.args.replace('\n', " | ").replace(" -> ", " - > "),
                     step.result.replace('\n', " | ")
                 );
             }
