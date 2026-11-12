@@ -6,7 +6,7 @@
 //! over the tasks and writes a CARD.md score report, for the echo
 //! backend (the floor) or the configured local model.
 
-use crate::investigate::investigate_with_context;
+use crate::investigate::{contains_word, investigate_with_context};
 use crate::tools::Tools;
 use gridtalk_graph::eval::{EvalCache, Value};
 use gridtalk_graph::lineage::Lineage;
@@ -419,24 +419,6 @@ pub fn judge_want(
     question: &str,
     history: &[gridtalk_index::ChatTurn],
 ) -> bool {
-    fn bounded(haystack: &str, needle: &str) -> bool {
-        let word = |c: char| c.is_alphanumeric() || c == '_';
-        let mut from = 0;
-        while let Some(pos) = haystack[from..].find(needle) {
-            let start = from + pos;
-            let end = start + needle.len();
-            let before_ok = haystack[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !word(c));
-            let after_ok = haystack[end..].chars().next().is_none_or(|c| !word(c));
-            if before_ok && after_ok {
-                return true;
-            }
-            from = start + needle.chars().next().map_or(1, char::len_utf8);
-        }
-        false
-    }
     let answer = answer.to_lowercase();
     let mut carried = tool_results.to_lowercase();
     let standalone = gridtalk_index::standalone_query(question, history);
@@ -452,7 +434,7 @@ pub fn judge_want(
     want.iter()
         .map(|w| w.trim().to_lowercase())
         .filter(|w| !w.is_empty())
-        .any(|w| bounded(&answer, &w) && bounded(&carried, &w))
+        .any(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
 }
 
 /// Whether `rest` holds nothing but citations (any token with a `!`,

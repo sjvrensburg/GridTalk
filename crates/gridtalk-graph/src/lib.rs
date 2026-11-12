@@ -1826,22 +1826,15 @@ pub fn build_graph_cached(
 ) -> (Graph, Vec<String>) {
     cache.invalidate(wb, dirty);
     let mut g = Graph::default();
-    let mut next = 0usize;
-    macro_rules! push {
-        ($kind:expr, $label:expr, $range:expr) => {
-            push_vis(&mut g, &mut next, $kind, $label, $range, None)
-        };
-    }
-    fn push_vis(
-        g: &mut Graph,
-        next: &mut usize,
-        kind: NodeKind,
-        label: String,
-        range: Option<RangeRef>,
-        visibility: Option<SheetVisibility>,
-    ) -> usize {
-        let id = *next;
-        *next += 1;
+    // Node ids are assigned sequentially, so a node's id is its
+    // index in `g.nodes`.
+    let push = |g: &mut Graph,
+                kind: NodeKind,
+                label: String,
+                range: Option<RangeRef>,
+                visibility: Option<SheetVisibility>|
+     -> usize {
+        let id = g.nodes.len();
         g.nodes.push(Node {
             id,
             kind,
@@ -1850,8 +1843,8 @@ pub fn build_graph_cached(
             visibility,
         });
         id
-    }
-    let wb_id = push!(NodeKind::Workbook, wb.name.clone(), None);
+    };
+    let wb_id = push(&mut g, NodeKind::Workbook, wb.name.clone(), None, None);
     for (sheet_idx, sheet) in wb.sheets.iter().enumerate() {
         let srange = if sheet.cells.is_empty() {
             None
@@ -1864,9 +1857,8 @@ pub fn build_graph_cached(
                 c1: sheet.max_col().saturating_sub(1),
             })
         };
-        let sid = push_vis(
+        let sid = push(
             &mut g,
-            &mut next,
             NodeKind::Sheet,
             sheet.name.clone(),
             srange,
@@ -1889,7 +1881,13 @@ pub fn build_graph_cached(
         };
         for region in regions {
             let label = format!("{} region {}", sheet.name, region.range.a1());
-            let rid = push!(NodeKind::Region, label, Some(region.range.clone()));
+            let rid = push(
+                &mut g,
+                NodeKind::Region,
+                label,
+                Some(region.range.clone()),
+                None,
+            );
             g.edges.push(Edge {
                 from: sid,
                 to: rid,
@@ -1904,7 +1902,7 @@ pub fn build_graph_cached(
                     r1: region.range.r1,
                     c1: col,
                 };
-                let cid = push!(NodeKind::Column, h.clone(), Some(crange));
+                let cid = push(&mut g, NodeKind::Column, h.clone(), Some(crange), None);
                 g.edges.push(Edge {
                     from: rid,
                     to: cid,

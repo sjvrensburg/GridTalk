@@ -589,26 +589,37 @@ pub fn is_follow_up(question: &str) -> bool {
     if words.iter().any(|w| PRONOUNS.contains(&w.as_str())) {
         return true;
     }
-    // "It" counts referentially ("what reads it?"), not as the
-    // expletive of "is it true…?" / "it is…".
-    let expletive_it = matches!(words.first().map(String::as_str), Some("is"))
-        && matches!(words.get(1).map(String::as_str), Some("it"))
-        || matches!(words.first().map(String::as_str), Some("it"))
-            && matches!(words.get(1).map(String::as_str), Some("is" | "was"));
-    if !expletive_it && words.iter().any(|w| w == "it") {
+    if referential_it(&words) {
         return true;
     }
-    const DEMONSTRATED: [&str; 10] = [
-        "column", "sheet", "tab", "cell", "range", "table", "check", "one", "row", "total",
-    ];
-    let demonstrative = words
-        .windows(2)
-        .any(|pair| matches!(pair, [a, b] if a == "that" && DEMONSTRATED.contains(&b.as_str())));
+    let demonstrative = (0..words.len()).any(|i| demonstrative_that(&words, i));
     demonstrative
         || matches!(words[0].as_str(), "and" | "also" | "so" | "then" | "but")
         || words
             .windows(2)
             .any(|pair| matches!(pair, [a, b] if (a == "what" || a == "how") && b == "about"))
+}
+
+/// "It" counts referentially ("what reads it?"), not as the
+/// expletive of "is it true…?" / "it is…".
+fn referential_it(words: &[String]) -> bool {
+    let expletive_it = matches!(words.first().map(String::as_str), Some("is"))
+        && matches!(words.get(1).map(String::as_str), Some("it"))
+        || matches!(words.first().map(String::as_str), Some("it"))
+            && matches!(words.get(1).map(String::as_str), Some("is" | "was"));
+    !expletive_it && words.iter().any(|w| w == "it")
+}
+
+/// Whether `words[i]` is a demonstrative "that" ("that column",
+/// "that one"), not the relative pronoun of "rows that cost more".
+fn demonstrative_that(words: &[String], i: usize) -> bool {
+    const DEMONSTRATED: [&str; 10] = [
+        "column", "sheet", "tab", "cell", "range", "table", "check", "one", "row", "total",
+    ];
+    words[i] == "that"
+        && words
+            .get(i + 1)
+            .is_some_and(|n| DEMONSTRATED.contains(&n.as_str()))
 }
 
 /// Whether a question points at what is selected rather than
@@ -631,13 +642,40 @@ pub fn references_selection(question: &str) -> bool {
     // "this workbook" / "this file" points at the whole book, not
     // at whatever happens to be selected.
     const WHOLE: [&str; 5] = ["workbook", "file", "spreadsheet", "book", "document"];
+    // A relative "that" ("rows that cost more") and an expletive
+    // "it" ("is it true…?") point at nothing, as in [`is_follow_up`];
+    // a bare closing "that" ("what feeds that?") still points.
     words.iter().enumerate().any(|(i, w)| {
-        POINTERS.contains(&w.as_str())
+        let pointing = match w.as_str() {
+            "that" => demonstrative_that(&words, i) || i + 1 == words.len(),
+            "it" => referential_it(&words),
+            other => POINTERS.contains(&other),
+        };
+        pointing
             && !(matches!(w.as_str(), "this" | "that" | "here")
                 && words
                     .get(i + 1)
                     .is_some_and(|n| WHOLE.contains(&n.as_str())))
     })
+}
+
+/// The recent history (at most [`MAX_HISTORY_TURNS`] turns) as a
+/// prompt section, each question and answer cut to 500 chars so
+/// one pasted-huge turn cannot crowd out the rest. Empty when there
+/// is no history.
+pub fn history_prompt(history: &[ChatTurn]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let recent = &history[history.len().saturating_sub(MAX_HISTORY_TURNS)..];
+    let mut text = String::from("Conversation so far:\n");
+    for turn in recent {
+        let question: String = turn.question.trim().chars().take(500).collect();
+        let answer: String = turn.answer.trim().chars().take(500).collect();
+        text.push_str(&format!("Q: {question}\nA: {answer}\n"));
+    }
+    text.push('\n');
+    text
 }
 
 /// Condense a follow-up against the recent history (at most
@@ -693,6 +731,10 @@ mod tests {
             "Show rows that cost more than pears"
         );
         assert!(references_selection("what feeds this?"));
+        assert!(references_selection("what feeds that?"));
+        assert!(references_selection("what does that column read?"));
+        assert!(!references_selection("Show rows that cost more than pears"));
+        assert!(!references_selection("Is it true that apples cost more?"));
         assert!(!references_selection("what feeds the Hrs column?"));
         assert!(!references_selection("What is this workbook about?"));
         assert!(!references_selection("what does this file hold?"));

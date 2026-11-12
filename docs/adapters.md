@@ -23,7 +23,8 @@ local agent on a workbook shape *without retraining the model*.
 Knobs the harness honours today: `top_k` (search hits),
 `max_steps` (investigate budget), `ref_context` (when a question
 names a cell like `Sheet1!D2`, include that cell directly even if
-retrieval missed it).
+retrieval missed it; on by default, as with no adapter, so set
+`ref_context = false` to turn it off).
 
 Loading order: built-in prompt → adapter rules → matched skills
 → per-workbook sidecar. The sidecar is `<workbook>.gridtalk.md`,

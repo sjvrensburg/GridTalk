@@ -515,6 +515,12 @@ fn run(args: &[String]) -> Result<(), CliError> {
                             // 0-task instead of being caught here.
                             let blank_want =
                                 !t.want.is_empty() && t.want.iter().all(|w| w.trim().is_empty());
+                            if blank_want {
+                                eprintln!(
+                                    "gridtalk: warning: task {} has only blank want strings; they are ignored",
+                                    t.id
+                                );
+                            }
                             let generated_kind = matches!(
                                 t.kind.as_str(),
                                 "cell_value" | "formula_result" | "what_if"
@@ -525,7 +531,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                                     .as_deref()
                                     .is_none_or(|x| x.trim().is_empty())
                                 && t.expected == 0.0;
-                            if blank_want || no_truth {
+                            if no_truth {
                                 eprintln!(
                                     "gridtalk: warning: task {} has no non-blank want or expected_text; it is judged against expected = 0 (the default when the file omits it)",
                                     t.id

@@ -7,7 +7,7 @@
 pub use crate::tools::parse_cell_ref;
 use crate::tools::Tools;
 use gridtalk_graph::{CellValue, NodeKind};
-use gridtalk_index::{standalone_query, ChatTurn};
+use gridtalk_index::{history_prompt, standalone_query, ChatTurn};
 use gridtalk_infer::{ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -305,7 +305,7 @@ pub fn investigate_with_context(
         }
         let formulas = run("list_formulas", &format!("range={clean}"), &mut trail);
         context.push_str(&format!("\n\ndirect reference {clean}:\n{formulas}"));
-        if trail.len() < max_steps && !cells_read.contains(clean) {
+        if trail.len() < max_steps && !cells_read.iter().any(|done| same_range(done, clean)) {
             let cells = run("get_cells", &format!("range={clean}"), &mut trail);
             context.push_str(&format!("\n\ndirect reference cells {clean}:\n{cells}"));
             cells_read.push(clean.clone());
@@ -318,7 +318,7 @@ pub fn investigate_with_context(
                 .sheet_for(&sheet_name)
                 .is_some_and(|sh| r < sh.cells.len() && c < sh.max_col())
         });
-        if sheet_ok && !citations.contains(clean) {
+        if sheet_ok && !citations.iter().any(|c| same_range(c, clean)) {
             citations.push(clean.clone());
         }
     }
@@ -352,7 +352,7 @@ pub fn investigate_with_context(
         let expanded = run("expand", &format!("range={range}"), &mut trail);
         context.push_str(&format!("\n\ncolumn expansion {range}:\n{expanded}"));
         expanded_ranges.push(range.clone());
-        if range_sheet_exists(&range) && !citations.contains(&range) {
+        if range_sheet_exists(&range) && !citations.iter().any(|c| same_range(c, &range)) {
             citations.push(range);
         }
     }
@@ -372,7 +372,7 @@ pub fn investigate_with_context(
     }
     if let Some(range) = &top_range {
         let mut top_done = true;
-        if !expanded_ranges.contains(range) {
+        if !expanded_ranges.iter().any(|done| same_range(done, range)) {
             if trail.len() < max_steps {
                 let expanded = run("expand", &format!("range={range}"), &mut trail);
                 context.push_str(&format!("\n\ngraph expansion:\n{expanded}"));
@@ -381,7 +381,7 @@ pub fn investigate_with_context(
                 top_done = false;
             }
         }
-        if !cells_read.contains(range) {
+        if !cells_read.iter().any(|done| same_range(done, range)) {
             if trail.len() < max_steps {
                 let cells = run("get_cells", &format!("range={range}"), &mut trail);
                 context.push_str(&format!("\n\ncells:\n{cells}"));
@@ -417,21 +417,7 @@ pub fn investigate_with_context(
         sidecar,
     ));
     let system = gridtalk_adapter::cap_prompt(system);
-    let mut user = String::new();
-    if !history.is_empty() {
-        user.push_str("Conversation so far:\n");
-        let recent = &history[history
-            .len()
-            .saturating_sub(gridtalk_index::MAX_HISTORY_TURNS)..];
-        for turn in recent {
-            user.push_str(&format!(
-                "Q: {}\nA: {}\n",
-                truncate_chars(turn.question.trim(), 500),
-                truncate_chars(turn.answer.trim(), 500)
-            ));
-        }
-        user.push('\n');
-    }
+    let mut user = history_prompt(history);
     user.push_str(&format!("Question: {question}\n"));
     if standalone != question {
         user.push_str(&format!("(searched as: {standalone})\n"));
@@ -487,14 +473,51 @@ fn ranges_nested(a: &str, b: &str) -> bool {
     if !(a_holds_b || b_holds_a) {
         return false;
     }
-    // Containment implies the same node only when the inner range
-    // is a single cell (its smallest covering node is its column)
-    // or the ranges are equal: a region contains its columns, but
-    // the Region node and a Column node carry different edges.
+    // Containment implies the same node only when the ranges are
+    // equal, or the inner range is a single cell (its smallest
+    // covering node is its column) and the outer one spans that
+    // one column: a region contains its columns, but the Region
+    // node and a Column node carry different edges.
     let single = |r0: usize, c0: usize, r1: usize, c1: usize| r0 == r1 && c0 == c1;
-    single(ar0, ac0, ar1, ac1)
-        || single(br0, bc0, br1, bc1)
-        || (ar0, ac0, ar1, ac1) == (br0, bc0, br1, bc1)
+    (ar0, ac0, ar1, ac1) == (br0, bc0, br1, bc1)
+        || (single(br0, bc0, br1, bc1) && ac0 == ac1)
+        || (single(ar0, ac0, ar1, ac1) && bc0 == bc1)
+}
+
+/// Whether two ranges name the same cells, however spelled
+/// (`Sheet1!D2` and the canonical `Sheet1!D2:D2`, `sheet1!$D$2`).
+fn same_range(a: &str, b: &str) -> bool {
+    match (
+        crate::tools::parse_range_uncapped(a),
+        crate::tools::parse_range_uncapped(b),
+    ) {
+        (Some((sa, ar0, ac0, ar1, ac1)), Some((sb, br0, bc0, br1, bc1))) => {
+            gridtalk_graph::sheet_name_eq(&sa, &sb) && (ar0, ac0, ar1, ac1) == (br0, bc0, br1, bc1)
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether `needle` occurs in `haystack` not flanked by word
+/// characters (alphanumeric or `_`), so "yes" is not found in
+/// "yesterday" nor "6" in "36".
+pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !word(c));
+        let after_ok = haystack[end..].chars().next().is_none_or(|c| !word(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// Column ranges whose heading the question uses ("what reads
@@ -505,26 +528,6 @@ fn ranges_nested(a: &str, b: &str) -> bool {
 /// step budget on expansions.
 fn columns_asked_about(question: &str, graph: &gridtalk_graph::Graph) -> Vec<String> {
     let lower = question.to_lowercase();
-    let bounded = |haystack: &str, needle: &str| -> bool {
-        let mut from = 0;
-        while let Some(pos) = haystack[from..].find(needle) {
-            let start = from + pos;
-            let end = start + needle.len();
-            let before_ok = haystack[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !c.is_alphanumeric());
-            let after_ok = haystack[end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_alphanumeric());
-            if before_ok && after_ok {
-                return true;
-            }
-            from = start + needle.chars().next().map_or(1, char::len_utf8);
-        }
-        false
-    };
     let mut found: Vec<(bool, usize, String)> = Vec::new();
     for node in &graph.nodes {
         if node.kind != NodeKind::Column {
@@ -539,12 +542,12 @@ fn columns_asked_about(question: &str, graph: &gridtalk_graph::Graph) -> Vec<Str
         ];
         if label.chars().count() < 2
             || STOPWORDS.contains(&label.as_str())
-            || !bounded(&lower, &label)
+            || !contains_word(&lower, &label)
         {
             continue;
         }
         let Some(range) = &node.range else { continue };
-        let sheet_named = bounded(&lower, &range.sheet.to_lowercase());
+        let sheet_named = contains_word(&lower, &range.sheet.to_lowercase());
         found.push((sheet_named, label.len(), range.a1()));
     }
     found.sort_by(|a, b| b.cmp(a));
@@ -1058,6 +1061,22 @@ mod tests {
         assert!(asks_about_the_workbook("what is on the third tab?"));
         assert!(asks_about_the_workbook("how many worksheets are there?"));
         assert!(asks_about_the_workbook("are there any hidden sheets?"));
+    }
+
+    #[test]
+    fn nested_ranges_count_only_when_they_expand_to_one_node() {
+        // A cell and its own column expand to the column node.
+        assert!(ranges_nested("Sheet1!D1:D3", "Sheet1!D2"));
+        assert!(ranges_nested("Sheet1!D2", "Sheet1!D1:D3"));
+        // A region holds the cell, but the cell expands to its
+        // column, not the region.
+        assert!(!ranges_nested("Sheet1!A1:D3", "Sheet1!D2"));
+        assert!(!ranges_nested("Sheet1!D2", "Sheet1!A1:D3"));
+        assert!(ranges_nested("Sheet1!A1:D3", "sheet1!A1:D3"));
+        // One cell however spelled.
+        assert!(same_range("Sheet1!D2", "Sheet1!D2:D2"));
+        assert!(same_range("sheet1!$D$2", "Sheet1!D2"));
+        assert!(!same_range("Sheet1!D2", "Sheet1!D3"));
     }
 
     #[test]

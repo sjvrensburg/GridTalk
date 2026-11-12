@@ -375,7 +375,34 @@ fn selection_context(
 ) -> String {
     let mut out = format!("selected {}:\n", sel.a1());
     let header_len = out.len();
-    if let Some(id) = node_for_selection(graph, sel) {
+    // The node the whole selection sits in (as the `expand` tool
+    // picks it): its exact node, else the smallest region or
+    // column covering it, not merely the one holding its first
+    // cell, so B1:C3 reads the region rather than column B alone.
+    let covering = graph
+        .nodes
+        .iter()
+        .find(|n| n.range.as_ref() == Some(sel))
+        .or_else(|| {
+            graph
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.kind, NodeKind::Region | NodeKind::Column))
+                .filter(|n| {
+                    n.range.as_ref().is_some_and(|r| {
+                        gridtalk_graph::sheet_name_eq(&r.sheet, &sel.sheet)
+                            && r.contains(sel.r0, sel.c0)
+                            && r.contains(sel.r1, sel.c1)
+                    })
+                })
+                .min_by_key(|n| {
+                    n.range
+                        .as_ref()
+                        .map_or(u128::MAX, gridtalk_graph::range_area)
+                })
+        })
+        .map(|n| n.id);
+    if let Some(id) = covering {
         if let Some(node) = graph.nodes.iter().find(|n| n.id == id) {
             out.push_str(&format!("node {} ({})\n", node.id, node.label));
             let mut shown = 0usize;
@@ -1097,7 +1124,9 @@ impl GridTalkApp {
             );
             return;
         }
-        if let Some(first) = hits.first() {
+        // A question about the selection keeps it selected, so a
+        // follow-up ("and what reads it?") still points at it.
+        if let Some(first) = hits.first().filter(|_| asked_selection.is_none()) {
             if let Some(node) =
                 self.graph
                     .node_for_cell(&first.range.sheet, first.range.r0, first.range.c0)
@@ -1127,21 +1156,8 @@ impl GridTalkApp {
             };
         }
         // The conversation so far, for the prompt: recent turns,
-        // answers cut so one long reply cannot crowd out the rest.
-        let history_text = if history.is_empty() {
-            String::new()
-        } else {
-            let recent = &history[history
-                .len()
-                .saturating_sub(gridtalk_index::MAX_HISTORY_TURNS)..];
-            let mut text = String::from("Conversation so far:\n");
-            for turn in recent {
-                let answer: String = turn.answer.trim().chars().take(500).collect();
-                text.push_str(&format!("Q: {}\nA: {answer}\n", turn.question.trim()));
-            }
-            text.push('\n');
-            text
-        };
+        // each cut so one long turn cannot crowd out the rest.
+        let history_text = gridtalk_index::history_prompt(&history);
         let searched_as = if standalone != question {
             format!("(searched as: {standalone})\n")
         } else {
