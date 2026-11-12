@@ -552,10 +552,174 @@ impl HybridIndex {
     }
 }
 
+/// Most earlier turns a follow-up is condensed against.
+pub const MAX_HISTORY_TURNS: usize = 6;
+
+/// One earlier turn of a chat about a workbook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatTurn {
+    pub question: String,
+    pub answer: String,
+}
+
+fn question_words(question: &str) -> Vec<String> {
+    question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a question leans on what was just discussed: it names
+/// its subject with a pronoun ("what reads **its** Hrs column?"),
+/// opens as a continuation ("and in March?"), or points ("that
+/// check"). Such a question searched as written has nothing to
+/// say what "its" refers to.
+pub fn is_follow_up(question: &str) -> bool {
+    let words = question_words(question);
+    if words.is_empty() {
+        return false;
+    }
+    // Anaphoric pronouns only. "That" mid-sentence is usually a
+    // relative pronoun ("rows that cost more"), so it counts
+    // only as a demonstrative ("that column", "that one"); plain
+    // "there/too/same/instead" say nothing about an antecedent.
+    const PRONOUNS: [&str; 7] = ["its", "this", "those", "these", "they", "them", "their"];
+    if words.iter().any(|w| PRONOUNS.contains(&w.as_str())) {
+        return true;
+    }
+    // "It" counts referentially ("what reads it?"), not as the
+    // expletive of "is it true…?" / "it is…".
+    let expletive_it = matches!(words.first().map(String::as_str), Some("is"))
+        && matches!(words.get(1).map(String::as_str), Some("it"))
+        || matches!(words.first().map(String::as_str), Some("it"))
+            && matches!(words.get(1).map(String::as_str), Some("is" | "was"));
+    if !expletive_it && words.iter().any(|w| w == "it") {
+        return true;
+    }
+    const DEMONSTRATED: [&str; 10] = [
+        "column", "sheet", "tab", "cell", "range", "table", "check", "one", "row", "total",
+    ];
+    let demonstrative = words
+        .windows(2)
+        .any(|pair| matches!(pair, [a, b] if a == "that" && DEMONSTRATED.contains(&b.as_str())));
+    demonstrative
+        || matches!(words[0].as_str(), "and" | "also" | "so" | "then" | "but")
+        || words
+            .windows(2)
+            .any(|pair| matches!(pair, [a, b] if (a == "what" || a == "how") && b == "about"))
+}
+
+/// Whether a question points at what is selected rather than
+/// naming it ("what feeds **this**?", "the selected column").
+pub fn references_selection(question: &str) -> bool {
+    let words = question_words(question);
+    const POINTERS: [&str; 11] = [
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "selected",
+        "selection",
+        "here",
+        "highlighted",
+        "chosen",
+    ];
+    // "this workbook" / "this file" points at the whole book, not
+    // at whatever happens to be selected.
+    const WHOLE: [&str; 5] = ["workbook", "file", "spreadsheet", "book", "document"];
+    words.iter().enumerate().any(|(i, w)| {
+        POINTERS.contains(&w.as_str())
+            && !(matches!(w.as_str(), "this" | "that" | "here")
+                && words
+                    .get(i + 1)
+                    .is_some_and(|n| WHOLE.contains(&n.as_str())))
+    })
+}
+
+/// Condense a follow-up against the recent history (at most
+/// [`MAX_HISTORY_TURNS`] turns) into a stand-alone search query:
+/// the earlier questions supply the words the follow-up's
+/// pronouns stand for ("What does the Labour tab hold?" + "and
+/// what reads its Hrs column?" searches for Labour and Hrs
+/// together). A question that stands alone, or one with no
+/// history, is returned unchanged. Deterministic and offline: no
+/// model round-trip, so the echo backend and bench runs condense
+/// the same way a configured model does.
+pub fn standalone_query(question: &str, history: &[ChatTurn]) -> String {
+    if history.is_empty() || !is_follow_up(question) {
+        return question.to_string();
+    }
+    let recent = &history[history.len().saturating_sub(MAX_HISTORY_TURNS)..];
+    // Each carried question is cut like history answers are in
+    // prompts, so one pasted-huge question cannot flood search.
+    let mut parts: Vec<String> = recent
+        .iter()
+        .map(|t| t.question.trim().chars().take(500).collect::<String>())
+        .filter(|q| !q.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return question.to_string();
+    }
+    parts.push(question.trim().to_string());
+    parts.join(". ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gridtalk_graph::{build_graph, parse_delimited};
+
+    #[test]
+    fn follow_ups_condense_against_the_recent_history() {
+        let turn = |q: &str| ChatTurn {
+            question: q.into(),
+            answer: "an answer".into(),
+        };
+        let history = vec![turn("What does the Labour tab hold?")];
+        assert!(is_follow_up("and what reads its Hrs column?"));
+        assert!(is_follow_up("What about March?"));
+        assert!(!is_follow_up("What is the total payroll?"));
+        // A relative "that" and an expletive "it" start new topics.
+        assert!(!is_follow_up("Show rows that cost more than pears"));
+        assert!(!is_follow_up("Is it true that apples cost more?"));
+        assert!(is_follow_up("what does that column read?"));
+        assert!(is_follow_up("what reads it?"));
+        assert_eq!(
+            standalone_query("Show rows that cost more than pears", &history),
+            "Show rows that cost more than pears"
+        );
+        assert!(references_selection("what feeds this?"));
+        assert!(!references_selection("what feeds the Hrs column?"));
+        assert!(!references_selection("What is this workbook about?"));
+        assert!(!references_selection("what does this file hold?"));
+        assert!(references_selection(
+            "is this workbook's total right for this?"
+        ));
+        // The referent's words join the search.
+        assert_eq!(
+            standalone_query("and what reads its Hrs column?", &history),
+            "What does the Labour tab hold?. and what reads its Hrs column?"
+        );
+        // A stand-alone question is searched as written.
+        assert_eq!(
+            standalone_query("What is the total payroll?", &history),
+            "What is the total payroll?"
+        );
+        // No history, no condensation.
+        assert_eq!(
+            standalone_query("what feeds this?", &[]),
+            "what feeds this?"
+        );
+        // Only the last MAX_HISTORY_TURNS questions are carried.
+        let long: Vec<ChatTurn> = (0..10).map(|i| turn(&format!("question{i}"))).collect();
+        let condensed = standalone_query("and that one?", &long);
+        assert!(!condensed.contains("question3"), "{condensed}");
+        assert!(condensed.contains("question4"), "{condensed}");
+    }
 
     /// A 2,000-row ledger; row 1234's territory is unique.
     fn ledger() -> WorkbookSnapshot {

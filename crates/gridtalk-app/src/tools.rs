@@ -118,7 +118,7 @@ impl ToolRequest {
         serde_json::json!({
             "request_format": "A ToolRequest is a JSON object with a \"tool\" discriminator, e.g. {\"tool\": \"search\", \"query\": \"...\", \"limit\": 3}. Unknown fields are rejected. A failed call returns {\"error\": {\"kind\": ..., \"message\": ...}}.",
             "tools": [
-                tool("workbook_info", "Sheets (name, rows, cols), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
+                tool("workbook_info", "Sheets (name, rows, cols, visibility: visible/hidden/veryHidden), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
                 tool("search", format!("Hybrid lexical+embedding search over workbook regions. Returns ranked regions with a cited passage each. limit: 1-{MAX_SEARCH_LIMIT} (default 3; larger values are clamped and the response says so)."), schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "default": 3}}), &["query"])),
                 tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
@@ -552,7 +552,7 @@ impl<'a> Tools<'a> {
                     .wb
                     .sheets
                     .iter()
-                    .map(|s| serde_json::json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col()}))
+                    .map(|s| serde_json::json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col(), "visibility": s.visibility.as_str()}))
                     .collect();
                 let names: Vec<serde_json::Value> = self
                     .wb
@@ -568,8 +568,13 @@ impl<'a> Tools<'a> {
                     .collect();
                 let mut lines = vec![format!("workbook {}", self.wb.name)];
                 for s in &self.wb.sheets {
+                    let hidden = if s.visibility == gridtalk_graph::SheetVisibility::Visible {
+                        String::new()
+                    } else {
+                        format!(", {}", s.visibility.as_str())
+                    };
                     lines.push(format!(
-                        "sheet {} ({} rows x {} cols)",
+                        "sheet {} ({} rows x {} cols{hidden})",
                         quote_sheet(&s.name),
                         s.cells.len(),
                         s.max_col()
@@ -607,7 +612,8 @@ impl<'a> Tools<'a> {
                     .map(|n| {
                         serde_json::json!({
                             "id": n.id, "kind": format!("{:?}", n.kind), "label": n.label,
-                            "range": n.range.as_ref().map(|r| r.a1())
+                            "range": n.range.as_ref().map(|r| r.a1()),
+                            "visibility": n.visibility.map(|v| v.as_str())
                         })
                     })
                     .collect();
@@ -1195,6 +1201,42 @@ mod tests {
         let info = tools.call(&ToolRequest::WorkbookInfo);
         assert_eq!(info.data["sheets"][0]["cols"], 250);
         assert_eq!(info.data["limits"]["expand_edges"], MAX_EXPAND_EDGES);
+    }
+
+    #[test]
+    fn workbook_info_and_graph_overview_say_which_sheets_are_hidden() {
+        let (mut wb, _, _) = fixture();
+        wb.sheets[0].visibility = gridtalk_graph::SheetVisibility::Hidden;
+        let (g, v) = build_graph(&wb);
+        assert!(v.is_empty());
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let info = tools.call(&ToolRequest::WorkbookInfo);
+        assert_eq!(info.data["sheets"][0]["visibility"], "hidden");
+        assert!(info.text.contains("hidden"), "{}", info.text);
+        let overview = tools.call(&ToolRequest::GraphOverview);
+        let sheet = overview.data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["kind"] == "Sheet")
+            .expect("a sheet node");
+        assert_eq!(sheet["visibility"], "hidden");
+        // Snapshot and graph JSON written before the field existed
+        // still load: sheets as visible, nodes with no visibility.
+        let mut old = serde_json::to_value(&wb.sheets[0]).unwrap();
+        old.as_object_mut().unwrap().remove("visibility");
+        let old: gridtalk_graph::SheetSnapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(old.visibility, gridtalk_graph::SheetVisibility::Visible);
+        let mut node = serde_json::to_value(&g.nodes[0]).unwrap();
+        node.as_object_mut().unwrap().remove("visibility");
+        let node: gridtalk_graph::Node = serde_json::from_value(node).unwrap();
+        assert_eq!(node.visibility, None);
     }
 
     #[test]

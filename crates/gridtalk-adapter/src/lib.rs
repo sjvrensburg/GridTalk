@@ -42,7 +42,9 @@ pub struct Adapter {
     pub max_steps: usize,
     /// When a question names a cell (Sheet1!D2), include that
     /// cell's formulas/cells in the context even if retrieval
-    /// missed it. Off by default; the optimiser can learn it.
+    /// missed it. Investigate does this by default with no
+    /// adapter in play; an adapter's value governs when one is
+    /// (off until the optimiser learns it for that adapter).
     pub ref_context: bool,
     pub skills: Vec<Skill>,
 }

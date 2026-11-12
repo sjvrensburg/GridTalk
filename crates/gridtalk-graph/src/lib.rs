@@ -62,6 +62,45 @@ impl CellValue {
 /// copying the workbook on every edit.
 pub type Row = std::sync::Arc<Vec<CellValue>>;
 
+/// Whether a sheet's tab shows in the workbook (`state` in the file:
+/// absent, `hidden`, `veryHidden`). Reviewers ask after hidden
+/// sheets first, and "the third tab" counts only the visible ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SheetVisibility {
+    #[default]
+    Visible,
+    Hidden,
+    VeryHidden,
+}
+
+impl SheetVisibility {
+    /// The spelling the tools and the file formats use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SheetVisibility::Visible => "visible",
+            SheetVisibility::Hidden => "hidden",
+            SheetVisibility::VeryHidden => "veryHidden",
+        }
+    }
+
+    fn of_gridcraft(v: gridcraft_model::Visibility) -> SheetVisibility {
+        match v {
+            gridcraft_model::Visibility::Visible => SheetVisibility::Visible,
+            gridcraft_model::Visibility::Hidden => SheetVisibility::Hidden,
+            gridcraft_model::Visibility::VeryHidden => SheetVisibility::VeryHidden,
+        }
+    }
+
+    fn to_gridcraft(self) -> gridcraft_model::Visibility {
+        match self {
+            SheetVisibility::Visible => gridcraft_model::Visibility::Visible,
+            SheetVisibility::Hidden => gridcraft_model::Visibility::Hidden,
+            SheetVisibility::VeryHidden => gridcraft_model::Visibility::VeryHidden,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SheetSnapshot {
     pub name: String,
@@ -69,6 +108,10 @@ pub struct SheetSnapshot {
     /// (`cells[r][c]`, `cells.get(r)`); write through
     /// [`cell_mut`](Self::cell_mut) or `Arc::make_mut`.
     pub cells: Vec<Row>,
+    /// Whether the sheet's tab shows, as read from the file.
+    /// Absent (visible) in snapshots serialised before it existed.
+    #[serde(default)]
+    pub visibility: SheetVisibility,
 }
 
 impl SheetSnapshot {
@@ -77,6 +120,7 @@ impl SheetSnapshot {
         SheetSnapshot {
             name: name.into(),
             cells: rows.into_iter().map(std::sync::Arc::new).collect(),
+            visibility: SheetVisibility::Visible,
         }
     }
 
@@ -266,6 +310,9 @@ pub struct Node {
     pub kind: NodeKind,
     pub label: String,
     pub range: Option<RangeRef>,
+    /// A Sheet node's tab visibility; `None` on every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<SheetVisibility>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,7 +770,9 @@ pub fn from_gridcraft_workbook(
         for (addr, cell) in sheet.cells.iter() {
             cells[addr.row as usize][addr.col as usize] = snapshot_cell(cell);
         }
-        sheets.push(SheetSnapshot::new(sheet.name.clone(), cells));
+        let mut snapshot = SheetSnapshot::new(sheet.name.clone(), cells);
+        snapshot.visibility = SheetVisibility::of_gridcraft(sheet.visibility);
+        sheets.push(snapshot);
     }
     Ok(WorkbookSnapshot {
         name: name.into(),
@@ -832,6 +881,14 @@ fn overlay_snapshot(
     let mut renames: Vec<ColumnRename> = Vec::new();
     for (i, sheet) in wb.sheets.iter().enumerate() {
         let src = &source.sheets[i];
+        // Visibility is the snapshot's to say, even on a sheet whose
+        // cells did not change.
+        let visibility = sheet.visibility.to_gridcraft();
+        if src.visibility != visibility {
+            if let Some(target) = gc.sheet_mut(i) {
+                target.visibility = visibility;
+            }
+        }
         let mut changed: Vec<(GcRef, gridcraft_model::Cell)> = Vec::new();
         // Cells the source has: rewrite those the snapshot changed.
         for (at, cell) in src.cells.iter() {
@@ -1004,6 +1061,7 @@ fn build_from_snapshot(wb: &WorkbookSnapshot) -> gridcraft_model::Workbook {
     gc.sheets.clear();
     for sheet in &wb.sheets {
         let mut gs = gridcraft_model::Sheet::new(sheet.name.clone());
+        gs.visibility = sheet.visibility.to_gridcraft();
         for (r, row) in sheet.cells.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
                 if !cell.is_empty() {
@@ -1769,19 +1827,31 @@ pub fn build_graph_cached(
     cache.invalidate(wb, dirty);
     let mut g = Graph::default();
     let mut next = 0usize;
-    let mut push =
-        |g: &mut Graph, kind: NodeKind, label: String, range: Option<RangeRef>| -> usize {
-            let id = next;
-            next += 1;
-            g.nodes.push(Node {
-                id,
-                kind,
-                label,
-                range,
-            });
-            id
+    macro_rules! push {
+        ($kind:expr, $label:expr, $range:expr) => {
+            push_vis(&mut g, &mut next, $kind, $label, $range, None)
         };
-    let wb_id = push(&mut g, NodeKind::Workbook, wb.name.clone(), None);
+    }
+    fn push_vis(
+        g: &mut Graph,
+        next: &mut usize,
+        kind: NodeKind,
+        label: String,
+        range: Option<RangeRef>,
+        visibility: Option<SheetVisibility>,
+    ) -> usize {
+        let id = *next;
+        *next += 1;
+        g.nodes.push(Node {
+            id,
+            kind,
+            label,
+            range,
+            visibility,
+        });
+        id
+    }
+    let wb_id = push!(NodeKind::Workbook, wb.name.clone(), None);
     for (sheet_idx, sheet) in wb.sheets.iter().enumerate() {
         let srange = if sheet.cells.is_empty() {
             None
@@ -1794,7 +1864,14 @@ pub fn build_graph_cached(
                 c1: sheet.max_col().saturating_sub(1),
             })
         };
-        let sid = push(&mut g, NodeKind::Sheet, sheet.name.clone(), srange);
+        let sid = push_vis(
+            &mut g,
+            &mut next,
+            NodeKind::Sheet,
+            sheet.name.clone(),
+            srange,
+            Some(sheet.visibility),
+        );
         g.edges.push(Edge {
             from: wb_id,
             to: sid,
@@ -1812,7 +1889,7 @@ pub fn build_graph_cached(
         };
         for region in regions {
             let label = format!("{} region {}", sheet.name, region.range.a1());
-            let rid = push(&mut g, NodeKind::Region, label, Some(region.range.clone()));
+            let rid = push!(NodeKind::Region, label, Some(region.range.clone()));
             g.edges.push(Edge {
                 from: sid,
                 to: rid,
@@ -1827,7 +1904,7 @@ pub fn build_graph_cached(
                     r1: region.range.r1,
                     c1: col,
                 };
-                let cid = push(&mut g, NodeKind::Column, h.clone(), Some(crange));
+                let cid = push!(NodeKind::Column, h.clone(), Some(crange));
                 g.edges.push(Edge {
                     from: rid,
                     to: cid,
@@ -2978,6 +3055,7 @@ mod tests {
             id: 0,
             kind: NodeKind::Region,
             label: "bad".into(),
+            visibility: None,
             range: Some(RangeRef {
                 sheet: "Sheet1".into(),
                 r0: 0,
@@ -3002,6 +3080,64 @@ mod tests {
         );
         assert_eq!(inc.flush(), 0);
         assert_eq!(inc.dropped_edits(), 1);
+    }
+
+    #[test]
+    fn sheet_visibility_reaches_the_graph_and_round_trips() {
+        let mut wb = sample();
+        wb.sheets[0].visibility = SheetVisibility::Hidden;
+        wb.sheets.push({
+            let mut s = SheetSnapshot::new("Scratch", vec![vec![CellValue::Number(1.0)]]);
+            s.visibility = SheetVisibility::VeryHidden;
+            s
+        });
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let vis = |label: &str| {
+            g.nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Sheet && n.label == label)
+                .and_then(|n| n.visibility)
+        };
+        assert_eq!(vis("Sheet1"), Some(SheetVisibility::Hidden));
+        assert_eq!(vis("Scratch"), Some(SheetVisibility::VeryHidden));
+        assert_eq!(SheetVisibility::Hidden.as_str(), "hidden");
+        assert_eq!(SheetVisibility::VeryHidden.as_str(), "veryHidden");
+        // A hand-built snapshot keeps its visibility through the
+        // Gridcraft conversion used for evaluation and saving.
+        let back = from_gridcraft_workbook("x", &to_gridcraft_workbook(&wb)).unwrap();
+        assert_eq!(back.sheets[0].visibility, SheetVisibility::Hidden);
+        assert_eq!(back.sheets[1].visibility, SheetVisibility::VeryHidden);
+        // And through an actual .xlsx file (`state="hidden"`); a
+        // workbook keeps at least one visible sheet, as Excel
+        // requires, so the file round-trip adds one.
+        let mut file_wb = wb.clone();
+        file_wb.sheets.push(SheetSnapshot::new(
+            "Main",
+            vec![vec![CellValue::Number(1.0)]],
+        ));
+        let bytes = to_package_bytes(&file_wb, "xlsx").unwrap();
+        let loaded = load_bytes(std::path::Path::new("hidden.xlsx"), &bytes).unwrap();
+        assert_eq!(loaded.sheets[0].visibility, SheetVisibility::Hidden);
+        assert_eq!(loaded.sheets[1].visibility, SheetVisibility::VeryHidden);
+        assert_eq!(loaded.sheets[2].visibility, SheetVisibility::Visible);
+        // A snapshot read from the file carries its Gridcraft source,
+        // so saving overlays it; a visibility change with no cell
+        // change must still reach the saved file.
+        assert!(loaded.source.is_some());
+        let mut changed = loaded.clone();
+        changed.sheets[0].visibility = SheetVisibility::Visible;
+        changed.sheets[2].visibility = SheetVisibility::Hidden;
+        let bytes = to_package_bytes(&changed, "xlsx").unwrap();
+        let reloaded = load_bytes(std::path::Path::new("hidden.xlsx"), &bytes).unwrap();
+        assert_eq!(reloaded.sheets[0].visibility, SheetVisibility::Visible);
+        assert_eq!(reloaded.sheets[1].visibility, SheetVisibility::VeryHidden);
+        assert_eq!(reloaded.sheets[2].visibility, SheetVisibility::Hidden);
+        // A sheet built the usual way is visible.
+        assert_eq!(
+            SheetSnapshot::new("S", vec![]).visibility,
+            SheetVisibility::Visible
+        );
     }
 
     #[test]

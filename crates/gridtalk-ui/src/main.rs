@@ -343,6 +343,101 @@ struct ChatMsg {
     sources: Vec<RangeRef>,
 }
 
+/// The conversation so far as question/answer turns, oldest first:
+/// each "you" message paired with the reply that followed it. A
+/// question that never got a reply (still waiting, or followed
+/// straight by another question) pairs with nothing and is left
+/// out, rather than handed to the model with a blank answer.
+fn chat_history(chat: &[ChatMsg]) -> Vec<gridtalk_index::ChatTurn> {
+    let mut turns = Vec::new();
+    let mut pending: Option<String> = None;
+    for msg in chat {
+        if msg.role == "you" {
+            pending = Some(msg.text.clone());
+        } else if let Some(q) = pending.take() {
+            turns.push(gridtalk_index::ChatTurn {
+                question: q,
+                answer: msg.text.clone(),
+            });
+        }
+    }
+    turns
+}
+
+/// What a question about the selection stands on: the selected
+/// node's graph neighbours (what it reads, what reads it) and
+/// the selected cells themselves, bounded so a whole-column
+/// selection cannot flood the prompt.
+fn selection_context(
+    graph: &Graph,
+    wb: &gridtalk_graph::WorkbookSnapshot,
+    sel: &RangeRef,
+) -> String {
+    let mut out = format!("selected {}:\n", sel.a1());
+    let header_len = out.len();
+    if let Some(id) = node_for_selection(graph, sel) {
+        if let Some(node) = graph.nodes.iter().find(|n| n.id == id) {
+            out.push_str(&format!("node {} ({})\n", node.id, node.label));
+            let mut shown = 0usize;
+            for e in &graph.edges {
+                let (other, arrow) = if e.from == id {
+                    (e.to, "->")
+                } else if e.to == id {
+                    (e.from, "<-")
+                } else {
+                    continue;
+                };
+                if shown >= 50 {
+                    out.push_str(" ... (more edges)\n");
+                    break;
+                }
+                if let Some(t) = graph.nodes.iter().find(|n| n.id == other) {
+                    out.push_str(&format!(" {}{} {}\n", arrow, e.kind, t.label));
+                    shown += 1;
+                }
+            }
+        }
+    }
+    if let Some(sheet) = wb
+        .sheets
+        .iter()
+        .find(|s| gridtalk_graph::sheet_name_eq(&s.name, &sel.sheet))
+    {
+        out.push_str("cells:\n");
+        let mut cells = 0usize;
+        let last_row = sel.r1.min(sel.r0 + 99);
+        let mut cut = false;
+        'rows: for r in sel.r0..=last_row {
+            let mut line = Vec::new();
+            for c in sel.c0..=sel.c1 {
+                if cells >= 300 {
+                    // Keep the part of the row already read.
+                    if !line.is_empty() {
+                        out.push_str(&line.join(" | "));
+                        out.push('\n');
+                    }
+                    cut = true;
+                    break 'rows;
+                }
+                line.push(sheet.get(r, c).display());
+                cells += 1;
+            }
+            out.push_str(&line.join(" | "));
+            out.push('\n');
+        }
+        if cut || last_row < sel.r1 {
+            // Say so, so a cut selection never reads as complete.
+            out.push_str("... (selection cut at 100 rows / 300 cells)\n");
+        }
+    }
+    // Nothing behind the header (no node, no such sheet): empty,
+    // so the caller treats it as no context at all.
+    if out.len() == header_len {
+        return String::new();
+    }
+    out
+}
+
 pub struct GridTalkApp {
     inc: Option<IncrementalSnapshot>,
     graph: Graph,
@@ -409,6 +504,10 @@ pub struct GridTalkApp {
     chat_started: Option<std::time::Instant>,
     /// The context ranges of the answer being generated.
     chat_sources: Vec<RangeRef>,
+    /// The range the last ask() selected itself (its top hit). While
+    /// it is still the selection the user has not pointed at it, so
+    /// "is it right?" does not read it as the user's selection.
+    ask_selected: Option<RangeRef>,
     /// Chat messages removed to keep the log short (shown as a note).
     chat_dropped: usize,
     /// Grid edits that undo and redo walk through.
@@ -521,6 +620,7 @@ impl GridTalkApp {
             chat_busy: false,
             chat_started: None,
             chat_sources: Vec::new(),
+            ask_selected: None,
             chat_dropped: 0,
             history: History::default(),
             grid_editor_focus: None,
@@ -956,6 +1056,20 @@ impl GridTalkApp {
             return;
         }
         self.chat_input.clear();
+        // What was said before this question, and what is selected
+        // as it is asked: a follow-up ("and what reads its Hrs
+        // column?") and a pointed question ("what feeds this?")
+        // both stand on them. Captured before the search below
+        // moves the selection to its top hit.
+        let history = chat_history(&self.chat);
+        let standalone = gridtalk_index::standalone_query(&question, &history);
+        let asked_selection = if gridtalk_index::references_selection(&question)
+            && self.sync.selected_range != self.ask_selected
+        {
+            self.sync.selected_range.clone()
+        } else {
+            None
+        };
         self.push_chat("you", question.clone());
         // Search the index as of the latest edit: land the rebuild in
         // flight, then run one more for edits that arrived during it.
@@ -968,9 +1082,15 @@ impl GridTalkApp {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
-        let (adapter_prompt, adapter_top_k) = self.active_adapter_prompt(&question);
-        let hits = index.search(&question, adapter_top_k);
-        if hits.is_empty() {
+        let (adapter_prompt, adapter_top_k) = self.active_adapter_prompt(&standalone);
+        let hits = index.search(&standalone, adapter_top_k);
+        // A question about the selection stands on the selection
+        // even when its own words match no region.
+        let selection_section = match (&asked_selection, &self.inc) {
+            (Some(sel), Some(inc)) => selection_context(&self.graph, inc.snapshot(), sel),
+            _ => String::new(),
+        };
+        if hits.is_empty() && selection_section.is_empty() {
             self.push_chat(
                 "gridtalk",
                 format!("No matching region found for \"{question}\"."),
@@ -984,14 +1104,49 @@ impl GridTalkApp {
             {
                 let id = node.id;
                 self.sync.select_node(&self.graph, id);
+                self.ask_selected = self.sync.selected_range.clone();
             }
         }
         self.chat_sources = hits.iter().map(|h| h.range.clone()).collect();
-        let context = hits
+        if let Some(sel) = &asked_selection {
+            if !selection_section.is_empty() && !self.chat_sources.contains(sel) {
+                self.chat_sources.insert(0, sel.clone());
+            }
+        }
+        let mut context = hits
             .iter()
             .map(|h| format!("[{}]\n{}", h.range.a1(), h.passage))
             .collect::<Vec<_>>()
             .join("\n---\n");
+        // The selection leads the context, ahead of the hits.
+        if !selection_section.is_empty() {
+            context = if context.is_empty() {
+                selection_section
+            } else {
+                format!("{selection_section}\n---\n{context}")
+            };
+        }
+        // The conversation so far, for the prompt: recent turns,
+        // answers cut so one long reply cannot crowd out the rest.
+        let history_text = if history.is_empty() {
+            String::new()
+        } else {
+            let recent = &history[history
+                .len()
+                .saturating_sub(gridtalk_index::MAX_HISTORY_TURNS)..];
+            let mut text = String::from("Conversation so far:\n");
+            for turn in recent {
+                let answer: String = turn.answer.trim().chars().take(500).collect();
+                text.push_str(&format!("Q: {}\nA: {answer}\n", turn.question.trim()));
+            }
+            text.push('\n');
+            text
+        };
+        let searched_as = if standalone != question {
+            format!("(searched as: {standalone})\n")
+        } else {
+            String::new()
+        };
         let config_path = self.config_path.clone();
         let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         self.chat_cancel = Some(cancel.clone());
@@ -1023,7 +1178,7 @@ impl GridTalkApp {
                 system: format!(
                     "You answer questions about a spreadsheet using only the cited context. Always cite the range.{adapter_prompt}"
                 ),
-                user: format!("Question: {question}\n\nContext:\n{context}"),
+                user: format!("{history_text}Question: {question}\n{searched_as}\nContext:\n{context}"),
                 max_tokens: 512,
             };
             let mut out = String::new();
@@ -3130,6 +3285,116 @@ mod tests {
             "Sheet1!A4:A4"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_history_pairs_questions_with_their_answers() {
+        let msg = |role: &str, text: &str| ChatMsg {
+            role: role.into(),
+            text: text.into(),
+            sources: Vec::new(),
+        };
+        let chat = vec![
+            msg("you", "What does Sheet1 hold?"),
+            msg("echo-local", "Items and totals."),
+            msg("you", "and the Total column?"),
+            msg("error", "backend down"),
+            msg("you", "still waiting"),
+        ];
+        let turns = chat_history(&chat);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].question, "What does Sheet1 hold?");
+        assert_eq!(turns[0].answer, "Items and totals.");
+        assert_eq!(turns[1].answer, "backend down");
+        // A question followed straight by another (its reply never
+        // came) is left out, not paired with a blank answer.
+        let unanswered = vec![
+            msg("you", "timed out"),
+            msg("you", "What is Total?"),
+            msg("echo-local", "Qty times Price."),
+        ];
+        let kept = chat_history(&unanswered);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].question, "What is Total?");
+        // And the follow-up condenses against them.
+        assert!(
+            gridtalk_index::standalone_query("and what reads it?", &turns)
+                .contains("What does Sheet1 hold?")
+        );
+    }
+
+    #[test]
+    fn selection_context_names_neighbours_and_cells() {
+        let wb = gridtalk_graph::parse_delimited(
+            "demo",
+            "Sheet1",
+            "Item,Qty,Price,Total\nApples,2,3,=B2*C2\n",
+            ',',
+        );
+        let (graph, violations) = gridtalk_graph::build_graph(&wb);
+        assert!(violations.is_empty());
+        let sel = RangeRef {
+            sheet: "Sheet1".into(),
+            r0: 0,
+            c0: 3,
+            r1: 1,
+            c1: 3,
+        };
+        let text = selection_context(&graph, &wb, &sel);
+        assert!(text.contains("selected Sheet1!D1:D2"), "{text}");
+        assert!(text.contains("depends_on"), "{text}");
+        assert!(text.contains("Qty"), "{text}");
+        assert!(text.contains("Total"), "{text}");
+        assert!(!text.contains("cut"), "{text}");
+        // A selection on no sheet and no node is no context at all.
+        let gone = RangeRef {
+            sheet: "Gone".into(),
+            ..sel.clone()
+        };
+        assert_eq!(selection_context(&graph, &wb, &gone), "");
+        // A selection longer than the 100-row cap says it was cut.
+        let rows: String = (0..250).map(|i| format!("{i}\n")).collect();
+        let tall = gridtalk_graph::parse_delimited("tall", "Sheet1", &format!("N\n{rows}"), ',');
+        let (graph, _) = gridtalk_graph::build_graph(&tall);
+        let sel = RangeRef {
+            sheet: "Sheet1".into(),
+            r0: 0,
+            c0: 0,
+            r1: 250,
+            c1: 0,
+        };
+        let text = selection_context(&graph, &tall, &sel);
+        assert!(text.contains("selection cut"), "{text}");
+        // And one cut mid-row by the 300-cell cap keeps that row's
+        // cells read so far.
+        let wide: String = (0..7)
+            .map(|c| format!("c{c}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body: String = (0..50)
+            .map(|_| format!("{}\n", ["1"; 7].join(",")))
+            .collect();
+        let wide_wb =
+            gridtalk_graph::parse_delimited("wide", "Sheet1", &format!("{wide}\n{body}"), ',');
+        let (graph, _) = gridtalk_graph::build_graph(&wide_wb);
+        let sel = RangeRef {
+            sheet: "Sheet1".into(),
+            r0: 0,
+            c0: 0,
+            r1: 50,
+            c1: 6,
+        };
+        let text = selection_context(&graph, &wide_wb, &sel);
+        assert!(text.contains("selection cut"), "{text}");
+        // 300 cells = 42 full rows of 7 plus 6 cells of the 43rd.
+        let cell_lines: Vec<&str> = text
+            .lines()
+            .skip_while(|l| *l != "cells:")
+            .skip(1)
+            .filter(|l| !l.starts_with("..."))
+            .collect();
+        assert_eq!(cell_lines.len(), 43, "{text}");
+        assert_eq!(cell_lines[42].split(" | ").count(), 6, "{text}");
     }
 
     #[test]
