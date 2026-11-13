@@ -8,13 +8,16 @@
 //! on a Vulkan-less machine llama.cpp falls back to CPU and the
 //! backend still works, just slower.
 
+use crate::turns::{self, ToolSession, Turn, TurnRequest, Usage};
 use crate::{CancelToken, ChatBackend, ChatRequest, GenerationStats, InferError};
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -22,9 +25,15 @@ use std::time::Instant;
 
 pub const MAX_CONTEXT: usize = 4096;
 
-// Note: each request builds a fresh llama.cpp context (no KV or
-// prefix reuse across requests), so prefill cost is paid per
-// request. Context reuse is future work.
+/// The context a tool conversation gets when the config sets no
+/// `n_ctx`: room for a dozen tool results without the gigabytes a
+/// model's full training length can cost.
+pub const SESSION_CONTEXT: usize = 4 * MAX_CONTEXT;
+
+// Note: a single request (`stream`) builds a fresh llama.cpp context
+// and pays its whole prefill. A tool conversation
+// (`with_tool_session`) keeps one context for all its turns and
+// evaluates only the new part of each prompt.
 
 pub struct LlamaCppBackend {
     pub model_path: PathBuf,
@@ -110,147 +119,168 @@ fn cached_state() -> &'static std::sync::Mutex<Option<CachedState>> {
     STATE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-impl LlamaCppBackend {
-    pub fn generate_with_stats(
-        &self,
-        req: &ChatRequest,
-        cancel: &CancelToken,
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<GenerationStats, InferError> {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(InferError::Cancelled);
-        }
-        let started = Instant::now();
-        if !(0.0..=2.0).contains(&self.temperature) {
-            return Err(InferError::EngineUnavailable(format!(
-                "temperature {} is outside 0.0..=2.0",
-                self.temperature
-            )));
-        }
-        if req.max_tokens == 0 {
-            return Ok(GenerationStats {
-                prompt_tokens: 0,
-                generated_tokens: 0,
-                first_token_ms: None,
-                total_ms: started.elapsed().as_secs_f64() * 1000.0,
-                load_ms: 0.0,
-                tokens_per_sec: 0.0,
-            });
-        }
-        // Recover from a poisoned lock by dropping the cached
-        // state (a fresh backend/model load follows) instead of
-        // failing every request for the process lifetime.
-        let mut guard = cached_state().lock().unwrap_or_else(|poisoned| {
-            let mut guard = poisoned.into_inner();
-            *guard = None;
-            guard
-        });
-        let load_started = Instant::now();
-        if guard.is_none() {
-            let backend = LlamaBackend::init().map_err(|e| {
-                InferError::EngineUnavailable(format!("llama.cpp backend init failed: {e}"))
-            })?;
-            *guard = Some(CachedState {
-                backend,
-                model: None,
-            });
-        }
-        let state = guard.as_mut().unwrap();
-        let stamp = file_stamp(&self.model_path);
-        let needs_load = state.model.as_ref().is_none_or(|cached| {
-            cached.path != self.model_path
-                || cached.stamp != stamp
-                || cached.n_gpu_layers != self.n_gpu_layers
-        });
-        if needs_load {
-            let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
-            let loaded =
-                LlamaModel::load_from_file(&state.backend, &self.model_path, &model_params)
-                    .map_err(|e| {
-                        InferError::EngineUnavailable(format!(
-                            "llama.cpp could not load {}: {e}",
-                            self.model_path.display()
-                        ))
-                    })?;
-            state.model = Some(CachedModel {
-                path: self.model_path.clone(),
-                stamp,
-                n_gpu_layers: self.n_gpu_layers,
-                model: loaded,
-            });
-        }
-        let backend = &state.backend;
-        let model = &state.model.as_ref().unwrap().model;
-        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
-        if cancel.load(Ordering::Relaxed) {
-            return Err(InferError::Cancelled);
-        }
+/// What one generation produced, and what it cost.
+struct Generated {
+    text: String,
+    prompt_tokens: usize,
+    /// Prompt tokens already in the context from an earlier turn,
+    /// so not evaluated again.
+    reused_tokens: usize,
+    generated_tokens: usize,
+    first_token_ms: Option<f64>,
+    gen_ms: f64,
+}
 
-        // Prompt via the model's own chat template when it has one.
-        let prompt = match model.chat_template(None) {
-            Ok(tmpl) => {
-                let messages = vec![
-                    LlamaChatMessage::new("system".into(), req.system.clone())
-                        .map_err(|e| InferError::EngineUnavailable(e.to_string()))?,
-                    LlamaChatMessage::new("user".into(), req.user.clone())
-                        .map_err(|e| InferError::EngineUnavailable(e.to_string()))?,
-                ];
-                model
-                    .apply_chat_template(&tmpl, &messages, true)
-                    .map_err(|e| InferError::EngineUnavailable(format!("chat template: {e}")))?
+/// The model's chat template applied to `(role, content)` messages,
+/// ending where the assistant's reply starts. ChatML when the model
+/// carries no template.
+fn render_prompt(model: &LlamaModel, messages: &[(&str, String)]) -> Result<String, InferError> {
+    match model.chat_template(None) {
+        Ok(tmpl) => {
+            let messages = messages
+                .iter()
+                .map(|(role, content)| {
+                    LlamaChatMessage::new((*role).into(), content.clone())
+                        .map_err(|e| InferError::EngineUnavailable(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            model
+                .apply_chat_template(&tmpl, &messages, true)
+                .map_err(|e| InferError::EngineUnavailable(format!("chat template: {e}")))
+        }
+        Err(_) => {
+            let mut prompt = String::new();
+            for (role, content) in messages {
+                prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
             }
-            Err(_) => format!(
-                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                req.system, req.user
-            ),
-        };
-
-        let vocab = model.vocab();
-        // Context comes from the model's own training length, not a
-        // hard-coded window; fall back to MAX_CONTEXT when unknown.
-        let context_len = context_window(model.n_ctx_train(), self.n_ctx);
-        let prompt_tokens = vocab.tokenize(prompt.as_bytes(), true, true);
-        if prompt_tokens.is_empty() {
-            return Err(InferError::EngineUnavailable("empty prompt".into()));
+            prompt.push_str("<|im_start|>assistant\n");
+            Ok(prompt)
         }
-        if prompt_tokens
-            .len()
-            .checked_add(req.max_tokens)
-            .is_none_or(|total| total > context_len)
-        {
-            return Err(InferError::EngineUnavailable(format!(
-                "prompt ({} tokens) + max_tokens ({}) exceeds the {context_len}-token context",
-                prompt_tokens.len(),
-                req.max_tokens
-            )));
-        }
+    }
+}
 
-        // Allocate only the context this request needs (prompt +
-        // generation), floored at MAX_CONTEXT and capped at the
-        // model's training length — a 64K KV cache for a 1K request
-        // wastes gigabytes.
-        let n_ctx =
-            (prompt_tokens.len() + req.max_tokens).clamp(MAX_CONTEXT.min(context_len), context_len);
+/// One llama.cpp context and the tokens it holds. A second
+/// generation whose prompt starts with those tokens evaluates only
+/// what follows them, which is what makes a conversation of several
+/// turns affordable: each turn's prompt is the last one plus the
+/// model's reply and a tool result.
+struct LocalSession<'m> {
+    model: &'m LlamaModel,
+    ctx: LlamaContext<'m>,
+    /// The tokens evaluated into `ctx`, in order.
+    held: Vec<LlamaToken>,
+    temperature: f32,
+    seed: u32,
+    /// Calls made so far, for their ids.
+    calls: usize,
+}
+
+impl<'m> LocalSession<'m> {
+    fn new(
+        backend: &LlamaBackend,
+        model: &'m LlamaModel,
+        n_ctx: usize,
+        config: &LlamaCppBackend,
+    ) -> Result<Self, InferError> {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx as u32))
             .with_n_batch(512);
-        let mut ctx = model
+        let ctx = model
             .new_context(backend, ctx_params)
             .map_err(|e| InferError::EngineUnavailable(format!("llama.cpp context: {e}")))?;
+        Ok(LocalSession {
+            model,
+            ctx,
+            held: Vec::new(),
+            temperature: config.temperature,
+            seed: config.seed,
+            calls: 0,
+        })
+    }
 
-        let mut sampler = if self.temperature <= 0.0 {
-            LlamaSampler::greedy()
+    fn n_ctx(&self) -> usize {
+        self.ctx.n_ctx() as usize
+    }
+
+    /// The prompt of a tool turn as tokens: the conversation in the
+    /// text protocol, through the model's chat template.
+    fn tokens_of(&self, req: &TurnRequest) -> Result<Vec<LlamaToken>, InferError> {
+        let messages = turns::text_messages(req.messages, req.tools);
+        let prompt = render_prompt(self.model, &messages)?;
+        Ok(self.model.vocab().tokenize(prompt.as_bytes(), true, true))
+    }
+
+    /// Generate up to `max_tokens` after `prompt_tokens`, the reply
+    /// held to `grammar` (GBNF, root rule `root`) when one is given.
+    fn generate(
+        &mut self,
+        prompt_tokens: &[LlamaToken],
+        max_tokens: usize,
+        grammar: Option<&str>,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Generated, InferError> {
+        let model = self.model;
+        let vocab = model.vocab();
+        if prompt_tokens.is_empty() {
+            return Err(InferError::EngineUnavailable("empty prompt".into()));
+        }
+        let context_len = self.n_ctx();
+        if prompt_tokens
+            .len()
+            .checked_add(max_tokens)
+            .is_none_or(|total| total > context_len)
+        {
+            return Err(InferError::EngineUnavailable(format!(
+                "prompt ({} tokens) + max_tokens ({max_tokens}) exceeds the {context_len}-token context",
+                prompt_tokens.len(),
+            )));
+        }
+
+        let tail: Vec<LlamaSampler> = if self.temperature <= 0.0 {
+            vec![LlamaSampler::greedy()]
         } else {
-            LlamaSampler::chain_simple([
+            vec![
                 LlamaSampler::temp(self.temperature),
                 LlamaSampler::dist(self.seed),
-            ])
+            ]
         };
+        let mut sampler = match grammar {
+            Some(grammar) => {
+                let constrained = LlamaSampler::grammar(model, grammar, "root")
+                    .map_err(|e| InferError::EngineUnavailable(format!("grammar: {e}")))?;
+                LlamaSampler::chain_simple(std::iter::once(constrained).chain(tail))
+            }
+            None => LlamaSampler::chain_simple(tail),
+        };
+
+        // Keep what the context already holds of this prompt. At
+        // least the last prompt token is evaluated again, because the
+        // first sample needs its logits.
+        let mut keep = self
+            .held
+            .iter()
+            .zip(prompt_tokens)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(prompt_tokens.len() - 1);
+        if keep < self.held.len() {
+            let trimmed = keep > 0
+                && self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(keep as u32), None)
+                    .unwrap_or(false);
+            if !trimmed {
+                self.ctx.clear_kv_cache();
+                keep = 0;
+            }
+            self.held.truncate(keep);
+        }
 
         // Prefill in <=512-token chunks (the batch capacity), with
         // logits requested only for the final prompt token.
         let gen_started = Instant::now();
-        for chunk_start in (0..prompt_tokens.len()).step_by(512) {
+        for chunk_start in (keep..prompt_tokens.len()).step_by(512) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(InferError::Cancelled);
             }
@@ -262,8 +292,10 @@ impl LlamaCppBackend {
                     .add(*token, (chunk_start + j) as i32, &[0], last)
                     .map_err(|e| InferError::EngineUnavailable(format!("batch: {e}")))?;
             }
-            ctx.decode(&mut batch)
+            self.ctx
+                .decode(&mut batch)
                 .map_err(|e| InferError::EngineUnavailable(format!("prefill decode: {e}")))?;
+            self.held.extend_from_slice(chunk);
         }
 
         // Decode timing starts after prefill so tokens_per_sec
@@ -281,12 +313,13 @@ impl LlamaCppBackend {
         let mut emitted_len = 0usize;
         let mut n_cur = prompt_tokens.len() as i32;
 
-        while generated < req.max_tokens {
+        while generated < max_tokens {
             if cancel.load(Ordering::Relaxed) {
                 return Err(InferError::Cancelled);
             }
-            let token = sampler.sample(&ctx, -1);
-            sampler.accept(token);
+            // `sample` also accepts the token; accepting it a second
+            // time would advance a grammar twice.
+            let token = sampler.sample(&self.ctx, -1);
             if first_token_ms.is_none() {
                 // TTFT includes prefill (from generation start,
                 // still excluding model load).
@@ -394,8 +427,10 @@ impl LlamaCppBackend {
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| InferError::EngineUnavailable(format!("batch: {e}")))?;
             n_cur += 1;
-            ctx.decode(&mut next_batch)
+            self.ctx
+                .decode(&mut next_batch)
                 .map_err(|e| InferError::EngineUnavailable(format!("decode: {e}")))?;
+            self.held.push(token);
         }
 
         // Drain any held-back incomplete trailing bytes as
@@ -408,20 +443,234 @@ impl LlamaCppBackend {
         if decoded.len() > emitted_len {
             on_token(&decoded[emitted_len..]);
         }
-
-        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let gen_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-        Ok(GenerationStats {
+        Ok(Generated {
+            text: decoded,
             prompt_tokens: prompt_tokens.len(),
+            reused_tokens: keep,
             generated_tokens: generated,
             first_token_ms,
-            total_ms,
-            load_ms,
-            tokens_per_sec: if gen_ms > 0.0 {
-                generated as f64 / (gen_ms / 1000.0)
-            } else {
-                0.0
-            },
+            gen_ms: decode_started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+/// Passes an answer's text on as it is generated and holds a tool
+/// call back: the first character that is not white space decides
+/// which the reply is, and an answer's `ANSWER:` mark is dropped.
+struct AnswerStream {
+    seen: String,
+    decided: Option<bool>,
+}
+
+impl AnswerStream {
+    fn new() -> Self {
+        AnswerStream {
+            seen: String::new(),
+            decided: None,
+        }
+    }
+
+    fn push(&mut self, piece: &str, on_token: &mut dyn FnMut(&str)) {
+        match self.decided {
+            Some(true) => on_token(piece),
+            Some(false) => {}
+            None => {
+                self.seen.push_str(piece);
+                let text = self.seen.trim_start();
+                if text.is_empty() || turns::ANSWER_MARK.starts_with(text) {
+                    return;
+                }
+                if text.starts_with('{') {
+                    self.decided = Some(false);
+                    return;
+                }
+                self.decided = Some(true);
+                let rest = text
+                    .strip_prefix(turns::ANSWER_MARK)
+                    .unwrap_or(text)
+                    .trim_start();
+                if !rest.is_empty() {
+                    on_token(rest);
+                }
+            }
+        }
+    }
+}
+
+impl ToolSession for LocalSession<'_> {
+    fn turn(
+        &mut self,
+        req: &TurnRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Turn, InferError> {
+        let prompt_tokens = self.tokens_of(req)?;
+        let grammar = turns::tool_grammar(req.tools, req.choice);
+        let mut stream = AnswerStream::new();
+        let generated = self.generate(
+            &prompt_tokens,
+            req.max_tokens,
+            Some(&grammar),
+            cancel,
+            &mut |piece| stream.push(piece, on_token),
+        )?;
+        self.calls += 1;
+        let mut turn = turns::parse_text_turn(&generated.text, &format!("call_{}", self.calls));
+        turn.usage = Some(Usage {
+            prompt_tokens: generated.prompt_tokens,
+            reused_tokens: generated.reused_tokens,
+            generated_tokens: generated.generated_tokens,
+        });
+        Ok(turn)
+    }
+
+    fn context_tokens(&self) -> Option<usize> {
+        Some(self.n_ctx())
+    }
+
+    fn prompt_tokens(&mut self, req: &TurnRequest) -> Option<usize> {
+        self.tokens_of(req).ok().map(|tokens| tokens.len())
+    }
+}
+
+impl LlamaCppBackend {
+    /// Run `run` with the model loaded (it is loaded on first use and
+    /// kept; the lock is held for the whole call, which serialises
+    /// concurrent requests). `run` is also given the load time in
+    /// milliseconds.
+    fn with_model<R>(
+        &self,
+        run: impl FnOnce(&LlamaBackend, &LlamaModel, f64) -> Result<R, InferError>,
+    ) -> Result<R, InferError> {
+        if !(0.0..=2.0).contains(&self.temperature) {
+            return Err(InferError::EngineUnavailable(format!(
+                "temperature {} is outside 0.0..=2.0",
+                self.temperature
+            )));
+        }
+        // Recover from a poisoned lock by dropping the cached
+        // state (a fresh backend/model load follows) instead of
+        // failing every request for the process lifetime.
+        let mut guard = cached_state().lock().unwrap_or_else(|poisoned| {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            guard
+        });
+        let load_started = Instant::now();
+        if guard.is_none() {
+            let backend = LlamaBackend::init().map_err(|e| {
+                InferError::EngineUnavailable(format!("llama.cpp backend init failed: {e}"))
+            })?;
+            *guard = Some(CachedState {
+                backend,
+                model: None,
+            });
+        }
+        let state = guard.as_mut().unwrap();
+        let stamp = file_stamp(&self.model_path);
+        let needs_load = state.model.as_ref().is_none_or(|cached| {
+            cached.path != self.model_path
+                || cached.stamp != stamp
+                || cached.n_gpu_layers != self.n_gpu_layers
+        });
+        if needs_load {
+            let model_params = LlamaModelParams::default().with_n_gpu_layers(self.n_gpu_layers);
+            let loaded =
+                LlamaModel::load_from_file(&state.backend, &self.model_path, &model_params)
+                    .map_err(|e| {
+                        InferError::EngineUnavailable(format!(
+                            "llama.cpp could not load {}: {e}",
+                            self.model_path.display()
+                        ))
+                    })?;
+            state.model = Some(CachedModel {
+                path: self.model_path.clone(),
+                stamp,
+                n_gpu_layers: self.n_gpu_layers,
+                model: loaded,
+            });
+        }
+        let backend = &state.backend;
+        let model = &state.model.as_ref().unwrap().model;
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        run(backend, model, load_ms)
+    }
+
+    pub fn generate_with_stats(
+        &self,
+        req: &ChatRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<GenerationStats, InferError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(InferError::Cancelled);
+        }
+        let started = Instant::now();
+        if req.max_tokens == 0 {
+            // Still refuse a bad temperature before doing nothing.
+            if !(0.0..=2.0).contains(&self.temperature) {
+                return Err(InferError::EngineUnavailable(format!(
+                    "temperature {} is outside 0.0..=2.0",
+                    self.temperature
+                )));
+            }
+            return Ok(GenerationStats {
+                prompt_tokens: 0,
+                generated_tokens: 0,
+                first_token_ms: None,
+                total_ms: started.elapsed().as_secs_f64() * 1000.0,
+                load_ms: 0.0,
+                tokens_per_sec: 0.0,
+            });
+        }
+        self.with_model(|backend, model, load_ms| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(InferError::Cancelled);
+            }
+            // Prompt via the model's own chat template when it has one.
+            let prompt = render_prompt(
+                model,
+                &[("system", req.system.clone()), ("user", req.user.clone())],
+            )?;
+            // Context comes from the model's own training length, not a
+            // hard-coded window; fall back to MAX_CONTEXT when unknown.
+            let context_len = context_window(model.n_ctx_train(), self.n_ctx);
+            let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+            if prompt_tokens.is_empty() {
+                return Err(InferError::EngineUnavailable("empty prompt".into()));
+            }
+            if prompt_tokens
+                .len()
+                .checked_add(req.max_tokens)
+                .is_none_or(|total| total > context_len)
+            {
+                return Err(InferError::EngineUnavailable(format!(
+                    "prompt ({} tokens) + max_tokens ({}) exceeds the {context_len}-token context",
+                    prompt_tokens.len(),
+                    req.max_tokens
+                )));
+            }
+            // Allocate only the context this request needs (prompt +
+            // generation), floored at MAX_CONTEXT and capped at the
+            // model's training length — a 64K KV cache for a 1K request
+            // wastes gigabytes.
+            let n_ctx = (prompt_tokens.len() + req.max_tokens)
+                .clamp(MAX_CONTEXT.min(context_len), context_len);
+            let mut session = LocalSession::new(backend, model, n_ctx, self)?;
+            let generated =
+                session.generate(&prompt_tokens, req.max_tokens, None, cancel, on_token)?;
+            Ok(GenerationStats {
+                prompt_tokens: generated.prompt_tokens,
+                generated_tokens: generated.generated_tokens,
+                first_token_ms: generated.first_token_ms,
+                total_ms: started.elapsed().as_secs_f64() * 1000.0,
+                load_ms,
+                tokens_per_sec: if generated.gen_ms > 0.0 {
+                    generated.generated_tokens as f64 / (generated.gen_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            })
         })
     }
 }
@@ -438,6 +687,27 @@ impl ChatBackend for LlamaCppBackend {
     ) -> Result<(), InferError> {
         self.generate_with_stats(req, cancel, on_token)?;
         Ok(())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn with_tool_session(
+        &self,
+        run: &mut dyn FnMut(&mut dyn ToolSession) -> Result<(), InferError>,
+    ) -> Result<(), InferError> {
+        self.with_model(|backend, model, _| {
+            let context_len = context_window(model.n_ctx_train(), self.n_ctx);
+            // A configured `n_ctx` is the user's choice; otherwise a
+            // conversation gets a moderate window.
+            let n_ctx = match self.n_ctx {
+                Some(_) => context_len,
+                None => context_len.min(SESSION_CONTEXT),
+            };
+            let mut session = LocalSession::new(backend, model, n_ctx, self)?;
+            run(&mut session)
+        })
     }
 }
 

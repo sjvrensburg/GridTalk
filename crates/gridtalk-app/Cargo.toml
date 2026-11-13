@@ -14,6 +14,7 @@ default = []
 
 [dependencies]
 gridtalk-adapter = { path = "../gridtalk-adapter" }
+gridtalk-agent = { path = "../gridtalk-agent" }
 gridtalk-graph = { path = "../gridtalk-graph" }
 gridtalk-index = { path = "../gridtalk-index" }
 gridtalk-infer = { path = "../gridtalk-infer" }

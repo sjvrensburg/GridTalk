@@ -38,12 +38,17 @@ always produces the same `tasks.json`.
 
 ```bash
 gridtalk bench run <workbook> [--tasks tasks.json] \
-    [--split train|dev|all] [--card CARD.md]
+    [--split train|dev|all] [--card CARD.md] [--adapter <name>] \
+    [--no-tool-loop]
 ```
 
 Each task runs through the investigate harness with the
 configured backend (the echo backend when no model is
 configured — that score is the floor a real model must beat).
+With a backend that takes tool turns the model chooses its own
+tool calls (decision 0006); `--no-tool-loop` scores the fixed
+pipeline with the same backend, which is how to tell what the loop
+is worth on a set of tasks.
 Scoring is a number check against ground truth (or, for a task
 with `expected_text`, a check that the text is the last value the
 answer states: its last whole-word occurrence, ignoring case, may be
@@ -122,6 +127,18 @@ counted as skipped in the CARD, never silently tasked.
 ## CARD.md
 
 The run writes a CARD with per-split accuracy, citation
-precision, mean latency, and a per-task PASS/FAIL table — the
-record Phase D's optimise loop compares before accepting an
-adapter change.
+precision, mean latency, a table by kind of question and a
+per-task PASS/FAIL table — the record Phase D's optimise loop
+compares before accepting an adapter change.
+
+The table by kind gives, for each `kind`, how many tasks passed,
+how many were *carried*, and the mean tool calls and model turns.
+A task is carried when the tool results held what it wants (a
+`want` string, its `expected_text`, or its expected number),
+whatever the answer made of it. The two counts separate two
+failures: a kind that is carried and not passed was read right and
+worded wrong, and a kind that is not carried never had the answer
+in front of the model, so the calls are what to fix. For a task
+scored by a number the count is generous: any number in the tool
+text that equals the expected one counts, a row label or a score
+included, so read it with care when the answer is a small integer.

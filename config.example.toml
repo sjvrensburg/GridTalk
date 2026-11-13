@@ -12,7 +12,10 @@ engine = "llamacpp"
 # model_path = "/home/you/.cache/gridtalk/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"  # any GGUF, incl. MoE
 # Local model tuning (also editable in the UI under Settings):
 # n_gpu_layers = 20   # layers offloaded to the GPU; unset = all, 0 = CPU only
-# n_ctx = 8192        # context window cap in tokens; unset = the model's own (up to 64K)
+# n_ctx = 8192        # context window cap in tokens; unset = the model's own (up to 64K;
+#                     # a tool conversation gets 16K unless this is set). With the
+#                     # external backend it tells the tool loop how large the
+#                     # endpoint's window is (16K is assumed when unset).
 # base_url = "http://127.0.0.1:11434/v1"   # external backend / redacting proxy
 # base_url = "https://api.example.com/v1"   # https: certificate-verified TLS
 # An API key goes over plain http only to a loopback host; use https

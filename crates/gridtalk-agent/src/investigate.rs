@@ -8,7 +8,7 @@ pub use crate::tools::parse_cell_ref;
 use crate::tools::Tools;
 use gridtalk_graph::{CellValue, NodeKind};
 use gridtalk_index::{history_prompt, standalone_query, ChatTurn};
-use gridtalk_infer::{ChatBackend, ChatRequest};
+use gridtalk_infer::{CancelToken, ChatBackend, ChatRequest};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -24,13 +24,33 @@ pub struct Investigation {
     pub answer: String,
     pub trail: Vec<TrailStep>,
     pub citations: Vec<String>,
+    /// Ranges the answer cites that no tool result read or named
+    /// (tool loop only): the model has them from somewhere else.
+    pub unread_citations: Vec<String>,
+    /// Model turns taken: 1 in the fixed pipeline, one per turn of
+    /// the tool loop.
+    pub model_turns: usize,
+    /// Whether `answer` ends in a `Sources:` line this code added
+    /// because the model cited nothing that was read. A caller that
+    /// shows the citations its own way can leave the line out.
+    pub sources_appended: bool,
+}
+
+impl Investigation {
+    /// The answer without the `Sources:` line added to it, if one
+    /// was.
+    pub fn answer_body(&self) -> &str {
+        match self.answer.rsplit_once("\n\nSources: ") {
+            Some((body, _)) if self.sources_appended => body,
+            _ => &self.answer,
+        }
+    }
 }
 
 /// Run an investigation. The deterministic planner always performs
 /// search -> cells -> formulas (plus what_if when the question asks
 /// for it); the backend then composes the final cited answer from
 /// the gathered context. Every step lands in the trail.
-#[allow(dead_code)] // convenience wrapper over investigate_with
 pub fn investigate(
     question: &str,
     tools: &Tools,
@@ -80,6 +100,180 @@ pub fn investigate_with_context(
     history: &[ChatTurn],
     selection: Option<&str>,
 ) -> Result<Investigation, gridtalk_infer::InferError> {
+    investigate_run(
+        &Ask {
+            question,
+            max_steps,
+            adapter,
+            sidecar,
+            history,
+            selection,
+        },
+        tools,
+        backend,
+        &mut Run {
+            cancel: Arc::new(AtomicBool::new(false)),
+            on_token: &mut |_| {},
+            on_step: &mut |_| {},
+            trace: None,
+            tool_loop: true,
+        },
+    )
+}
+
+/// What is asked, and what it is asked against.
+#[derive(Clone, Copy)]
+pub struct Ask<'a> {
+    pub question: &'a str,
+    /// The tool-call budget. In the fixed pipeline it bounds every
+    /// call. In the tool loop it bounds the calls the model chooses;
+    /// the planner's opening reads (at most
+    /// [`crate::agent::OPENING_STEPS`]) come on top.
+    pub max_steps: usize,
+    pub adapter: Option<&'a gridtalk_adapter::Adapter>,
+    /// The per-workbook sidecar's rules, appended last.
+    pub sidecar: Option<&'a str>,
+    /// Earlier turns of the conversation, oldest first.
+    pub history: &'a [ChatTurn],
+    /// The range the caller has selected.
+    pub selection: Option<&'a str>,
+}
+
+/// How a run reports back while it is under way.
+pub struct Run<'a> {
+    /// Set to stop the run; the backend polls it.
+    pub cancel: CancelToken,
+    /// The answer's text as it is produced.
+    pub on_token: &'a mut dyn FnMut(&str),
+    /// Each tool call once it has run.
+    pub on_step: &'a mut dyn FnMut(&TrailStep),
+    /// Every model request and reply and every tool call of the tool
+    /// loop, one JSON object each (see [`crate::agent`]).
+    pub trace: Option<&'a mut dyn FnMut(&serde_json::Value)>,
+    /// `false` keeps the fixed pipeline whatever the backend can do.
+    pub tool_loop: bool,
+}
+
+/// Answer `ask.question`. With a backend that takes tool turns (and
+/// no `tool_loop = false` from the caller or the adapter) the model
+/// chooses its own tool calls after the planner's opening reads
+/// ([`crate::agent::tool_loop`]). Otherwise the planner makes every
+/// call and the backend words the answer from what it read.
+pub fn investigate_run(
+    ask: &Ask,
+    tools: &Tools,
+    backend: &dyn ChatBackend,
+    run: &mut Run,
+) -> Result<Investigation, gridtalk_infer::InferError> {
+    if ask.max_steps == 0 {
+        // The step budget gates every tool call, including search.
+        return Ok(Investigation {
+            answer: String::new(),
+            trail: Vec::new(),
+            citations: Vec::new(),
+            unread_citations: Vec::new(),
+            model_turns: 0,
+            sources_appended: false,
+        });
+    }
+    if run.tool_loop && ask.adapter.is_none_or(|a| a.tool_loop) && backend.supports_tools() {
+        return crate::agent::tool_loop(ask, tools, backend, run);
+    }
+    let gathered = gather(ask, tools, ask.max_steps);
+    for step in &gathered.trail {
+        (run.on_step)(step);
+    }
+    let Gathered {
+        trail,
+        mut context,
+        citations,
+        standalone,
+        skipped,
+    } = gathered;
+    let (question, adapter, sidecar, history, max_steps) = (
+        ask.question,
+        ask.adapter,
+        ask.sidecar,
+        ask.history,
+        ask.max_steps,
+    );
+    if !skipped.is_empty() {
+        context.push_str(&format!(
+            "\n\nnote: the step budget ({max_steps}) was spent before {} could be read.",
+            skipped.join(" and ")
+        ));
+    }
+
+    let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
+    system.push_str(&gridtalk_adapter::prompt_text(
+        adapter,
+        &standalone,
+        sidecar,
+    ));
+    let system = gridtalk_adapter::cap_prompt(system);
+    let mut user = history_prompt(history);
+    user.push_str(&format!("Question: {question}\n"));
+    if standalone != question {
+        user.push_str(&format!("(searched as: {standalone})\n"));
+    }
+    user.push_str(&format!("\nTool results:\n{context}"));
+    let req = ChatRequest {
+        system,
+        user,
+        max_tokens: 512,
+    };
+    let mut answer = String::new();
+    // Backend failures are propagated, never silently replaced by
+    // raw context masquerading as an answer.
+    backend.stream(&req, &run.cancel, &mut |t| {
+        answer.push_str(t);
+        (run.on_token)(t);
+    })?;
+    if answer.trim().is_empty() {
+        // Never substitute raw tool context as if it were an
+        // answer; say plainly that the backend produced nothing.
+        answer = "(the backend returned an empty answer; see the trail for the tool results)"
+            .to_string();
+    }
+    // Citation guarantee: the printed answer must cite a range we
+    // actually retrieved.
+    let sources_appended =
+        !citations.is_empty() && !citations.iter().any(|c| contains_bounded(&answer, c));
+    if sources_appended {
+        answer.push_str(&format!("\n\nSources: {}", citations.join(", ")));
+    }
+
+    Ok(Investigation {
+        answer,
+        trail,
+        citations,
+        unread_citations: Vec::new(),
+        model_turns: 1,
+        sources_appended,
+    })
+}
+
+/// What the planner read for a question.
+pub struct Gathered {
+    pub trail: Vec<TrailStep>,
+    /// The results as prompt text, the selection's first.
+    pub context: String,
+    /// The ranges the reads stand on.
+    pub citations: Vec<String>,
+    /// The question as it was searched (a follow-up made to stand
+    /// alone).
+    pub standalone: String,
+    /// Planned reads the step budget dropped.
+    pub skipped: Vec<&'static str>,
+}
+
+/// The deterministic planner: search, then read what the question
+/// names (the selection, an asked-for what-if, cells and columns
+/// named as references or in words, the workbook's sheet list) and
+/// the top region, in that order, in at most `max_steps` tool calls.
+pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
+    let (question, adapter, history, selection) =
+        (ask.question, ask.adapter, ask.history, ask.selection);
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
         let result = tools.execute(tool, args);
@@ -90,15 +284,6 @@ pub fn investigate_with_context(
         });
         result
     };
-
-    if max_steps == 0 {
-        // The step budget gates every tool call, including search.
-        return Ok(Investigation {
-            answer: String::new(),
-            trail: Vec::new(),
-            citations: Vec::new(),
-        });
-    }
 
     // A follow-up is searched in its stand-alone form: the
     // history's questions supply the words its pronouns stand for.
@@ -162,12 +347,20 @@ pub fn investigate_with_context(
             expanded_ranges.push(sel.to_string());
         }
         if trail.len() < max_steps {
-            let cells = run("get_cells", &format!("range={sel}"), &mut trail);
+            // A tall selection (a whole column) is read from its top
+            // rows, like a range the question names.
+            let (read, clipped) = clip_range(sel);
+            let note = if clipped {
+                format!(", first rows {read}")
+            } else {
+                String::new()
+            };
+            let cells = run("get_cells", &format!("range={read}"), &mut trail);
             if !selection_section.is_empty() {
                 selection_section.push_str("\n\n");
             }
-            selection_section.push_str(&format!("selected {sel} (cells):\n{cells}"));
-            cells_read.push(sel.to_string());
+            selection_section.push_str(&format!("selected {sel} (cells{note}):\n{cells}"));
+            cells_read.push(read);
         }
         // Cite the selection only when its sheet exists and a
         // step actually read it.
@@ -429,60 +622,16 @@ pub fn investigate_with_context(
             skipped.push("some reads of the top region");
         }
     }
-    if !skipped.is_empty() {
-        context.push_str(&format!(
-            "\n\nnote: the step budget ({max_steps}) was spent before {} could be read.",
-            skipped.join(" and ")
-        ));
-    }
     if !selection_section.is_empty() {
         context = format!("{selection_section}\n\n{context}");
     }
-
-    let mut system = "You answer questions about a spreadsheet using only the tool results provided. Always cite the range like Sheet1!A1:D4.".to_string();
-    system.push_str(&gridtalk_adapter::prompt_text(
-        adapter,
-        &standalone,
-        sidecar,
-    ));
-    let system = gridtalk_adapter::cap_prompt(system);
-    let mut user = history_prompt(history);
-    user.push_str(&format!("Question: {question}\n"));
-    if standalone != question {
-        user.push_str(&format!("(searched as: {standalone})\n"));
-    }
-    user.push_str(&format!("\nTool results:\n{context}"));
-    let req = ChatRequest {
-        system,
-        user,
-        max_tokens: 512,
-    };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut answer = String::new();
-    // Backend failures are propagated, never silently replaced by
-    // raw context masquerading as an answer.
-    backend.stream(&req, &cancel, &mut |t| answer.push_str(t))?;
-    if answer.trim().is_empty() {
-        // Never substitute raw tool context as if it were an
-        // answer; say plainly that the backend produced nothing.
-        answer = "(the backend returned an empty answer; see the trail for the tool results)"
-            .to_string();
-    }
-    // Citation guarantee: the printed answer must cite a range we
-    // actually retrieved.
-    if !citations.is_empty()
-        && !citations
-            .iter()
-            .any(|c| crate::bench::contains_bounded(&answer, c))
-    {
-        answer.push_str(&format!("\n\nSources: {}", citations.join(", ")));
-    }
-
-    Ok(Investigation {
-        answer,
+    Gathered {
         trail,
+        context,
         citations,
-    })
+        standalone,
+        skipped,
+    }
 }
 
 /// Whether either range contains the other on the same sheet, so
@@ -515,7 +664,7 @@ fn ranges_nested(a: &str, b: &str) -> bool {
 
 /// Whether two ranges name the same cells, however spelled
 /// (`Sheet1!D2` and the canonical `Sheet1!D2:D2`, `sheet1!$D$2`).
-fn same_range(a: &str, b: &str) -> bool {
+pub(crate) fn same_range(a: &str, b: &str) -> bool {
     match (
         crate::tools::parse_range_uncapped(a),
         crate::tools::parse_range_uncapped(b),
@@ -530,7 +679,7 @@ fn same_range(a: &str, b: &str) -> bool {
 /// Whether `needle` occurs in `haystack` not flanked by word
 /// characters (alphanumeric or `_`), so "yes" is not found in
 /// "yesterday" nor "6" in "36".
-pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
+pub fn contains_word(haystack: &str, needle: &str) -> bool {
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let mut from = 0;
     while let Some(pos) = haystack[from..].find(needle) {
@@ -1046,6 +1195,41 @@ fn parse_what_if_target(question: &str, override_cell: &str) -> Option<String> {
     qualified_refs(question)
         .into_iter()
         .find(|cell| parse_cell_ref(cell) != override_ref)
+}
+
+/// `answer` mentions `needle` as a standalone reference, not as a
+/// substring of a longer ref (Sheet1!A1 inside Sheet1!A10:B20).
+pub fn contains_bounded(answer: &str, needle: &str) -> bool {
+    // ASCII case-insensitive (offsets preserved; matches the
+    // case-insensitive sheet comparison in citation_hit).
+    let answer = &answer.to_ascii_lowercase();
+    let needle = &needle.to_ascii_lowercase();
+    let boundary = |c: char| !(c.is_alphanumeric() || matches!(c, '!' | ':' | '.' | '$'));
+    let first_char_len = needle.chars().next().map_or(1, |c| c.len_utf8());
+    let mut from = 0;
+    while let Some(pos) = answer[from..].find(needle.as_str()) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
+        // Sentence punctuation (`... Sheet1!D2.` / `Sheet1!D2: 6`)
+        // ends a reference; a '.'/':' that continues a longer ref
+        // (Sheet1!A1:B2) does not.
+        let mut tail = answer[end..].chars();
+        let after_ok = match tail.next() {
+            None => true,
+            Some(c) if boundary(c) => true,
+            Some('.') | Some(':') => tail.next().is_none_or(|n| n.is_whitespace()),
+            Some(_) => false,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + first_char_len;
+        if from >= answer.len() {
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

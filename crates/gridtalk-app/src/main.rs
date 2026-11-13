@@ -5,17 +5,17 @@
 
 mod bench;
 mod cli;
-mod investigate;
 mod mcp;
 mod optimise;
-mod tools;
 
 use cli::CliError;
 use gridtalk_adapter as adapter;
+use gridtalk_agent::{investigate, tools};
 use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, WorkbookSnapshot};
 use gridtalk_index::HybridIndex;
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
+use std::io::Write as _;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -456,10 +456,17 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     Ok(())
                 }
                 Some("run") => {
-                    let parsed = cli::parse(
+                    let parsed = cli::parse_with(
                         cmd,
                         sub_args,
-                        &["--tasks", "--split", "--card", "--adapter"],
+                        &[
+                            cli::Flag::Value("--tasks"),
+                            cli::Flag::Value("--split"),
+                            cli::Flag::Value("--card"),
+                            cli::Flag::Value("--adapter"),
+                            cli::Flag::Switch("--no-tool-loop"),
+                        ],
+                        None,
                     )?;
                     let file = &parsed.positionals(cmd, &["<file>"], 0)?[0];
                     // Checked before the workbook loads: a typo must
@@ -558,6 +565,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                         &split,
                         bench_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
                         bench_adapter.as_ref(),
+                        !parsed.switch("--no-tool-loop"),
                     )
                     .map_err(|e| CliError::Backend(format!("bench run failed: {e}")))?;
                     let card =
@@ -592,6 +600,8 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     cli::Flag::Value("--adapter"),
                     cli::Flag::Value("--selection"),
                     cli::Flag::Value("--history-file"),
+                    cli::Flag::Value("--trace"),
+                    cli::Flag::Switch("--no-tool-loop"),
                 ],
                 Some(1),
             )?;
@@ -638,17 +648,50 @@ fn run(args: &[String]) -> Result<(), CliError> {
             warn_if_external(&cfg);
             let cli_adapter = adapter_name.map(load_named_adapter);
             let sidecar = adapter::sidecar_rules(std::path::Path::new(file));
-            let inv = investigate::investigate_with_context(
-                &question,
+            // The trace file is opened before any work, so a path
+            // that cannot be written fails at once.
+            let mut trace_file = match parsed.flag("--trace") {
+                Some(path) => Some(std::io::BufWriter::new(
+                    std::fs::File::create(path)
+                        .map_err(|e| CliError::Input(format!("{path}: {e}")))?,
+                )),
+                None => None,
+            };
+            let mut trace_error: Option<std::io::Error> = None;
+            let mut write_trace = |event: &serde_json::Value| {
+                if let Some(file) = trace_file.as_mut() {
+                    if let Err(e) = writeln!(file, "{event}") {
+                        trace_error.get_or_insert(e);
+                    }
+                }
+            };
+            let inv = investigate::investigate_run(
+                &investigate::Ask {
+                    question: &question,
+                    max_steps: cli_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
+                    adapter: cli_adapter.as_ref(),
+                    sidecar: sidecar.as_deref(),
+                    history: &history,
+                    selection,
+                },
                 &tools,
                 backend.as_ref(),
-                cli_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
-                cli_adapter.as_ref(),
-                sidecar.as_deref(),
-                &history,
-                selection,
+                &mut investigate::Run {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    on_token: &mut |_| {},
+                    on_step: &mut |_| {},
+                    trace: parsed
+                        .flag("--trace")
+                        .map(|_| &mut write_trace as &mut dyn FnMut(&serde_json::Value)),
+                    tool_loop: !parsed.switch("--no-tool-loop"),
+                },
             )
             .map_err(|e| CliError::Backend(format!("backend failed: {e}")))?;
+            if let Some(mut file) = trace_file {
+                if let Some(e) = trace_error.or_else(|| file.flush().err()) {
+                    eprintln!("gridtalk: warning: the trace is incomplete: {e}");
+                }
+            }
             for step in &inv.trail {
                 println!(
                     "[tool] {} ({}) -> {}",
@@ -663,6 +706,12 @@ fn run(args: &[String]) -> Result<(), CliError> {
                 );
             }
             println!("\ncitations: {}", inv.citations.join(", "));
+            if !inv.unread_citations.is_empty() {
+                eprintln!(
+                    "gridtalk: warning: the answer cites {} which no tool call read",
+                    inv.unread_citations.join(", ")
+                );
+            }
             println!("\n--- answer ({}) ---\n{}", backend.name(), inv.answer);
             Ok(())
         }

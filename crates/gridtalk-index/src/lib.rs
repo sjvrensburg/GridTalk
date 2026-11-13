@@ -142,7 +142,7 @@ pub fn excerpt(
 
 pub type DocEntry = (RangeRef, String, BTreeMap<String, usize>, String, usize);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Index {
     docs: Vec<DocEntry>,
     df: BTreeMap<String, usize>,
@@ -472,6 +472,7 @@ impl Index {
 /// Hybrid search: lexical TF-IDF + local embedding cosine, fused
 /// with Reciprocal Rank Fusion. This is the retrieval entry point
 /// the chat pipeline and the investigate harness use.
+#[derive(Clone)]
 pub struct HybridIndex {
     lexical: Index,
     vector: VectorIndex,

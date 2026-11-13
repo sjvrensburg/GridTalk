@@ -57,6 +57,11 @@ pub type CancelToken = Arc<AtomicBool>;
 pub mod models;
 pub mod probe;
 pub mod transport;
+pub mod turns;
+
+pub use turns::{
+    Message, Role, ToolCall, ToolChoice, ToolSession, ToolSpec, Turn, TurnRequest, Usage,
+};
 
 pub mod llama_backend;
 
@@ -70,6 +75,27 @@ pub trait ChatBackend: Send {
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<(), InferError>;
+
+    /// Whether the backend can take tool turns
+    /// ([`ChatBackend::with_tool_session`]). The echo backend cannot:
+    /// with no model there is nothing to choose a call.
+    fn supports_tools(&self) -> bool {
+        false
+    }
+
+    /// Open a conversation in which the model may call tools and hand
+    /// it to `run`, which takes as many turns as it needs. The session
+    /// ends when `run` returns, and `run`'s error is passed through.
+    fn with_tool_session(
+        &self,
+        run: &mut dyn FnMut(&mut dyn ToolSession) -> Result<(), InferError>,
+    ) -> Result<(), InferError> {
+        let _ = run;
+        Err(InferError::EngineUnavailable(format!(
+            "the {} backend cannot call tools",
+            self.name()
+        )))
+    }
 }
 
 /// Deterministic offline backend: echoes the cited context back in a
@@ -134,6 +160,10 @@ pub struct OpenAiCompatibleBackend {
     pub base_url: String, // e.g. http://127.0.0.1:11434/v1
     pub model: String,
     pub api_key: Option<String>,
+    /// How many tokens a tool conversation may grow to (the
+    /// config's `n_ctx`); `None` when the endpoint's window is not
+    /// known.
+    pub context_tokens: Option<usize>,
 }
 
 fn reject_crlf(field: &str, value: &str) -> Result<(), InferError> {
@@ -438,16 +468,14 @@ fn read_http_response(
     String::from_utf8(decoded).map_err(|e| InferError::Http(format!("response is not UTF-8: {e}")))
 }
 
-impl ChatBackend for OpenAiCompatibleBackend {
-    fn name(&self) -> &str {
-        "openai-compatible"
-    }
-    fn stream(
+impl OpenAiCompatibleBackend {
+    /// POST `body` to `chat/completions` and return the parsed JSON
+    /// reply.
+    fn post_chat(
         &self,
-        req: &ChatRequest,
+        body: &serde_json::Value,
         cancel: &CancelToken,
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<(), InferError> {
+    ) -> Result<serde_json::Value, InferError> {
         if cancel.load(Ordering::Relaxed) {
             return Err(InferError::Cancelled);
         }
@@ -466,18 +494,7 @@ impl ChatBackend for OpenAiCompatibleBackend {
         }
         let path_prefix = url.path.as_str();
         let path = format!("{}/chat/completions", path_prefix.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.model,
-            "stream": false,
-            "max_tokens": req.max_tokens,
-            "messages": [
-                {"role": "system", "content": req.system},
-                {"role": "user", "content": req.user}
-            ]
-        })
-        .to_string();
-        // Note: stream:false, so tokens are replayed word-by-word
-        // locally; cancellation is honoured between words.
+        let body = body.to_string();
         let mut stream = transport::connect(
             &url,
             std::time::Duration::from_secs(5),
@@ -494,23 +511,49 @@ impl ChatBackend for OpenAiCompatibleBackend {
         stream.write_all(req_text.as_bytes())?;
         stream.write_all(body.as_bytes())?;
         let raw = read_http_response(&mut stream, Some(cancel))?;
-        let value: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| InferError::Http(format!("bad JSON response: {e}")))?;
-        let content_value = &value["choices"][0]["message"]["content"];
-        let content: String = if let Some(text) = content_value.as_str() {
-            text.to_string()
-        } else if let Some(parts) = content_value.as_array() {
-            // Array-of-parts content (some compatible servers).
+        serde_json::from_str(&raw).map_err(|e| InferError::Http(format!("bad JSON response: {e}")))
+    }
+}
+
+/// A reply message's `content`: a string, or an array of text parts
+/// (some compatible servers). `None` when it is neither.
+fn message_content(content: &serde_json::Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        Some(text.to_string())
+    } else {
+        content.as_array().map(|parts| {
             parts
                 .iter()
                 .filter_map(|part| part["text"].as_str())
                 .collect()
-        } else {
-            return Err(InferError::Http(
-                "response has no choices[0].message.content".into(),
-            ));
-        };
-        let content = content.as_str();
+        })
+    }
+}
+
+impl ChatBackend for OpenAiCompatibleBackend {
+    fn name(&self) -> &str {
+        "openai-compatible"
+    }
+    fn stream(
+        &self,
+        req: &ChatRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<(), InferError> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "stream": false,
+            "max_tokens": req.max_tokens,
+            "messages": [
+                {"role": "system", "content": req.system},
+                {"role": "user", "content": req.user}
+            ]
+        });
+        // Note: stream:false, so tokens are replayed word-by-word
+        // locally; cancellation is honoured between words.
+        let value = self.post_chat(&body, cancel)?;
+        let content = message_content(&value["choices"][0]["message"]["content"])
+            .ok_or_else(|| InferError::Http("response has no choices[0].message.content".into()))?;
         for word in content.split_inclusive(' ') {
             if cancel.load(Ordering::Relaxed) {
                 return Err(InferError::Cancelled);
@@ -518,6 +561,171 @@ impl ChatBackend for OpenAiCompatibleBackend {
             on_token(word);
         }
         Ok(())
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn with_tool_session(
+        &self,
+        run: &mut dyn FnMut(&mut dyn ToolSession) -> Result<(), InferError>,
+    ) -> Result<(), InferError> {
+        run(&mut OpenAiSession {
+            backend: self,
+            required_refused: false,
+        })
+    }
+}
+
+/// Tool turns over the OpenAI wire format: the tools go out as
+/// function definitions and the calls come back in `tool_calls`.
+/// Each turn sends the whole conversation, verbatim (decision 0002).
+struct OpenAiSession<'a> {
+    backend: &'a OpenAiCompatibleBackend,
+    /// The endpoint refused `tool_choice: "required"`; later turns
+    /// ask with `"auto"` and leave the check to the caller.
+    required_refused: bool,
+}
+
+/// One message in the OpenAI wire format.
+fn wire_message(message: &Message) -> serde_json::Value {
+    match message.role {
+        Role::Assistant if !message.tool_calls.is_empty() => serde_json::json!({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": message.tool_calls.iter().map(|call| serde_json::json!({
+                "id": call.id, "type": "function",
+                "function": {"name": call.name, "arguments": match &call.arguments {
+                    // What the model wrote when it was not an object.
+                    serde_json::Value::String(raw) => raw.clone(),
+                    arguments => arguments.to_string(),
+                }}
+            })).collect::<Vec<_>>()
+        }),
+        Role::Tool => serde_json::json!({
+            "role": "tool", "tool_call_id": message.tool_call_id, "content": message.content
+        }),
+        role => serde_json::json!({"role": role.as_str(), "content": message.content}),
+    }
+}
+
+impl ToolSession for OpenAiSession<'_> {
+    fn turn(
+        &mut self,
+        req: &TurnRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Turn, InferError> {
+        let body = |choice: &str| {
+            let mut body = serde_json::json!({
+                "model": self.backend.model,
+                "stream": false,
+                "max_tokens": req.max_tokens,
+                "messages": req.messages.iter().map(wire_message).collect::<Vec<_>>(),
+            });
+            if !req.tools.is_empty() {
+                body["tools"] = req
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({"type": "function", "function": {
+                            "name": tool.name, "description": tool.description,
+                            "parameters": tool.parameters
+                        }})
+                    })
+                    .collect();
+                body["tool_choice"] = choice.into();
+            }
+            body
+        };
+        let choice = match req.choice {
+            ToolChoice::Required if !self.required_refused => "required",
+            ToolChoice::None => "none",
+            _ => "auto",
+        };
+        let value = match self.backend.post_chat(&body(choice), cancel) {
+            // Not every compatible server takes "required": ask again
+            // with "auto", and do so from here on.
+            Err(InferError::Http(message))
+                if choice == "required" && message.starts_with("endpoint returned HTTP 4") =>
+            {
+                // Remembered only once "auto" got through: a 4xx
+                // for another reason (a bad key, a rate limit) fails
+                // both ways and says nothing about "required".
+                let value = self.backend.post_chat(&body("auto"), cancel)?;
+                self.required_refused = true;
+                value
+            }
+            other => other?,
+        };
+        let message = &value["choices"][0]["message"];
+        if !message.is_object() {
+            return Err(InferError::Http(
+                "response has no choices[0].message".into(),
+            ));
+        }
+        let calls: Vec<ToolCall> = message["tool_calls"]
+            .as_array()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, call)| {
+                        let raw = &call["function"]["arguments"];
+                        // The arguments arrive as a JSON string; a
+                        // few servers send the object itself.
+                        let arguments = match raw.as_str() {
+                            Some(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                                Ok(parsed @ serde_json::Value::Object(_)) => parsed,
+                                _ if text.trim().is_empty() => serde_json::json!({}),
+                                _ => serde_json::Value::String(text.to_string()),
+                            },
+                            None if raw.is_object() => raw.clone(),
+                            None => serde_json::json!({}),
+                        };
+                        ToolCall {
+                            id: call["id"]
+                                .as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| format!("call_{i}")),
+                            name: call["function"]["name"].as_str().unwrap_or("").to_string(),
+                            arguments,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = message_content(&message["content"]).unwrap_or_default();
+        let text = turns::strip_answer_mark(&text).to_string();
+        if calls.is_empty() && text.is_empty() && value["choices"][0]["finish_reason"] == "length" {
+            // A reasoning model can spend the whole turn thinking.
+            return Err(InferError::Http(format!(
+                "the model used all {} tokens of its turn before replying",
+                req.max_tokens
+            )));
+        }
+        if calls.is_empty() {
+            for word in text.split_inclusive(' ') {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(InferError::Cancelled);
+                }
+                on_token(word);
+            }
+        }
+        let count = |key: &str| value["usage"][key].as_u64().map(|n| n as usize);
+        let usage = count("prompt_tokens").map(|prompt_tokens| Usage {
+            prompt_tokens,
+            reused_tokens: value["usage"]["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as usize,
+            generated_tokens: count("completion_tokens").unwrap_or(0),
+        });
+        Ok(Turn { text, calls, usage })
+    }
+
+    fn context_tokens(&self) -> Option<usize> {
+        self.backend.context_tokens
     }
 }
 
@@ -542,6 +750,7 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .api_key_env
                 .as_ref()
                 .and_then(|env| std::env::var(env).ok()),
+            context_tokens: cfg.n_ctx.map(|n| n as usize),
         }),
         _ => {
             if !matches!(
@@ -666,6 +875,7 @@ pub mod config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn echo_streams_and_cancels() {
@@ -783,6 +993,7 @@ mod tests {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             model: "m".into(),
             api_key: None,
+            context_tokens: None,
         };
         let req = ChatRequest {
             system: "s".into(),
@@ -798,6 +1009,199 @@ mod tests {
             "passage must be sent verbatim"
         );
         assert!(out.contains("Sheet1!A1"));
+    }
+
+    /// A mock chat-completions server: replies to each connection in
+    /// turn with the next (status, body) and returns the request
+    /// bodies it was sent.
+    fn mock_chat_server(
+        replies: Vec<(u16, String)>,
+    ) -> (u16, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, reply) in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = sock.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    raw.extend_from_slice(&buf[..n]);
+                    let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:")?.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= pos + 4 + len {
+                        break raw[pos + 4..pos + 4 + len].to_vec();
+                    }
+                };
+                bodies.push(serde_json::from_slice(&body).unwrap());
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+            bodies
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn external_backend_takes_tool_turns_on_the_openai_wire_format() {
+        let call_reply = serde_json::json!({"choices": [{"message": {
+            "content": null,
+            "tool_calls": [{"id": "abc", "type": "function", "function": {
+                "name": "get_cells", "arguments": "{\"range\":\"Sheet1!A1:B2\"}"
+            }}]
+        }, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 9,
+                      "prompt_tokens_details": {"cached_tokens": 100}}})
+        .to_string();
+        let answer_reply = serde_json::json!({"choices": [{"message": {
+            "content": "ANSWER: It is 6 (Sheet1!B2)."
+        }}]})
+        .to_string();
+        let (port, server) = mock_chat_server(vec![
+            // The endpoint refuses "required"; the turn is asked again.
+            (
+                400,
+                "{\"error\":\"tool_choice required is not supported\"}".into(),
+            ),
+            (200, call_reply),
+            (200, answer_reply),
+            (
+                200,
+                "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"length\"}]}"
+                    .into(),
+            ),
+        ]);
+        let backend = OpenAiCompatibleBackend {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "m".into(),
+            api_key: None,
+            context_tokens: Some(8_192),
+        };
+        assert!(backend.supports_tools());
+        let tools = vec![ToolSpec {
+            name: "get_cells".into(),
+            description: "Read cells.".into(),
+            parameters: serde_json::json!({
+                "type": "object", "properties": {"range": {"type": "string"}}, "required": ["range"]
+            }),
+        }];
+        let cancel: CancelToken = Arc::new(AtomicBool::new(false));
+        let mut streamed = String::new();
+        backend
+            .with_tool_session(&mut |session| {
+                assert_eq!(session.context_tokens(), Some(8_192));
+                let mut messages = vec![
+                    Message::system("Answer from the workbook."),
+                    Message::user("What is B2? SecretCellValue123"),
+                ];
+                let first = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::Required,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |t| streamed.push_str(t),
+                )?;
+                assert_eq!(first.text, "");
+                assert_eq!(
+                    first.calls,
+                    vec![ToolCall {
+                        id: "abc".into(),
+                        name: "get_cells".into(),
+                        arguments: serde_json::json!({"range": "Sheet1!A1:B2"}),
+                    }]
+                );
+                assert_eq!(
+                    first.usage,
+                    Some(Usage {
+                        prompt_tokens: 120,
+                        reused_tokens: 100,
+                        generated_tokens: 9
+                    })
+                );
+                // A call streams nothing.
+                assert!(streamed.is_empty());
+                messages.push(Message::assistant("", first.calls.clone()));
+                messages.push(Message::tool(&first.calls[0], "Sheet1!B2: 6"));
+                // "required" was refused once, so it is not sent again.
+                let second = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::Required,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |t| streamed.push_str(t),
+                )?;
+                assert!(second.calls.is_empty());
+                assert_eq!(second.text, "It is 6 (Sheet1!B2).");
+                assert_eq!(streamed, "It is 6 (Sheet1!B2).");
+                // A turn spent before any reply is an error, not an
+                // empty answer.
+                let spent = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::None,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |_| {},
+                );
+                assert!(
+                    matches!(&spent, Err(InferError::Http(m)) if m.contains("all 64 tokens")),
+                    "{spent:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let sent = server.join().unwrap();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[0]["tool_choice"], "required");
+        assert_eq!(sent[1]["tool_choice"], "auto");
+        assert_eq!(sent[2]["tool_choice"], "auto");
+        assert_eq!(sent[3]["tool_choice"], "none");
+        assert_eq!(
+            sent[0]["tools"],
+            serde_json::json!([{"type": "function", "function": {
+                "name": "get_cells", "description": "Read cells.",
+                "parameters": {"type": "object", "properties": {"range": {"type": "string"}}, "required": ["range"]}
+            }}])
+        );
+        // The conversation goes out verbatim (decision 0002), with the
+        // call and its result in the wire format's own shape.
+        assert_eq!(
+            sent[0]["messages"][1]["content"],
+            "What is B2? SecretCellValue123"
+        );
+        assert_eq!(
+            sent[2]["messages"][2],
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": "abc", "type": "function",
+                "function": {"name": "get_cells", "arguments": "{\"range\":\"Sheet1!A1:B2\"}"}
+            }]})
+        );
+        assert_eq!(
+            sent[2]["messages"][3],
+            serde_json::json!({"role": "tool", "tool_call_id": "abc", "content": "Sheet1!B2: 6"})
+        );
+        // The echo backend takes no tool turns.
+        assert!(!EchoBackend.supports_tools());
+        assert!(EchoBackend.with_tool_session(&mut |_| Ok(())).is_err());
     }
 
     #[test]
@@ -848,6 +1252,7 @@ mod tests {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             model: "m".into(),
             api_key: None,
+            context_tokens: None,
         };
         let req = ChatRequest {
             system: "s".into(),
@@ -864,6 +1269,7 @@ mod tests {
             base_url: "http://203.0.113.9/v1".into(),
             model: "m".into(),
             api_key: Some("secret".into()),
+            context_tokens: None,
         };
         assert!(matches!(
             remote.stream(&req, &cancel, &mut |_| {}),
@@ -874,6 +1280,7 @@ mod tests {
             base_url: "http://127.0.0.1:9/v1\r\nX-Injected: 1".into(),
             model: "m".into(),
             api_key: None,
+            context_tokens: None,
         };
         assert!(bad.stream(&req, &cancel, &mut |_| {}).is_err());
     }
@@ -896,6 +1303,7 @@ mod tests {
             base_url: format!("https://localhost:{port}/v1"),
             model: "m".into(),
             api_key: Some("secret".into()),
+            context_tokens: None,
         };
         let req = ChatRequest {
             system: "s".into(),

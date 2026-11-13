@@ -76,8 +76,8 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "investigate",
-        usage: &["gridtalk investigate <file> [--adapter <name>] [--selection <Sheet!A1:B2>] [--history-file <turns.json>] <question...>"],
-        summary: "Answer with the tool-using planner (search, get_cells, what_if...), printing each tool step and the citations. Flags must come before the question. --selection names the range selected when asking (\"what feeds this?\"); --history-file is a JSON array of earlier {\"question\", \"answer\"} turns a follow-up is condensed against.",
+        usage: &["gridtalk investigate <file> [--adapter <name>] [--selection <Sheet!A1:B2>] [--history-file <turns.json>] [--trace <file.jsonl>] [--no-tool-loop] <question...>"],
+        summary: "Answer by reading the workbook with tools (search, expand, get_cells, list_formulas, what_if...), printing each tool step and the citations. With a model that can take tool turns, the planner reads what the question names and the model then chooses its own calls; --no-tool-loop keeps every call with the planner, as the echo backend always does. Flags must come before the question. --selection names the range selected when asking (\"what feeds this?\"); --history-file is a JSON array of earlier {\"question\", \"answer\"} turns a follow-up is condensed against; --trace writes every model request, reply and tool call of the tool loop to a file, one JSON object per line.",
     },
     Command {
         name: "graph",
@@ -103,9 +103,9 @@ pub const COMMANDS: &[Command] = &[
         name: "bench",
         usage: &[
             "gridtalk bench generate <file> [--out tasks.json] [--max <n>]",
-            "gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md] [--adapter <name>]",
+            "gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md] [--adapter <name>] [--no-tool-loop]",
         ],
-        summary: "Generate evaluation tasks from a workbook (default 100), or run them against the configured backend and print or write the CARD.",
+        summary: "Generate evaluation tasks from a workbook (default 100), or run them against the configured backend and print or write the CARD, which breaks the score down by kind of question and says how often the tool results carried the answer. --no-tool-loop scores the fixed pipeline with the same backend.",
     },
     Command {
         name: "optimise",

@@ -88,7 +88,6 @@ fn default_limit() -> usize {
 }
 
 impl ToolRequest {
-    #[allow(dead_code)] // used by external tool-list consumers
     pub fn name(&self) -> &'static str {
         match self {
             ToolRequest::Search { .. } => "search",
@@ -121,8 +120,8 @@ impl ToolRequest {
                 tool("workbook_info", "Sheets (name, rows, cols, visibility: visible/hidden/veryHidden), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
                 tool("search", format!("Hybrid lexical+embedding search over workbook regions. Returns ranked regions with a cited passage each. limit: 1-{MAX_SEARCH_LIMIT} (default 3; larger values are clamped and the response says so)."), schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "default": 3}}), &["query"])),
                 tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
-                tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
-                tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2, each with its address. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. For each column it says how far one formula is filled down, which cells hold a different formula, and which hold a typed value where the column has formulas. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
                 tool("graph_overview", "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)".into(), schema(serde_json::json!({}), &[]))
             ]
@@ -219,9 +218,26 @@ impl<'a> Tools<'a> {
                         })
                     })
                     .collect();
+                // Each hit's range and score, then the top of its
+                // passage (the heading and the rows that matched), so
+                // a reader can tell the hits apart before reading one.
                 let text = hits
                     .iter()
-                    .map(|h| format!("[{}] score {:.3}", h.range.a1(), h.score))
+                    .map(|h| {
+                        let mut entry = format!("[{}] score {:.3}", h.range.a1(), h.score);
+                        let mut used = 0usize;
+                        for line in h.passage.lines() {
+                            let len = line.chars().count();
+                            if used + len > MAX_SEARCH_TEXT_PASSAGE {
+                                entry.push_str("\n  ...");
+                                break;
+                            }
+                            used += len;
+                            entry.push_str("\n  ");
+                            entry.push_str(line);
+                        }
+                        entry
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
                     + &limit_note;
@@ -350,125 +366,8 @@ impl<'a> Tools<'a> {
                     ),
                 }
             }
-            ToolRequest::GetCells { range } => match parse_range(range) {
-                Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
-                    Some(sheet) => {
-                        // Formula cells report what they compute, not
-                        // only the file's cached value: one batch
-                        // through the workbook's calc engine.
-                        let formulas: Vec<(usize, usize)> = (r0..=r1)
-                            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
-                            .filter(|(r, c)| {
-                                matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. })
-                            })
-                            .collect();
-                        let mut results = if formulas.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.calc.get(self.wb).values(&sheet.name, &formulas)
-                        }
-                        .into_iter();
-                        let mut rows = Vec::new();
-                        let mut text = format!("Range {range}\n");
-                        for r in r0..=r1 {
-                            let mut row = Vec::new();
-                            for c in c0..=c1 {
-                                let cell = sheet.get(r, c);
-                                match &cell {
-                                    CellValue::Formula { expr, cached } => {
-                                        let result =
-                                            results.next().expect("one result per formula");
-                                        text.push_str(&match &result {
-                                            Ok(v) => v.display(),
-                                            Err(e) => format!("#ERROR({e})"),
-                                        });
-                                        row.push(formula_json(expr, cached.as_deref(), &result));
-                                    }
-                                    _ => {
-                                        text.push_str(&cell.display());
-                                        row.push(cell_json(&cell));
-                                    }
-                                }
-                                if c < c1 {
-                                    text.push_str(" | ");
-                                }
-                            }
-                            text.push('\n');
-                            rows.push(serde_json::Value::Array(row));
-                        }
-                        ToolResult::ok(
-                            "get_cells",
-                            serde_json::json!({"range": range, "rows": rows}),
-                            text,
-                        )
-                    }
-                    None => ToolResult::err(
-                        "get_cells",
-                        ErrorKind::UnknownSheet,
-                        format!("no sheet named {sheet_name}"),
-                    ),
-                },
-                None => ToolResult::err("get_cells", ErrorKind::InvalidRange, range_error(range)),
-            },
-            ToolRequest::ListFormulas { range } => match parse_range(range) {
-                Some((sheet_name, r0, c0, r1, c1)) => match self.sheet(&sheet_name) {
-                    Some(sheet) => {
-                        // One shared evaluator memo across the
-                        // whole range, not a fresh one per cell.
-                        let coords: Vec<(usize, usize)> = (r0..=r1)
-                            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
-                            .filter(|(r, c)| matches!(sheet.get(*r, *c), CellValue::Formula { .. }))
-                            .collect();
-                        // One recalculation for the whole batch, not
-                        // one per cell.
-                        let evaluated = self.calc.get(self.wb).values(&sheet.name, &coords);
-                        let mut eval_iter = coords.iter().zip(evaluated.iter());
-                        let mut formulas = Vec::new();
-                        let mut lines = Vec::new();
-                        for r in r0..=r1 {
-                            for c in c0..=c1 {
-                                if let CellValue::Formula { expr, .. } = sheet.get(r, c) {
-                                    let (_, result) = eval_iter.next().unwrap();
-                                    let cell = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
-                                    let (value, typed, error) = match result {
-                                        Ok(v) => (legacy_number(v), Some(value_json(v)), None),
-                                        Err(e) => (None, None, Some(e.to_string())),
-                                    };
-                                    lines.push(match result {
-                                        Ok(v) => format!("{cell} = {expr} -> {}", v.display()),
-                                        Err(e) => format!("{cell} = {expr} -> error: {e}"),
-                                    });
-                                    formulas.push(serde_json::json!({
-                                        "cell": cell, "formula": expr, "value": value,
-                                        "result": typed, "error": error
-                                    }));
-                                }
-                            }
-                        }
-                        if formulas.is_empty() {
-                            ToolResult::ok(
-                                "list_formulas",
-                                serde_json::json!({"formulas": []}),
-                                "no formulas in range".into(),
-                            )
-                        } else {
-                            ToolResult::ok(
-                                "list_formulas",
-                                serde_json::json!({"formulas": formulas}),
-                                lines.join("\n"),
-                            )
-                        }
-                    }
-                    None => ToolResult::err(
-                        "list_formulas",
-                        ErrorKind::UnknownSheet,
-                        format!("no sheet named {sheet_name}"),
-                    ),
-                },
-                None => {
-                    ToolResult::err("list_formulas", ErrorKind::InvalidRange, range_error(range))
-                }
-            },
+            ToolRequest::GetCells { range } => self.get_cells(range),
+            ToolRequest::ListFormulas { range } => self.list_formulas(range),
             ToolRequest::WhatIf {
                 cell,
                 value,
@@ -643,6 +542,319 @@ impl<'a> Tools<'a> {
         }
     }
 
+    /// `get_cells`: every cell carries its address, in the JSON
+    /// (`address`) and in the text, so a reader can cite a cell
+    /// without counting columns. A range of up to
+    /// [`MAX_ADDRESSED_CELLS`] cells prints one line per cell
+    /// (`Labour!D2: E/012`); a larger one prints one line per sheet
+    /// row with each value after its column letter.
+    fn get_cells(&self, range: &str) -> ToolResult {
+        let Some((sheet_name, r0, c0, r1, c1)) = parse_range(range) else {
+            return ToolResult::err("get_cells", ErrorKind::InvalidRange, range_error(range));
+        };
+        let Some(sheet) = self.sheet(&sheet_name) else {
+            return ToolResult::err(
+                "get_cells",
+                ErrorKind::UnknownSheet,
+                format!("no sheet named {sheet_name}"),
+            );
+        };
+        // Formula cells report what they compute, not only the
+        // file's cached value: one batch through the workbook's
+        // calc engine.
+        let formulas: Vec<(usize, usize)> = (r0..=r1)
+            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
+            .filter(|(r, c)| matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. }))
+            .collect();
+        let mut results = if formulas.is_empty() {
+            Vec::new()
+        } else {
+            self.calc.get(self.wb).values(&sheet.name, &formulas)
+        }
+        .into_iter();
+        let quoted = quote_sheet(&sheet.name);
+        let per_cell = (r1 - r0 + 1) * (c1 - c0 + 1) <= MAX_ADDRESSED_CELLS;
+        let mut rows = Vec::new();
+        let mut lines = Vec::new();
+        let mut empty = 0usize;
+        for r in r0..=r1 {
+            let mut row = Vec::new();
+            let mut shown: Vec<String> = Vec::new();
+            for c in c0..=c1 {
+                let column = gridtalk_graph::col_name(c);
+                let address = format!("{quoted}!{column}{}", r + 1);
+                let cell = sheet.get(r, c);
+                let (mut json, display, formula) = match &cell {
+                    CellValue::Formula { expr, cached } => {
+                        let result = results.next().expect("one result per formula");
+                        let display = match &result {
+                            Ok(v) => v.display(),
+                            Err(e) => format!("#ERROR({e})"),
+                        };
+                        (
+                            formula_json(expr, cached.as_deref(), &result),
+                            display,
+                            Some(expr.clone()),
+                        )
+                    }
+                    _ => (cell_json(&cell), cell.display(), None),
+                };
+                json["address"] = serde_json::Value::String(address.clone());
+                row.push(json);
+                if matches!(cell, CellValue::Empty) {
+                    empty += 1;
+                } else if per_cell {
+                    lines.push(match formula {
+                        Some(expr) => format!("{address}: {display}  [={expr}]"),
+                        None => format!("{address}: {display}"),
+                    });
+                } else {
+                    shown.push(format!("{column}: {display}"));
+                }
+            }
+            if !per_cell {
+                lines.push(if shown.is_empty() {
+                    format!("{} | (empty)", r + 1)
+                } else {
+                    format!("{} | {}", r + 1, shown.join(" | "))
+                });
+            }
+            rows.push(serde_json::Value::Array(row));
+        }
+        let mut text = if per_cell {
+            format!("Range {range}\n")
+        } else {
+            format!(
+                "Range {range}\nOne line per sheet row; each value follows its column letter, so row {}'s {} value is {quoted}!{}{}.\n",
+                r0 + 1,
+                gridtalk_graph::col_name(c0),
+                gridtalk_graph::col_name(c0),
+                r0 + 1
+            )
+        };
+        for line in &lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        if per_cell && empty > 0 {
+            text.push_str(&if lines.is_empty() {
+                "(every cell in the range is empty)\n".to_string()
+            } else {
+                format!("({empty} empty cells not listed)\n")
+            });
+        }
+        let columns: Vec<String> = (c0..=c1).map(gridtalk_graph::col_name).collect();
+        ToolResult::ok(
+            "get_cells",
+            serde_json::json!({
+                "range": range, "sheet": sheet.name, "first_row": r0 + 1,
+                "columns": columns, "rows": rows
+            }),
+            text,
+        )
+    }
+
+    /// `list_formulas`: each formula with its sheet-qualified cell,
+    /// after one line per column that says how far one formula is
+    /// filled down and which cells break the pattern (see
+    /// [`Tools::column_patterns`]).
+    fn list_formulas(&self, range: &str) -> ToolResult {
+        let Some((sheet_name, r0, c0, r1, c1)) = parse_range(range) else {
+            return ToolResult::err("list_formulas", ErrorKind::InvalidRange, range_error(range));
+        };
+        let Some(sheet) = self.sheet(&sheet_name) else {
+            return ToolResult::err(
+                "list_formulas",
+                ErrorKind::UnknownSheet,
+                format!("no sheet named {sheet_name}"),
+            );
+        };
+        let coords: Vec<(usize, usize)> = (r0..=r1)
+            .flat_map(|r| (c0..=c1).map(move |c| (r, c)))
+            .filter(|(r, c)| matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. }))
+            .collect();
+        if coords.is_empty() {
+            return ToolResult::ok(
+                "list_formulas",
+                serde_json::json!({"formulas": [], "columns": []}),
+                "no formulas in range".into(),
+            );
+        }
+        // One recalculation for the whole batch, not one per cell.
+        let evaluated = self.calc.get(self.wb).values(&sheet.name, &coords);
+        let quoted = quote_sheet(&sheet.name);
+        let mut formulas = Vec::new();
+        let mut lines = Vec::new();
+        for (&(r, c), result) in coords.iter().zip(evaluated.iter()) {
+            let CellValue::Formula { expr, .. } = sheet.get_ref(r, c) else {
+                continue;
+            };
+            let cell = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
+            let address = format!("{quoted}!{cell}");
+            let (value, typed, error) = match result {
+                Ok(v) => (legacy_number(v), Some(value_json(v)), None),
+                Err(e) => (None, None, Some(e.to_string())),
+            };
+            lines.push(match result {
+                Ok(v) => format!("{address} = {expr} -> {}", v.display()),
+                Err(e) => format!("{address} = {expr} -> error: {e}"),
+            });
+            formulas.push(serde_json::json!({
+                "cell": cell, "address": address, "formula": expr, "value": value,
+                "result": typed, "error": error
+            }));
+        }
+        let (columns, mut text) = self.column_patterns(sheet, (r0, c0, r1, c1));
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&lines.join("\n"));
+        ToolResult::ok(
+            "list_formulas",
+            serde_json::json!({"formulas": formulas, "columns": columns}),
+            text,
+        )
+    }
+
+    /// One entry per column of the range that holds at least
+    /// [`MIN_PATTERN_FORMULAS`] formulas: how many share the column's
+    /// commonest shape (compared in R1C1, so a formula filled down
+    /// counts as one shape), the formula cells with another shape,
+    /// and the cells holding a typed value where the column
+    /// otherwise holds formulas. The second kind is what "has a
+    /// formula been typed over?" asks for, and reading it off
+    /// hundreds of formula lines is where a model goes wrong.
+    fn column_patterns(
+        &self,
+        sheet: &gridtalk_graph::SheetSnapshot,
+        (r0, c0, r1, c1): (usize, usize, usize, usize),
+    ) -> (Vec<serde_json::Value>, String) {
+        let quoted = quote_sheet(&sheet.name);
+        let address =
+            |r: usize, c: usize| format!("{quoted}!{}{}", gridtalk_graph::col_name(c), r + 1);
+        let mut columns = Vec::new();
+        let mut lines = Vec::new();
+        for c in c0..=c1 {
+            // (row, formula, shape) for each formula cell, top down.
+            let cells: Vec<(usize, &str, String)> = (r0..=r1)
+                .filter_map(|r| match sheet.get_ref(r, c) {
+                    CellValue::Formula { expr, .. } => Some((
+                        r,
+                        expr.as_str(),
+                        gridtalk_graph::lineage::formula_pattern(expr, r, c)
+                            .unwrap_or_else(|| expr.clone()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if cells.len() < MIN_PATTERN_FORMULAS {
+                continue;
+            }
+            let mut counts: Vec<(&str, usize)> = Vec::new();
+            for (_, _, shape) in &cells {
+                match counts.iter_mut().find(|(s, _)| s == shape) {
+                    Some(entry) => entry.1 += 1,
+                    None => counts.push((shape, 1)),
+                }
+            }
+            // The commonest shape; the first seen wins a tie.
+            let mut best = counts[0];
+            for &entry in &counts[1..] {
+                if entry.1 > best.1 {
+                    best = entry;
+                }
+            }
+            let (pattern, same) = best;
+            let example = cells.iter().find(|(_, _, s)| s == pattern).unwrap();
+            let other: Vec<String> = cells
+                .iter()
+                .filter(|(_, _, s)| s != pattern)
+                .map(|(r, _, _)| address(*r, c))
+                .collect();
+            // The rows the column's formulas run over, widened to the
+            // graph column they sit in (below its heading), so a value
+            // typed over the first or last formula is still inside.
+            let (first, last) = (cells[0].0, cells[cells.len() - 1].0);
+            let (mut top, mut bottom) = (first, last);
+            if let Some(node) = self.graph.nodes.iter().find_map(|n| {
+                let r = n.range.as_ref()?;
+                (n.kind == gridtalk_graph::NodeKind::Column
+                    && sheet_name_eq(&r.sheet, &sheet.name)
+                    && r.c0 == c
+                    && r.c1 == c
+                    && r.r0 <= first
+                    && r.r1 >= last
+                    && r.r1 > r.r0)
+                    .then_some(r)
+            }) {
+                let heading = matches!(sheet.get_ref(node.r0, c), CellValue::Text(_));
+                top = top.min(node.r0 + usize::from(heading)).max(r0);
+                bottom = bottom.max(node.r1).min(r1);
+            }
+            let typed: Vec<(usize, String)> = (top..=bottom)
+                .filter_map(|r| match sheet.get_ref(r, c) {
+                    CellValue::Empty | CellValue::Formula { .. } => None,
+                    value => Some((r, value.display())),
+                })
+                .collect();
+            // A column that is mostly typed values is mixed by
+            // design, not typed over.
+            let typed = if typed.len() < cells.len() {
+                typed
+            } else {
+                Vec::new()
+            };
+            let span = gridtalk_graph::RangeRef {
+                sheet: sheet.name.clone(),
+                r0: top,
+                c0: c,
+                r1: bottom,
+                c1: c,
+            }
+            .a1();
+            let mut line = format!(
+                "column {} ({span}): {} formulas, {} like {} = {}",
+                gridtalk_graph::col_name(c),
+                cells.len(),
+                if same == cells.len() {
+                    "all".to_string()
+                } else {
+                    same.to_string()
+                },
+                address(example.0, c),
+                example.1
+            );
+            if !other.is_empty() {
+                line.push_str(&format!(
+                    "; a different formula in {}",
+                    listed(&other, MAX_PATTERN_EXCEPTIONS)
+                ));
+            }
+            if !typed.is_empty() {
+                let cells: Vec<String> = typed
+                    .iter()
+                    .map(|(r, v)| format!("{} ({v})", address(*r, c)))
+                    .collect();
+                line.push_str(&format!(
+                    "; a typed value, not a formula, in {}",
+                    listed(&cells, MAX_PATTERN_EXCEPTIONS)
+                ));
+            }
+            if other.is_empty() && typed.is_empty() {
+                line.push_str("; no cell breaks the pattern");
+            }
+            lines.push(line);
+            columns.push(serde_json::json!({
+                "column": gridtalk_graph::col_name(c), "range": span,
+                "formulas": cells.len(), "same_pattern": same, "pattern": pattern,
+                "example": {"address": address(example.0, c), "formula": example.1},
+                "other_formulas": other,
+                "typed_values": typed.iter().map(|(r, v)| serde_json::json!({"address": address(*r, c), "value": v})).collect::<Vec<_>>(),
+            }));
+        }
+        (columns, lines.join("\n"))
+    }
+
     /// Legacy string interface kept for the planner's text context:
     /// parses `key=value;key=value` and renders the typed result.
     pub fn execute(&self, tool: &str, args: &str) -> String {
@@ -782,6 +994,33 @@ fn cell_json(cell: &CellValue) -> serde_json::Value {
             "cached": cached.as_ref().map(|c| c.display())
         }),
     }
+}
+
+/// Largest range `get_cells` prints one line per cell for; a larger
+/// one prints one line per sheet row.
+pub const MAX_ADDRESSED_CELLS: usize = 60;
+/// Fewest formulas in a column before `list_formulas` describes the
+/// column's pattern.
+pub const MIN_PATTERN_FORMULAS: usize = 3;
+/// Most cells named per kind of exception in a column's pattern line
+/// (the JSON lists them all).
+pub const MAX_PATTERN_EXCEPTIONS: usize = 12;
+/// Most characters of a hit's passage in `search`'s text (the JSON
+/// carries the whole passage).
+pub const MAX_SEARCH_TEXT_PASSAGE: usize = 600;
+
+/// `a, b, c` for up to `max` items, then how many more there are.
+fn listed(items: &[String], max: usize) -> String {
+    let mut out = items
+        .iter()
+        .take(max)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > max {
+        out.push_str(&format!(" and {} more", items.len() - max));
+    }
+    out
 }
 
 /// Largest range a GetCells/ListFormulas call may materialise.
@@ -1030,11 +1269,16 @@ mod tests {
         assert!(f[2]["result"].is_null());
         assert!(f[2]["error"].as_str().unwrap().contains("division"));
         assert!(
-            res.text.contains("C2 = A2&\" x\"&B2 -> Apples x2"),
+            res.text.contains("Sheet1!C2 = A2&\" x\"&B2 -> Apples x2"),
             "{}",
             res.text
         );
-        assert!(res.text.contains("D2 = B2>5 -> FALSE"), "{}", res.text);
+        assert!(
+            res.text.contains("Sheet1!D2 = B2>5 -> FALSE"),
+            "{}",
+            res.text
+        );
+        assert_eq!(f[0]["address"], "Sheet1!C2");
 
         let whatif = tools.call(&ToolRequest::WhatIf {
             cell: "B2".into(),
@@ -1104,7 +1348,13 @@ mod tests {
         let e2 = &out.data["rows"][0][3];
         assert!(e2["result"].is_null() && e2["error"].is_string());
         assert!(e2["cached_result"].is_null());
-        assert!(out.text.contains("2 | 3 | 6 | #ERROR("), "{}", out.text);
+        assert_eq!(d2["address"], "Sheet1!D2");
+        assert!(
+            out.text
+                .contains("Sheet1!B2: 2\nSheet1!C2: 3\nSheet1!D2: 6  [=B2*C2]\nSheet1!E2: #ERROR("),
+            "{}",
+            out.text
+        );
         // The grid ends at XFD1048576.
         assert!(
             tools
@@ -1150,6 +1400,165 @@ mod tests {
             unqualified.text.contains("cannot parse target D2"),
             "{}",
             unqualified.text
+        );
+    }
+    /// #44: a reader can cite any cell either tool shows without
+    /// counting columns, and a column's formulas are summed up so a
+    /// typed-over cell is named instead of left among the rows.
+    #[test]
+    fn cells_and_formulas_carry_their_addresses() {
+        let mut csv = String::from("Item,Qty,Price,Total\n");
+        for r in 2..=30 {
+            // Row 9 was typed over; row 12 holds another formula.
+            let total = match r {
+                9 => "77".to_string(),
+                12 => format!("=B{r}+C{r}"),
+                _ => format!("=B{r}*C{r}"),
+            };
+            csv.push_str(&format!("item{r},{r},2,{total}\n"));
+        }
+        let wb = parse_delimited("d", "My Data", &csv, ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        // A few cells: one line each, the sheet name quoted as a
+        // citation needs it.
+        let small = tools.call(&ToolRequest::GetCells {
+            range: "'my data'!A1:D2".into(),
+        });
+        assert!(
+            small.text.contains("'My Data'!D1: Total\n"),
+            "{}",
+            small.text
+        );
+        assert!(
+            small.text.contains("'My Data'!D2: 4  [=B2*C2]\n"),
+            "{}",
+            small.text
+        );
+        assert_eq!(small.data["rows"][1][3]["address"], "'My Data'!D2");
+        assert_eq!(
+            small.data["columns"],
+            serde_json::json!(["A", "B", "C", "D"])
+        );
+        assert_eq!(small.data["first_row"], 1);
+        // Many cells: one line per sheet row, each value after its
+        // column letter.
+        let tall = tools.call(&ToolRequest::GetCells {
+            range: "'My Data'!A1:D30".into(),
+        });
+        assert!(
+            tall.text.contains("\n9 | A: item9 | B: 9 | C: 2 | D: 77\n"),
+            "{}",
+            tall.text
+        );
+        assert!(tall.text.contains("'My Data'!A1"), "{}", tall.text);
+        // Empty cells are counted, not printed.
+        let sparse = tools.call(&ToolRequest::GetCells {
+            range: "'My Data'!D30:E31".into(),
+        });
+        assert!(
+            sparse.text.contains("(3 empty cells not listed)"),
+            "{}",
+            sparse.text
+        );
+
+        let formulas = tools.call(&ToolRequest::ListFormulas {
+            range: "'My Data'!A1:D30".into(),
+        });
+        let first = formulas.text.lines().next().unwrap();
+        assert_eq!(
+            first,
+            "column D ('My Data'!D2:D30): 28 formulas, 27 like 'My Data'!D2 = B2*C2; \
+             a different formula in 'My Data'!D12; \
+             a typed value, not a formula, in 'My Data'!D9 (77)"
+        );
+        assert!(
+            formulas.text.contains("\n'My Data'!D3 = B3*C3 -> 6\n"),
+            "{}",
+            formulas.text
+        );
+        let column = &formulas.data["columns"][0];
+        assert_eq!(column["pattern"], "RC[-2]*RC[-1]");
+        assert_eq!(
+            column["other_formulas"],
+            serde_json::json!(["'My Data'!D12"])
+        );
+        assert_eq!(column["typed_values"][0]["address"], "'My Data'!D9");
+        // A value typed over the last formula is still inside the
+        // column, and a column with no exception says so.
+        let mut wb2 = wb.clone();
+        *wb2.sheets[0].cell_mut(29, 3) = CellValue::Number(5.0);
+        *wb2.sheets[0].cell_mut(8, 3) = CellValue::Formula {
+            expr: "B9*C9".into(),
+            cached: None,
+        };
+        *wb2.sheets[0].cell_mut(11, 3) = CellValue::Formula {
+            expr: "B12*C12".into(),
+            cached: None,
+        };
+        let (g2, _) = build_graph(&wb2);
+        let hybrid2 = HybridIndex::build(&wb2, &g2);
+        let tools2 = Tools {
+            wb: &wb2,
+            graph: &g2,
+            hybrid: &hybrid2,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let last = tools2.call(&ToolRequest::ListFormulas {
+            range: "'My Data'!D1:D30".into(),
+        });
+        assert!(
+            last.text
+                .starts_with("column D ('My Data'!D2:D30): 28 formulas, all like"),
+            "{}",
+            last.text
+        );
+        assert!(
+            last.text
+                .contains("a typed value, not a formula, in 'My Data'!D30 (5)"),
+            "{}",
+            last.text
+        );
+        *wb2.sheets[0].cell_mut(29, 3) = CellValue::Formula {
+            expr: "B30*C30".into(),
+            cached: None,
+        };
+        let (g3, _) = build_graph(&wb2);
+        let hybrid3 = HybridIndex::build(&wb2, &g3);
+        let tools3 = Tools {
+            wb: &wb2,
+            graph: &g3,
+            hybrid: &hybrid3,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let clean = tools3.call(&ToolRequest::ListFormulas {
+            range: "'My Data'!D1:D30".into(),
+        });
+        assert!(
+            clean
+                .text
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("; no cell breaks the pattern"),
+            "{}",
+            clean.text
+        );
+        // A search hit shows the top of its passage.
+        let hit = tools.call(&ToolRequest::Search {
+            query: "item9 total".into(),
+            limit: 1,
+        });
+        assert!(
+            hit.text.contains("\n  Item | Qty | Price | Total"),
+            "{}",
+            hit.text
         );
     }
 
