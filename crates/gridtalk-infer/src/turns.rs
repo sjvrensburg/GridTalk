@@ -166,6 +166,15 @@ pub trait ToolSession {
     fn context_tokens(&self) -> Option<usize> {
         None
     }
+
+    /// The size of `req`'s prompt in tokens, when the backend can
+    /// count it without running the model. A caller that keeps the
+    /// conversation inside [`ToolSession::context_tokens`] by this
+    /// count never sends a prompt the backend must refuse.
+    fn prompt_tokens(&mut self, req: &TurnRequest) -> Option<usize> {
+        let _ = req;
+        None
+    }
 }
 
 /// What an answer starts with in the text protocol.
@@ -378,6 +387,12 @@ pub fn parse_text_turn(text: &str, id: &str) -> Turn {
 
 /// A call as the text protocol writes it: `{"tool": name, ...args}`.
 pub fn call_text(call: &ToolCall) -> String {
+    // A reply that was not a call (`parse_text_turn` kept its raw
+    // text) goes back as the model wrote it, so the error that
+    // follows it still has something to refer to.
+    if let (true, serde_json::Value::String(raw)) = (call.name.is_empty(), &call.arguments) {
+        return raw.clone();
+    }
     let mut text = format!("{{\"tool\":{}", serde_json::Value::from(call.name.clone()));
     if let Some(map) = call.arguments.as_object() {
         for (name, value) in map {

@@ -1148,8 +1148,14 @@ impl GridTalkApp {
             );
             let (who, mut text, sources) = match outcome {
                 Ok(inv) => {
+                    // The chat has its own "Sources:" line, so the one
+                    // added to an answer that cited nothing is left out.
                     let sources = answer_sources(&inv.answer, &inv.citations, &snapshot);
-                    (backend.name().to_string(), inv.answer, sources)
+                    (
+                        backend.name().to_string(),
+                        inv.answer_body().to_string(),
+                        sources,
+                    )
                 }
                 Err(e) => ("error".to_string(), e.to_string(), Vec::new()),
             };

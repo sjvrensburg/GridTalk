@@ -15,6 +15,7 @@ use gridtalk_graph::{build_graph, load_path, Graph, NodeKind, RangeRef, Workbook
 use gridtalk_index::HybridIndex;
 use gridtalk_infer::config::Config;
 use gridtalk_infer::{backend_from_config, ChatRequest};
+use std::io::Write as _;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -658,7 +659,6 @@ fn run(args: &[String]) -> Result<(), CliError> {
             };
             let mut trace_error: Option<std::io::Error> = None;
             let mut write_trace = |event: &serde_json::Value| {
-                use std::io::Write as _;
                 if let Some(file) = trace_file.as_mut() {
                     if let Err(e) = writeln!(file, "{event}") {
                         trace_error.get_or_insert(e);
@@ -688,7 +688,6 @@ fn run(args: &[String]) -> Result<(), CliError> {
             )
             .map_err(|e| CliError::Backend(format!("backend failed: {e}")))?;
             if let Some(mut file) = trace_file {
-                use std::io::Write as _;
                 if let Some(e) = trace_error.or_else(|| file.flush().err()) {
                     eprintln!("gridtalk: warning: the trace is incomplete: {e}");
                 }

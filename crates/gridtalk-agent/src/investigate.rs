@@ -30,6 +30,21 @@ pub struct Investigation {
     /// Model turns taken: 1 in the fixed pipeline, one per turn of
     /// the tool loop.
     pub model_turns: usize,
+    /// Whether `answer` ends in a `Sources:` line this code added
+    /// because the model cited nothing that was read. A caller that
+    /// shows the citations its own way can leave the line out.
+    pub sources_appended: bool,
+}
+
+impl Investigation {
+    /// The answer without the `Sources:` line added to it, if one
+    /// was.
+    pub fn answer_body(&self) -> &str {
+        match self.answer.rsplit_once("\n\nSources: ") {
+            Some((body, _)) if self.sources_appended => body,
+            _ => &self.answer,
+        }
+    }
 }
 
 /// Run an investigation. The deterministic planner always performs
@@ -158,6 +173,7 @@ pub fn investigate_run(
             citations: Vec::new(),
             unread_citations: Vec::new(),
             model_turns: 0,
+            sources_appended: false,
         });
     }
     if run.tool_loop && ask.adapter.is_none_or(|a| a.tool_loop) && backend.supports_tools() {
@@ -221,7 +237,9 @@ pub fn investigate_run(
     }
     // Citation guarantee: the printed answer must cite a range we
     // actually retrieved.
-    if !citations.is_empty() && !citations.iter().any(|c| contains_bounded(&answer, c)) {
+    let sources_appended =
+        !citations.is_empty() && !citations.iter().any(|c| contains_bounded(&answer, c));
+    if sources_appended {
         answer.push_str(&format!("\n\nSources: {}", citations.join(", ")));
     }
 
@@ -231,6 +249,7 @@ pub fn investigate_run(
         citations,
         unread_citations: Vec::new(),
         model_turns: 1,
+        sources_appended,
     })
 }
 

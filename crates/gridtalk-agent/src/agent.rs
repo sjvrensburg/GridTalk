@@ -32,7 +32,8 @@ use crate::tools::{parse_range_uncapped, ToolRequest, Tools};
 use gridtalk_graph::sheet_name_eq;
 use gridtalk_index::history_prompt;
 use gridtalk_infer::{
-    ChatBackend, InferError, Message, Role, ToolCall, ToolChoice, ToolSpec, TurnRequest,
+    ChatBackend, InferError, Message, Role, ToolCall, ToolChoice, ToolSession, ToolSpec,
+    TurnRequest,
 };
 use std::sync::atomic::Ordering;
 
@@ -47,6 +48,8 @@ pub const DEFAULT_CONTEXT_TOKENS: usize = 16_384;
 pub const MAX_RESULT_CHARS: usize = 6_000;
 /// What an older result is shortened to when room runs out.
 const SHORT_RESULT_CHARS: usize = 400;
+/// What a result becomes when even shortened results do not fit.
+const REMOVED_RESULT: &str = "[removed to make room; call the tool again if you need it]";
 /// Most ranges a `Sources:` line names.
 const MAX_SOURCES: usize = 6;
 
@@ -90,9 +93,11 @@ fn cut_to(text: &str, max: usize, note: &str) -> (String, bool) {
     }
     let mut end = 0;
     let mut kept_lines = 0;
+    let mut kept_chars = 0;
     for (i, line) in text.split_inclusive('\n').enumerate() {
         let next = end + line.len();
-        if text[..next].chars().count() > max {
+        kept_chars += line.chars().count();
+        if kept_chars > max {
             if i == 0 {
                 // One very long line: cut inside it.
                 end = text
@@ -273,6 +278,51 @@ fn conversation_chars(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// What the loop has to stay inside.
+struct Budget {
+    /// The backend's context, in tokens.
+    window: usize,
+    /// Tokens kept for the model's turn.
+    turn_tokens: usize,
+    /// The conversation's share of the window, in tokens, for when it
+    /// can only be estimated from its length.
+    estimate_tokens: usize,
+    /// The size of the tool definitions, in characters.
+    specs_chars: usize,
+}
+
+/// Tokens left free past the turn's own, for what is appended after
+/// the count (a note to answer now).
+const TOKEN_MARGIN: usize = 64;
+
+impl Budget {
+    /// Whether the conversation leaves no room for the next turn. The
+    /// backend's own token count decides when it has one (the local
+    /// backend does, and refuses a prompt that is too long); otherwise
+    /// the length in characters does, at `chars_per_token`.
+    fn over(
+        &self,
+        session: &mut dyn ToolSession,
+        messages: &[Message],
+        specs: &[ToolSpec],
+        chars_per_token: f64,
+    ) -> bool {
+        let counted = session.prompt_tokens(&TurnRequest {
+            messages,
+            tools: specs,
+            choice: ToolChoice::Auto,
+            max_tokens: self.turn_tokens,
+        });
+        match counted {
+            Some(tokens) => tokens + self.turn_tokens + TOKEN_MARGIN > self.window,
+            None => {
+                conversation_chars(messages) + self.specs_chars
+                    > (self.estimate_tokens as f64 * chars_per_token) as usize
+            }
+        }
+    }
+}
+
 /// Run the loop. Called through
 /// [`crate::investigate::investigate_run`], which has checked that
 /// the backend takes tool turns.
@@ -337,27 +387,41 @@ pub(crate) fn tool_loop(
         // rest, less a margin for the chat template, is the
         // conversation's.
         let turn_tokens = ANSWER_TOKENS.min(window / 4).max(64);
-        let budget = window
-            .saturating_sub(turn_tokens + (window / 16).min(256))
-            .max(512);
+        let budget = Budget {
+            window,
+            turn_tokens,
+            estimate_tokens: window
+                .saturating_sub(turn_tokens + (window / 16).min(256))
+                .max(512),
+            specs_chars,
+        };
         // Characters per token, measured from the backend's own
         // counts once it reports them. Tables of numbers run well
         // under the four of ordinary prose.
         let mut chars_per_token = 3.0f64;
-        let room = |chars_per_token: f64| (budget as f64 * chars_per_token) as usize;
-        let result_cap = (room(chars_per_token) / 5).clamp(800, MAX_RESULT_CHARS);
-        let (opening_text, opening_cut) = cut_to(
-            &context,
-            (room(chars_per_token) / 3).clamp(1_500, 2 * MAX_RESULT_CHARS),
-            "read the range you need with a tool",
-        );
-        let mut user = history_prompt(ask.history);
-        user.push_str(&format!("Question: {question}\n"));
-        if standalone != question {
-            user.push_str(&format!("(searched as: {standalone})\n"));
-        }
-        user.push_str(&format!("\nAlready read for you:\n{opening_text}"));
+        let room = (budget.estimate_tokens as f64 * chars_per_token) as usize;
+        let result_cap = (room / 5).clamp(800, MAX_RESULT_CHARS);
+        let opening = |cap: usize| {
+            let (text, cut) = cut_to(&context, cap, "read the range you need with a tool");
+            let mut user = history_prompt(ask.history);
+            user.push_str(&format!("Question: {question}\n"));
+            if standalone != question {
+                user.push_str(&format!("(searched as: {standalone})\n"));
+            }
+            user.push_str(&format!("\nAlready read for you:\n{text}"));
+            (user, text, cut)
+        };
+        let mut opening_cap = (room / 3).clamp(1_500, 2 * MAX_RESULT_CHARS);
+        let (user, mut opening_text, mut opening_cut) = opening(opening_cap);
         let mut messages = vec![Message::system(system.clone()), Message::user(user)];
+        // The planner's reads give way before the first turn can be
+        // too long for the context: the model can read them again.
+        while opening_cap > 400 && budget.over(session, &messages, &specs, chars_per_token) {
+            opening_cap /= 2;
+            let (user, text, cut) = opening(opening_cap);
+            messages[1] = Message::user(user);
+            (opening_text, opening_cut) = (text, cut);
+        }
         shown.extend(qualified_ranges(&opening_text));
 
         // Requests already answered, with the message that holds the
@@ -374,7 +438,10 @@ pub(crate) fn tool_loop(
         // Tool messages already shortened.
         let mut shortened: Vec<usize> = Vec::new();
         let mut calls_left = ask.max_steps;
-        let mut chosen = 0usize;
+        // Calls that put a result in front of the model (a repeat's
+        // is there already). A call that could not run read nothing,
+        // so it does not count as the first call.
+        let mut reads = 0usize;
         let mut nudged = false;
         loop {
             if run.cancel.load(Ordering::Relaxed) {
@@ -382,7 +449,7 @@ pub(crate) fn tool_loop(
             }
             let choice = if calls_left == 0 {
                 ToolChoice::None
-            } else if first_call && chosen == 0 && !nudged {
+            } else if first_call && reads == 0 && !nudged {
                 ToolChoice::Required
             } else {
                 ToolChoice::Auto
@@ -439,7 +506,6 @@ pub(crate) fn tool_loop(
                 if run.cancel.load(Ordering::Relaxed) {
                     return Err(InferError::Cancelled);
                 }
-                chosen += 1;
                 let at = messages.len();
                 let (text, ok) = if calls_left == 0 {
                     (
@@ -457,6 +523,9 @@ pub(crate) fn tool_loop(
                                     && message.is_none_or(|m| !shortened.contains(&m))
                             });
                             if repeat.is_some() {
+                                // Its result is already in front of
+                                // the model, so it has read something.
+                                reads += 1;
                                 (
                                     "already called with these arguments: the result is above. Read something else or answer."
                                         .to_string(),
@@ -508,28 +577,20 @@ pub(crate) fn tool_loop(
                     "result_chars": text.chars().count(),
                 }));
                 if ok {
+                    reads += 1;
                     shown.extend(qualified_ranges(&sent));
                 }
                 messages.push(Message::tool(call, sent));
             }
-            if calls_left == 0 {
-                if let Some(last) = messages.last_mut() {
-                    last.content.push_str(
-                        "\n\n[That was the last tool call allowed. Answer now from the results.]",
-                    );
-                }
-            }
+            // What the last result is told; added after any
+            // shortening, which would otherwise cut it off.
+            let mut note = (calls_left == 0)
+                .then_some("[That was the last tool call allowed. Answer now from the results.]");
             // Out of room: shorten the oldest results first, and
             // stop calling tools when that is not enough.
-            let over = |messages: &[Message], chars_per_token: f64| {
-                conversation_chars(messages) + specs_chars > room(chars_per_token)
-            };
-            if over(&messages, chars_per_token) {
+            if budget.over(session, &messages, &specs, chars_per_token) {
                 let mut cut = 0usize;
                 for at in 0..messages.len() {
-                    if !over(&messages, chars_per_token) {
-                        break;
-                    }
                     if messages[at].role != Role::Tool || shortened.contains(&at) {
                         continue;
                     }
@@ -542,19 +603,46 @@ pub(crate) fn tool_loop(
                         messages[at].content = short;
                         shortened.push(at);
                         cut += 1;
+                        if !budget.over(session, &messages, &specs, chars_per_token) {
+                            break;
+                        }
+                    }
+                }
+                // Still too long: the planner's reads give way next,
+                // and then the oldest results altogether.
+                while opening_cap > 400
+                    && budget.over(session, &messages, &specs, chars_per_token)
+                {
+                    opening_cap /= 2;
+                    messages[1] = Message::user(opening(opening_cap).0);
+                    // What was cut may be asked for again.
+                    seen.retain(|(_, message)| message.is_some());
+                }
+                let mut removed = 0usize;
+                for at in 0..messages.len() {
+                    if !budget.over(session, &messages, &specs, chars_per_token) {
+                        break;
+                    }
+                    if messages[at].role == Role::Tool && messages[at].content != REMOVED_RESULT {
+                        messages[at].content = REMOVED_RESULT.to_string();
+                        if !shortened.contains(&at) {
+                            shortened.push(at);
+                        }
+                        removed += 1;
                     }
                 }
                 trace(serde_json::json!({
                     "event": "shortened", "turn": model_turns, "results": cut,
+                    "removed": removed, "opening_chars": opening_cap,
                 }));
-                if over(&messages, chars_per_token) && calls_left > 0 {
+                if calls_left > 0 && budget.over(session, &messages, &specs, chars_per_token) {
                     calls_left = 0;
-                    if let Some(last) = messages.last_mut() {
-                        last.content.push_str(
-                            "\n\n[No room is left for more results. Answer now from the results.]",
-                        );
-                    }
+                    note = Some("[No room is left for more results. Answer now from the results.]");
                 }
+            }
+            if let (Some(note), Some(last)) = (note, messages.last_mut()) {
+                last.content.push_str("\n\n");
+                last.content.push_str(note);
             }
         }
     })?;
@@ -583,6 +671,7 @@ pub(crate) fn tool_loop(
             unread_citations.push(cited);
         }
     }
+    let mut sources_appended = false;
     // Citation guarantee: an answer that cites nothing that was read
     // is given its sources, the model's own reads first.
     if !supported && !citations.iter().any(|c| contains_bounded(&answer, c)) {
@@ -599,6 +688,7 @@ pub(crate) fn tool_loop(
                 .map(|s| s.as_str())
                 .collect();
             answer.push_str(&format!("\n\nSources: {}", named.join(", ")));
+            sources_appended = true;
         }
     }
     trace(serde_json::json!({
@@ -612,6 +702,7 @@ pub(crate) fn tool_loop(
         citations,
         unread_citations,
         model_turns,
+        sources_appended,
     })
 }
 
@@ -631,6 +722,9 @@ mod tests {
         turns: Mutex<Vec<Turn>>,
         asked: Mutex<Vec<(ToolChoice, Vec<Message>)>>,
         context: Option<usize>,
+        /// When set, the session counts a prompt's tokens itself, at
+        /// this many characters to the token.
+        chars_per_token: Option<usize>,
     }
 
     impl Scripted {
@@ -639,6 +733,7 @@ mod tests {
                 turns: Mutex::new(turns.into_iter().rev().collect()),
                 asked: Mutex::new(Vec::new()),
                 context: None,
+                chars_per_token: None,
             }
         }
         fn asked(&self) -> Vec<(ToolChoice, Vec<Message>)> {
@@ -676,6 +771,11 @@ mod tests {
         }
         fn context_tokens(&self) -> Option<usize> {
             self.0.context
+        }
+        fn prompt_tokens(&mut self, req: &TurnRequest) -> Option<usize> {
+            self.0
+                .chars_per_token
+                .map(|per| conversation_chars(req.messages) / per)
         }
     }
 
@@ -1163,6 +1263,94 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_that_counts_tokens_is_never_sent_too_long_a_prompt() {
+        let fixture = Fixture::new();
+        let read = |n: usize, range: &str| {
+            calls(vec![call(
+                n,
+                "get_cells",
+                serde_json::json!({ "range": range }),
+            )])
+        };
+        let mut backend = Scripted::new(vec![
+            read(1, "Labour!A1:E40"),
+            read(2, "Labour!A2:E41"),
+            read(3, "Labour!A3:E41"),
+            read(4, "Labour!A4:E41"),
+            read(5, "Labour!A5:E41"),
+            says("Labour!E2 is the first cost."),
+        ]);
+        // Two characters to the token, as a table of numbers runs:
+        // denser than the loop's own estimate of three, so only the
+        // backend's count keeps the conversation inside the window.
+        backend.context = Some(4_000);
+        backend.chars_per_token = Some(2);
+        let (inv, _) = run_with(&fixture, &backend, "What is the first cost?", 8, None, true);
+        let turn_tokens = ANSWER_TOKENS.min(4_000 / 4);
+        for (_, messages) in backend.asked() {
+            let tokens = conversation_chars(&messages) / 2;
+            assert!(tokens + turn_tokens <= 4_000, "{tokens}");
+        }
+        assert_eq!(inv.answer, "Labour!E2 is the first cost.");
+        // A window too small for the planner's reads still gets a
+        // first turn: they are cut back until it fits.
+        let mut backend = Scripted::new(vec![
+            calls(vec![call(1, "workbook_info", serde_json::json!({}))]),
+            says("Four people are paid by the hour (Staff!A1:B5)."),
+        ]);
+        backend.context = Some(2_000);
+        backend.chars_per_token = Some(2);
+        let (inv, _) = run_with(
+            &fixture,
+            &backend,
+            "How is the labour cost worked out?",
+            8,
+            None,
+            true,
+        );
+        let asked = backend.asked();
+        assert!(
+            asked[0].1[1]
+                .content
+                .contains("more lines not shown; read the range you need with a tool]"),
+            "{}",
+            asked[0].1[1].content
+        );
+        for (_, messages) in &asked {
+            let tokens = conversation_chars(messages) / 2;
+            assert!(tokens + 500 <= 2_000, "{tokens}");
+        }
+        assert!(inv.answer.starts_with("Four people"), "{}", inv.answer);
+    }
+
+    #[test]
+    fn a_call_that_did_not_run_is_not_the_first_call() {
+        let fixture = Fixture::new();
+        let backend = Scripted::new(vec![
+            calls(vec![call(
+                1,
+                "read_cells",
+                serde_json::json!({"range": "Staff!A1"}),
+            )]),
+            calls(vec![call(
+                2,
+                "get_cells",
+                serde_json::json!({"range": "Staff!A2:B2"}),
+            )]),
+            says("E1 is paid 100 an hour (Staff!B2)."),
+        ]);
+        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 8, None, true);
+        let choices: Vec<ToolChoice> = backend.asked().iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            choices,
+            [ToolChoice::Required, ToolChoice::Required, ToolChoice::Auto]
+        );
+        assert_eq!(inv.answer, "E1 is paid 100 an hour (Staff!B2).");
+        assert!(!inv.sources_appended);
+        assert_eq!(inv.answer_body(), inv.answer);
+    }
+
+    #[test]
     fn citations_are_checked_against_what_was_read() {
         let fixture = Fixture::new();
         // A range no call read is reported, not trusted.
@@ -1195,6 +1383,8 @@ mod tests {
             "{}",
             inv.answer
         );
+        assert!(inv.sources_appended);
+        assert_eq!(inv.answer_body(), "The rate is 120.");
         // An empty reply is said to be one.
         let backend = Scripted::new(vec![
             calls(vec![call(1, "workbook_info", serde_json::json!({}))]),

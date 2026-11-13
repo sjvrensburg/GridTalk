@@ -138,4 +138,7 @@ A task is carried when the tool results held what it wants (a
 whatever the answer made of it. The two counts separate two
 failures: a kind that is carried and not passed was read right and
 worded wrong, and a kind that is not carried never had the answer
-in front of the model, so the calls are what to fix.
+in front of the model, so the calls are what to fix. For a task
+scored by a number the count is generous: any number in the tool
+text that equals the expected one counts, a row label or a score
+included, so read it with care when the answer is a small integer.

@@ -202,6 +202,14 @@ impl<'m> LocalSession<'m> {
         self.ctx.n_ctx() as usize
     }
 
+    /// The prompt of a tool turn as tokens: the conversation in the
+    /// text protocol, through the model's chat template.
+    fn tokens_of(&self, req: &TurnRequest) -> Result<Vec<LlamaToken>, InferError> {
+        let messages = turns::text_messages(req.messages, req.tools);
+        let prompt = render_prompt(self.model, &messages)?;
+        Ok(self.model.vocab().tokenize(prompt.as_bytes(), true, true))
+    }
+
     /// Generate up to `max_tokens` after `prompt_tokens`, the reply
     /// held to `grammar` (GBNF, root rule `root`) when one is given.
     fn generate(
@@ -496,10 +504,7 @@ impl ToolSession for LocalSession<'_> {
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Turn, InferError> {
-        let rendered = turns::text_messages(req.messages, req.tools);
-        let messages: Vec<(&str, String)> = rendered.into_iter().collect();
-        let prompt = render_prompt(self.model, &messages)?;
-        let prompt_tokens = self.model.vocab().tokenize(prompt.as_bytes(), true, true);
+        let prompt_tokens = self.tokens_of(req)?;
         let grammar = turns::tool_grammar(req.tools, req.choice);
         let mut stream = AnswerStream::new();
         let generated = self.generate(
@@ -521,6 +526,10 @@ impl ToolSession for LocalSession<'_> {
 
     fn context_tokens(&self) -> Option<usize> {
         Some(self.n_ctx())
+    }
+
+    fn prompt_tokens(&mut self, req: &TurnRequest) -> Option<usize> {
+        self.tokens_of(req).ok().map(|tokens| tokens.len())
     }
 }
 

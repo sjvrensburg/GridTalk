@@ -59,7 +59,10 @@ UI share one implementation.
   results are shortened only when the conversation outgrows the
   context, because a rewritten history costs the local backend its
   cached prefix: a local conversation keeps one llama.cpp context
-  and evaluates only the new part of each prompt.
+  and evaluates only the new part of each prompt. The local backend
+  counts each prompt's tokens before it is sent, so the loop never
+  hands it one that is too long; an external endpoint's window is
+  estimated from the conversation's length.
 - A call repeated with the same arguments is not run again, and a
   call that cannot run (no such tool, bad arguments, not JSON) is
   answered with what was wrong.

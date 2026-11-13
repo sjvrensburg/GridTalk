@@ -650,8 +650,12 @@ impl ToolSession for OpenAiSession<'_> {
             Err(InferError::Http(message))
                 if choice == "required" && message.starts_with("endpoint returned HTTP 4") =>
             {
+                // Remembered only once "auto" got through: a 4xx
+                // for another reason (a bad key, a rate limit) fails
+                // both ways and says nothing about "required".
+                let value = self.backend.post_chat(&body("auto"), cancel)?;
                 self.required_refused = true;
-                self.backend.post_chat(&body("auto"), cancel)?
+                value
             }
             other => other?,
         };
@@ -871,6 +875,7 @@ pub mod config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn echo_streams_and_cancels() {
@@ -1012,7 +1017,6 @@ mod tests {
     fn mock_chat_server(
         replies: Vec<(u16, String)>,
     ) -> (u16, std::thread::JoinHandle<Vec<serde_json::Value>>) {
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
