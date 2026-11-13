@@ -109,6 +109,21 @@ case-insensitively, and cells must lie inside the sheet grid
   (a formula that has been typed over).
 - `what_if`: before and after values of a target when one cell is
   set to a number, evaluated on a copy.
+- `filter`: the rows of a table whose columns meet every condition
+  in `where` (`[{"column": "Region", "op": "=", "value": "EMEA"}]`;
+  `op` is `=`, `!=`, `>`, `>=`, `<`, `<=` or `contains`). `range` is
+  the table (a detected region) or any cell or column in it; a range
+  of several rows checks only those rows. A column is named by its
+  heading (ignoring case) or its letter. Numbers compare as numbers
+  when the value reads as one (`5000`, `12.5%`), text compares
+  ignoring case, and a number is never ordered against text; formula
+  cells compare by what they compute, and one that fails matches
+  nothing. `value` may be sent as a string or a number. `columns`
+  limits the columns shown. Each row carries its `row` number, its
+  `range` and its `cells`, typed like `get_cells` values with their
+  `address` and `column` heading. `limit` is 1-200 (default 50);
+  `matched` counts every matching row, `rows_checked` the non-empty
+  rows, and `truncated` says when more matched than are shown.
 - `issues`: problems in the workbook's formulas, errors first. Each
   issue has a `kind`, a `severity` (`error` or `warning`), the
   `range` of its cells (or the defined `name`), a `detail`, a
@@ -151,7 +166,10 @@ rather than on message text.
   Kinds: `unknown_workbook`, `workbook_unavailable` (the file was
   deleted or became unreadable), `open_failed`, `invalid_range`
   (unparseable, over the cell limit, or outside the grid),
-  `unknown_sheet`, `no_graph_node`, `evaluation_failed`,
+  `unknown_sheet` (the message names the closest sheet when one is
+  near, "did you mean …?", and lists the sheets), `unknown_column`
+  (`filter`; the same, for the table's columns), `no_graph_node`,
+  `evaluation_failed`,
   `invalid_arguments` (e.g. a non-finite what-if value),
   `path_not_allowed` (outside every `--root`), `over_budget` (one
   workbook's estimate is over `--memory-budget` on its own; when an

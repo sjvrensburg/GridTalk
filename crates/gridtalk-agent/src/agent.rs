@@ -59,7 +59,7 @@ How to work:
 1. Find what the question is about. `search` finds tables by the words in them. `workbook_info` lists the sheets, defined names and tables, and is where a question about the workbook or a whole sheet starts.
 2. See how it connects. A column reads the columns its formulas refer to, and feeds the columns whose formulas refer to it. `expand` on a column or table range lists what it reads (-depends_on->) and what reads it (<-depends_on-), each with its range. To follow an input to a result, expand each step of the chain.
 3. Read the cells. `list_formulas` gives a column's formula, how far it is filled down and any cell that breaks the pattern. `get_cells` gives values with their addresses.
-   `issues` lists formulas that evaluate to an error, broken references, saved values that recalculation disagrees with and numbers written into formulas: use it when the question asks whether something is wrong.
+   `filter` finds a table's rows by value (Region = EMEA, Amount > 5000). `issues` lists formula errors and other problems.
 4. Answer as soon as the results show the answer. Do not repeat a call or read something a result already shows.
 
 Rules:
@@ -261,6 +261,14 @@ fn ranges_read(request: &ToolRequest, data: &serde_json::Value, tools: &Tools) -
                     .filter_map(|issue| issue["range"].as_str())
                     .filter_map(canonical),
             )
+            .collect(),
+        // The rows it showed (a citation of a cell in one is read).
+        ToolRequest::Filter { .. } => data["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["range"].as_str())
+            .filter_map(canonical)
             .collect(),
         ToolRequest::WorkbookInfo | ToolRequest::GraphOverview => Vec::new(),
     }
@@ -1046,7 +1054,7 @@ mod tests {
                 "response", "answer"
             ]
         );
-        assert_eq!(seen.events[0]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(seen.events[0]["tools"].as_array().unwrap().len(), 8);
         assert_eq!(seen.events[1]["messages"].as_array().unwrap().len(), 2);
         assert_eq!(seen.events[3]["name"], "expand");
         assert_eq!(seen.events[9]["tool_calls"], 2);
@@ -1164,7 +1172,7 @@ mod tests {
             .filter(|m| m.role == Role::Tool)
             .map(|m| m.content.as_str())
             .collect();
-        assert!(results[0].starts_with("error: no tool named read_cells. The tools are workbook_info, search, expand, get_cells, list_formulas, issues, what_if."), "{}", results[0]);
+        assert!(results[0].starts_with("error: no tool named read_cells. The tools are workbook_info, search, expand, get_cells, list_formulas, filter, issues, what_if."), "{}", results[0]);
         assert!(
             results[1].starts_with("error: bad arguments for get_cells: unknown field `cells`"),
             "{}",
@@ -1179,7 +1187,11 @@ mod tests {
             results[3],
             "error: the arguments of get_cells must be a JSON object."
         );
-        assert_eq!(results[4], "error: no sheet named Nowhere");
+        assert!(
+            results[4].starts_with("error: no sheet named Nowhere; the sheets are "),
+            "{}",
+            results[4]
+        );
         assert!(
             results[5].starts_with("error: no tool named graph_overview."),
             "{}",

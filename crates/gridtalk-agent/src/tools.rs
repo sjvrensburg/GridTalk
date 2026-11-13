@@ -38,6 +38,93 @@ pub enum ToolRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         range: Option<String>,
     },
+    Filter {
+        /// A table's range, or any cell or column in it.
+        range: String,
+        /// Conditions every returned row meets; none returns every
+        /// row.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        r#where: Vec<Condition>,
+        /// The columns to show, by heading or letter; all when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
+        #[serde(default = "default_filter_limit")]
+        limit: usize,
+    },
+}
+
+/// One `filter` condition: a column (by heading, or by letter), a
+/// comparison, and the value to compare with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Condition {
+    pub column: String,
+    pub op: FilterOp,
+    /// Written as text; a number or boolean is accepted and read as
+    /// its text.
+    #[serde(deserialize_with = "text_or_scalar")]
+    pub value: String,
+}
+
+/// How a `filter` condition compares. Numbers compare as numbers
+/// when both sides are numbers; anything else compares as text,
+/// ignoring case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterOp {
+    #[serde(rename = "=", alias = "==")]
+    Eq,
+    #[serde(rename = "!=", alias = "<>")]
+    Ne,
+    #[serde(rename = ">")]
+    Gt,
+    #[serde(rename = ">=")]
+    Ge,
+    #[serde(rename = "<")]
+    Lt,
+    #[serde(rename = "<=")]
+    Le,
+    #[serde(rename = "contains")]
+    Contains,
+}
+
+impl FilterOp {
+    pub const ALL: [FilterOp; 7] = [
+        FilterOp::Eq,
+        FilterOp::Ne,
+        FilterOp::Gt,
+        FilterOp::Ge,
+        FilterOp::Lt,
+        FilterOp::Le,
+        FilterOp::Contains,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "!=",
+            FilterOp::Gt => ">",
+            FilterOp::Ge => ">=",
+            FilterOp::Lt => "<",
+            FilterOp::Le => "<=",
+            FilterOp::Contains => "contains",
+        }
+    }
+}
+
+/// A condition value given as a string, number or boolean, as text.
+fn text_or_scalar<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    match serde_json::Value::deserialize(de)? {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(if b { "TRUE" } else { "FALSE" }.to_string()),
+        other => Err(serde::de::Error::custom(format!(
+            "value must be text or a number, not {other}"
+        ))),
+    }
+}
+
+fn default_filter_limit() -> usize {
+    DEFAULT_FILTER_ROWS
 }
 
 /// What went wrong in a failed tool call, so a client can branch on
@@ -58,6 +145,8 @@ pub enum ErrorKind {
     NoGraphNode,
     /// The calc engine could not evaluate the request.
     EvaluationFailed,
+    /// No column of the table has that heading or letter.
+    UnknownColumn,
     /// MCP: no open workbook has that id.
     UnknownWorkbook,
     /// MCP: the workbook's file was deleted or became unreadable.
@@ -104,6 +193,7 @@ impl ToolRequest {
             ToolRequest::GraphOverview => "graph_overview",
             ToolRequest::WorkbookInfo => "workbook_info",
             ToolRequest::Issues { .. } => "issues",
+            ToolRequest::Filter { .. } => "filter",
         }
     }
 
@@ -129,6 +219,21 @@ impl ToolRequest {
                 tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2, each with its address. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. For each column it says how far one formula is filled down, which cells hold a different formula, and which hold a typed value where the column has formulas. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("filter", format!("Rows of a table whose columns meet every condition in where, e.g. {{\"column\": \"Region\", \"op\": \"=\", \"value\": \"EMEA\"}}. range: the table or any cell in it (several rows: only those rows). column: a heading or letter. Numbers compare as numbers, text ignoring case; formula cells by their result. Rows carry cell addresses. limit: 1-{MAX_FILTER_ROWS} (default {DEFAULT_FILTER_ROWS})"), schema(serde_json::json!({
+                    "range": range,
+                    "where": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": {"type": "string"},
+                            "op": {"type": "string", "enum": FilterOp::ALL.iter().map(|op| op.as_str()).collect::<Vec<_>>()},
+                            "value": {"type": "string"}
+                        },
+                        "required": ["column", "op", "value"],
+                        "additionalProperties": false
+                    }},
+                    "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to show; all when absent"},
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_FILTER_ROWS}
+                }), &["range"])),
                 tool("issues", format!("Problems in the workbook's formulas, errors first: formulas that evaluate to an error (and those that only pass on an error from a cell they read), references to a missing sheet, #REF! left by deleted cells, broken defined names, values saved in the file that recalculation disagrees with, links to other workbooks, and numbers written into a formula's arithmetic (=B5*1.05). Cells with the same problem in one column are one issue. range: check one sheet's range only (e.g. Sheet1!A1:F200); absent checks the whole workbook. At most {MAX_ISSUES_LISTED} issues are listed; the counts cover all."), schema(serde_json::json!({"range": range}), &[])),
                 tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
                 tool("graph_overview", "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)".into(), schema(serde_json::json!({}), &[]))
@@ -187,6 +292,19 @@ impl<'a> Tools<'a> {
         // Caller spellings are case-insensitive (expand already
         // canonicalises sheet1!a1:b2; get_cells/list_formulas/what_if agree).
         self.wb.sheets.iter().find(|s| sheet_name_eq(&s.name, name))
+    }
+
+    /// "no sheet named X", with the closest sheet name when one is
+    /// near and the sheets there are.
+    fn no_sheet(&self, name: &str) -> String {
+        let names: Vec<&str> = self.wb.sheets.iter().map(|s| s.name.as_str()).collect();
+        let mut text = format!("no sheet named {name}");
+        if let Some(near) = did_you_mean(name, &names) {
+            text.push_str(&format!(" (did you mean {}?)", quote_sheet(near)));
+        }
+        let quoted: Vec<String> = names.iter().map(|n| quote_sheet(n)).collect();
+        text.push_str(&format!("; the sheets are {}", listed(&quoted, 20)));
+        text
     }
 
     /// The one typed entry point every surface calls.
@@ -376,6 +494,12 @@ impl<'a> Tools<'a> {
             }
             ToolRequest::GetCells { range } => self.get_cells(range),
             ToolRequest::Issues { range } => self.issues(range.as_deref()),
+            ToolRequest::Filter {
+                range,
+                r#where,
+                columns,
+                limit,
+            } => self.filter(range, r#where, columns, *limit),
             ToolRequest::ListFormulas { range } => self.list_formulas(range),
             ToolRequest::WhatIf {
                 cell,
@@ -414,14 +538,17 @@ impl<'a> Tools<'a> {
                     return ToolResult::err(
                         "what_if",
                         ErrorKind::UnknownSheet,
-                        format!("no sheet named {override_sheet} for override cell {cell}"),
+                        format!(
+                            "{} (for override cell {cell})",
+                            self.no_sheet(&override_sheet)
+                        ),
                     );
                 }
                 if self.sheet(&target_sheet).is_none() {
                     return ToolResult::err(
                         "what_if",
                         ErrorKind::UnknownSheet,
-                        format!("no sheet named {target_sheet}"),
+                        self.no_sheet(&target_sheet),
                     );
                 }
                 // Canonicalise to the workbook's own sheet names:
@@ -565,7 +692,7 @@ impl<'a> Tools<'a> {
             return ToolResult::err(
                 "get_cells",
                 ErrorKind::UnknownSheet,
-                format!("no sheet named {sheet_name}"),
+                self.no_sheet(&sheet_name),
             );
         };
         // Formula cells report what they compute, not only the
@@ -675,7 +802,7 @@ impl<'a> Tools<'a> {
             return ToolResult::err(
                 "list_formulas",
                 ErrorKind::UnknownSheet,
-                format!("no sheet named {sheet_name}"),
+                self.no_sheet(&sheet_name),
             );
         };
         let coords: Vec<(usize, usize)> = (r0..=r1)
@@ -864,6 +991,258 @@ impl<'a> Tools<'a> {
         (columns, lines.join("\n"))
     }
 
+    /// `filter`: the data rows of the table at `range` whose cells
+    /// meet every condition, with their addresses.
+    fn filter(
+        &self,
+        range: &str,
+        conditions: &[Condition],
+        shown: &[String],
+        requested: usize,
+    ) -> ToolResult {
+        let fail = |kind, message: String| ToolResult::err("filter", kind, message);
+        let Some((sheet_name, r0, c0, r1, c1)) = parse_range_uncapped(range) else {
+            return fail(ErrorKind::InvalidRange, range_error(range));
+        };
+        let Some(sheet) = self.sheet(&sheet_name) else {
+            return fail(ErrorKind::UnknownSheet, self.no_sheet(&sheet_name));
+        };
+        // The smallest table holding the range's first cell, else the
+        // first one it overlaps.
+        let on_sheet = || {
+            self.graph
+                .regions
+                .iter()
+                .filter(|g| sheet_name_eq(&g.range.sheet, &sheet.name))
+        };
+        let Some(region) = on_sheet()
+            .filter(|g| {
+                let t = &g.range;
+                t.r0 <= r0 && r0 <= t.r1 && t.c0 <= c0 && c0 <= t.c1
+            })
+            .min_by_key(|g| (g.range.r1 - g.range.r0 + 1) * (g.range.c1 - g.range.c0 + 1))
+            .or_else(|| {
+                on_sheet().find(|g| {
+                    let t = &g.range;
+                    t.r0 <= r1 && r0 <= t.r1 && t.c0 <= c1 && c0 <= t.c1
+                })
+            })
+        else {
+            return fail(
+                ErrorKind::NoGraphNode,
+                format!("no table at {range}; workbook_info lists the tables (regions)"),
+            );
+        };
+        let table = &region.range;
+        let first_data = region.header_row.map_or(table.r0, |h| h + 1).max(table.r0);
+        // A range of several rows checks only those rows; a cell or
+        // a column from the heading down checks the whole table.
+        let (top, bottom) = if r1 > r0 {
+            (first_data.max(r0), table.r1.min(r1))
+        } else {
+            (first_data, table.r1)
+        };
+        let headings: Vec<String> = region
+            .headers
+            .iter()
+            .map(|h| h.trim().to_string())
+            .collect();
+        // A heading, or a letter; with no heading row the headings are
+        // the letters themselves.
+        let heading_of = |c: usize| -> Option<&str> {
+            let h = headings.get(c - table.c0)?.as_str();
+            (!h.is_empty() && region.header_row.is_some()).then_some(h)
+        };
+        let resolve = |name: &str| -> Result<usize, String> {
+            let wanted = name.trim();
+            if let Some(c) = (table.c0..=table.c1)
+                .find(|&c| heading_of(c).is_some_and(|h| h.eq_ignore_ascii_case(wanted)))
+            {
+                return Ok(c);
+            }
+            if let Some(c) = column_letters(wanted) {
+                if (table.c0..=table.c1).contains(&c) {
+                    return Ok(c);
+                }
+            }
+            let named: Vec<&str> = (table.c0..=table.c1).filter_map(heading_of).collect();
+            let mut text = format!("no column {wanted} in {}", table.a1());
+            if let Some(near) = did_you_mean(wanted, &named) {
+                text.push_str(&format!(" (did you mean {near}?)"));
+            }
+            let all: Vec<String> = (table.c0..=table.c1)
+                .map(|c| match heading_of(c) {
+                    Some(h) => format!("{h} ({})", gridtalk_graph::col_name(c)),
+                    None => gridtalk_graph::col_name(c),
+                })
+                .collect();
+            text.push_str(&format!("; its columns are {}", listed(&all, 40)));
+            Err(text)
+        };
+        let mut tests = Vec::new();
+        for condition in conditions {
+            match resolve(&condition.column) {
+                Ok(c) => tests.push((c, condition)),
+                Err(e) => return fail(ErrorKind::UnknownColumn, e),
+            }
+        }
+        let mut show = Vec::new();
+        for name in shown {
+            match resolve(name) {
+                Ok(c) if !show.contains(&c) => show.push(c),
+                Ok(_) => {}
+                Err(e) => return fail(ErrorKind::UnknownColumn, e),
+            }
+        }
+        if show.is_empty() {
+            show = (table.c0..=table.c1).collect();
+        }
+        let limit = requested.clamp(1, MAX_FILTER_ROWS);
+
+        // What each formula cell of the rows computes, in one batch.
+        let formulas: Vec<(usize, usize)> = (top..=bottom)
+            .flat_map(|r| (table.c0..=table.c1).map(move |c| (r, c)))
+            .filter(|(r, c)| matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. }))
+            .collect();
+        let computed: std::collections::HashMap<(usize, usize), Result<Value, String>> =
+            if formulas.is_empty() {
+                Default::default()
+            } else {
+                let values = self.calc.get(self.wb).values(&sheet.name, &formulas);
+                formulas
+                    .into_iter()
+                    .zip(values)
+                    .map(|(at, v)| (at, v.map_err(|e| e.to_string())))
+                    .collect()
+            };
+        let value_at = |r: usize, c: usize| -> Result<Value, String> {
+            match sheet.get_ref(r, c) {
+                CellValue::Formula { .. } => {
+                    computed.get(&(r, c)).cloned().unwrap_or(Ok(Value::Empty))
+                }
+                CellValue::Empty => Ok(Value::Empty),
+                CellValue::Text(t) => Ok(Value::Text(t.clone())),
+                CellValue::Number(n) => Ok(Value::Number(*n)),
+                CellValue::Bool(b) => Ok(Value::Bool(*b)),
+            }
+        };
+        let blank = |r: usize| {
+            (table.c0..=table.c1).all(|c| matches!(sheet.get_ref(r, c), CellValue::Empty))
+        };
+
+        let quoted = quote_sheet(&sheet.name);
+        let mut matched = 0usize;
+        let mut checked = 0usize;
+        let mut rows = Vec::new();
+        let mut lines = Vec::new();
+        for r in top..=bottom {
+            if blank(r) {
+                continue;
+            }
+            checked += 1;
+            if !tests
+                .iter()
+                .all(|(c, condition)| condition_holds(&value_at(r, *c), condition))
+            {
+                continue;
+            }
+            matched += 1;
+            if rows.len() >= limit {
+                continue;
+            }
+            let mut cells = Vec::new();
+            let mut parts = Vec::new();
+            for &c in &show {
+                let address = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
+                let (mut json, display) = match &value_at(r, c) {
+                    Ok(v) => (value_json(v), v.display()),
+                    Err(e) => (
+                        serde_json::json!({"type": "error", "error": e}),
+                        format!("#ERROR({e})"),
+                    ),
+                };
+                json["address"] = serde_json::json!(format!("{quoted}!{address}"));
+                json["column"] = serde_json::json!(heading_of(c));
+                cells.push(json);
+                parts.push(match heading_of(c) {
+                    Some(h) => format!("{address} {h} = {display}"),
+                    None => format!("{address} = {display}"),
+                });
+            }
+            let row_range = gridtalk_graph::RangeRef {
+                sheet: sheet.name.clone(),
+                r0: r,
+                c0: *show.iter().min().unwrap_or(&table.c0),
+                r1: r,
+                c1: *show.iter().max().unwrap_or(&table.c1),
+            }
+            .a1();
+            lines.push(format!("{quoted} row {}: {}", r + 1, parts.join(" | ")));
+            rows.push(serde_json::json!({"row": r + 1, "range": row_range, "cells": cells}));
+        }
+        let name_of = |c: usize| {
+            heading_of(c)
+                .map(str::to_string)
+                .unwrap_or_else(|| gridtalk_graph::col_name(c))
+        };
+        let described: Vec<String> = tests
+            .iter()
+            .map(|(c, cond)| format!("{} {} {}", name_of(*c), cond.op.as_str(), cond.value))
+            .collect();
+        let checked_range = gridtalk_graph::RangeRef {
+            sheet: sheet.name.clone(),
+            r0: top,
+            c0: table.c0,
+            r1: bottom.max(top),
+            c1: table.c1,
+        }
+        .a1();
+        let mut text = format!("Table {}", table.a1());
+        if (top, bottom) != (first_data, table.r1) {
+            text.push_str(&format!(", rows {checked_range}"));
+        }
+        if !described.is_empty() {
+            text.push_str(&format!(" where {}", described.join(" and ")));
+        }
+        text.push_str(&format!(": {matched} of {checked} rows match"));
+        if matched > rows.len() {
+            text.push_str(&format!(
+                " (the first {} shown; raise limit, up to {MAX_FILTER_ROWS}, or add a condition)",
+                rows.len()
+            ));
+        }
+        if requested != limit {
+            text.push_str(&format!(" (limit {requested} clamped to {limit})"));
+        }
+        for line in &lines {
+            text.push('\n');
+            text.push_str(line);
+        }
+        let where_json: Vec<serde_json::Value> = tests
+            .iter()
+            .map(|(c, cond)| {
+                serde_json::json!({
+                    "column": cond.column, "letter": gridtalk_graph::col_name(*c),
+                    "op": cond.op, "value": cond.value
+                })
+            })
+            .collect();
+        let columns_json: Vec<serde_json::Value> = show
+            .iter()
+            .map(|&c| serde_json::json!({"name": heading_of(c), "letter": gridtalk_graph::col_name(c)}))
+            .collect();
+        ToolResult::ok(
+            "filter",
+            serde_json::json!({
+                "table": table.a1(), "checked": checked_range, "where": where_json,
+                "columns": columns_json, "matched": matched, "rows_checked": checked,
+                "shown": rows.len(), "limit": limit, "limit_clamped": requested != limit,
+                "truncated": matched > rows.len(), "rows": rows
+            }),
+            text,
+        )
+    }
+
     /// `issues`: the workbook's problems (see
     /// [`gridtalk_graph::issues`]), errors first, at most
     /// [`MAX_ISSUES_LISTED`] of them with their first cells.
@@ -884,7 +1263,7 @@ impl<'a> Tools<'a> {
                     return ToolResult::err(
                         "issues",
                         ErrorKind::UnknownSheet,
-                        format!("no sheet named {sheet_name}"),
+                        self.no_sheet(&sheet_name),
                     );
                 };
                 Some((index, (r0, c0, r1, c1)))
@@ -1073,12 +1452,15 @@ impl<'a> Tools<'a> {
             }
             "graph_overview" => ToolRequest::GraphOverview,
             "workbook_info" => ToolRequest::WorkbookInfo,
+            "filter" => {
+                return "filter takes a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into()
+            }
             "issues" => ToolRequest::Issues {
                 range: arg("range").filter(|r| !r.is_empty()),
             },
             other => {
                 return format!(
-                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, what_if, issues, graph_overview"
+                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, filter, what_if, issues, graph_overview"
                 )
             }
         };
@@ -1193,6 +1575,134 @@ fn listed(items: &[String], max: usize) -> String {
         out.push_str(&format!(" and {} more", items.len() - max));
     }
     out
+}
+
+/// Rows `filter` returns by default.
+pub const DEFAULT_FILTER_ROWS: usize = 50;
+/// Most rows one `filter` call returns; `matched` counts them all.
+pub const MAX_FILTER_ROWS: usize = 200;
+
+/// Whether a cell's value meets a `filter` condition. Numbers compare
+/// as numbers when the condition's value reads as one (`5000`,
+/// `12.5%`); otherwise both sides compare as text, ignoring case and
+/// surrounding spaces. A number is never ordered against text. A cell
+/// whose formula fails meets no condition.
+fn condition_holds(value: &Result<Value, String>, condition: &Condition) -> bool {
+    let Ok(value) = value else {
+        return false;
+    };
+    let wanted = condition.value.trim();
+    let wanted_number = wanted
+        .strip_suffix('%')
+        .and_then(|n| n.trim().parse::<f64>().ok().map(|n| n / 100.0))
+        .or_else(|| wanted.parse::<f64>().ok())
+        .filter(|n| n.is_finite());
+    let display = value.display();
+    let text = display.trim().to_lowercase();
+    let wanted_text = wanted.to_lowercase();
+    if condition.op == FilterOp::Contains {
+        return text.contains(&wanted_text);
+    }
+    let ordering = match (value, wanted_number) {
+        (Value::Number(n), Some(w)) => {
+            if (n - w).abs() <= 1e-9 * n.abs().max(w.abs()).max(1.0) {
+                std::cmp::Ordering::Equal
+            } else if *n < w {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (Value::Number(_), None) | (Value::Text(_), Some(_))
+            if !matches!(condition.op, FilterOp::Eq | FilterOp::Ne) =>
+        {
+            return false;
+        }
+        _ => text.cmp(&wanted_text),
+    };
+    match condition.op {
+        FilterOp::Eq => ordering.is_eq(),
+        FilterOp::Ne => ordering.is_ne(),
+        FilterOp::Gt => ordering.is_gt(),
+        FilterOp::Ge => ordering.is_ge(),
+        FilterOp::Lt => ordering.is_lt(),
+        FilterOp::Le => ordering.is_le(),
+        FilterOp::Contains => text.contains(&wanted_text),
+    }
+}
+
+/// A column given by its letters (`D`, `aa`), 0-based, within
+/// Excel's columns.
+fn column_letters(text: &str) -> Option<usize> {
+    if text.is_empty() || text.len() > 3 || !text.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let col = text
+        .to_ascii_uppercase()
+        .bytes()
+        .fold(0usize, |acc, b| acc * 26 + usize::from(b - b'A' + 1));
+    (col <= gridtalk_graph::EXCEL_MAX_COLS).then(|| col - 1)
+}
+
+/// The candidate closest to `name` when it is near enough to be what
+/// was meant, ignoring case: within one edit for names of up to five
+/// characters, two beyond; failing that, the one candidate that starts
+/// with `name` (or that `name` starts with), or else the one that
+/// holds `name` as a word, when only one does.
+pub fn did_you_mean<'a>(name: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let wanted = name.trim().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    let allowed = if wanted.chars().count() <= 5 { 1 } else { 2 };
+    let best = candidates
+        .iter()
+        .map(|c| (edit_distance(&wanted, &c.to_lowercase()), *c))
+        .filter(|(d, _)| *d <= allowed)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c);
+    if best.is_some() {
+        return best;
+    }
+    let prefixed: Vec<&str> = candidates
+        .iter()
+        .filter(|c| {
+            let c = c.to_lowercase();
+            wanted.chars().count() >= 3 && (c.starts_with(&wanted) || wanted.starts_with(&c))
+        })
+        .copied()
+        .collect();
+    if prefixed.len() == 1 {
+        return Some(prefixed[0]);
+    }
+    // `Type` for `Debt Type`: the one name holding it as a word.
+    let worded: Vec<&str> = candidates
+        .iter()
+        .filter(|c| {
+            c.to_lowercase()
+                .split(|ch: char| !ch.is_alphanumeric())
+                .any(|word| word == wanted)
+        })
+        .copied()
+        .collect();
+    (worded.len() == 1).then(|| worded[0])
+}
+
+/// Levenshtein distance over chars.
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Most issues `issues` lists; the counts cover every issue.
@@ -1474,6 +1984,139 @@ mod tests {
         assert!(tools
             .execute("issues", "range=Calc!D2:D4")
             .starts_with("1 error and 1 warning in Calc!D2:D4"));
+    }
+
+    /// `filter` on a table with a heading row: text compares ignoring
+    /// case, numbers as numbers, formula cells by what they compute;
+    /// rows come with addresses; a near-miss column or sheet name is
+    /// answered with the name meant.
+    #[test]
+    fn filter_finds_rows_by_value_with_addresses() {
+        let wb = parse_delimited(
+            "demo",
+            "Sales",
+            "Account,Region,Amount,Net\nA-1,EMEA,7000,=C2*0.9\nA-2,APAC,9000,=C3*0.9\nA-3,emea,4000,=C4*0.9\nA-4,EMEA North,12000,=C5*0.9\nA-5,EMEA,abc,=1/0\n",
+            ',',
+        );
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let call = |json: serde_json::Value| {
+            let req: ToolRequest = serde_json::from_value(json).unwrap();
+            tools.call(&req)
+        };
+        let rows = |res: &ToolResult| -> Vec<u64> {
+            res.data["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["row"].as_u64().unwrap())
+                .collect()
+        };
+
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!B3",
+            "where": [{"column": "region", "op": "=", "value": "EMEA"}]}));
+        assert!(res.ok, "{}", res.text);
+        assert_eq!(rows(&res), vec![2, 4, 6]);
+        assert_eq!(res.data["matched"], 3);
+        assert_eq!(res.data["rows_checked"], 5);
+        let lines: Vec<&str> = res.text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "Table Sales!A1:D6 where Region = EMEA: 3 of 5 rows match"
+        );
+        assert_eq!(
+            lines[1],
+            "Sales row 2: A2 Account = A-1 | B2 Region = EMEA | C2 Amount = 7000 | D2 Net = 6300"
+        );
+        assert_eq!(res.data["rows"][0]["range"], "Sales!A2:D2");
+        assert_eq!(res.data["rows"][0]["cells"][3]["address"], "Sales!D2");
+        assert_eq!(res.data["rows"][0]["cells"][3]["value"], 6300.0);
+        // A formula that fails shows its error and matches nothing on
+        // that column.
+        assert_eq!(res.data["rows"][2]["cells"][3]["type"], "error");
+
+        // Numbers as numbers (a value given as a JSON number too), on
+        // a formula column, by letter, with two conditions and a
+        // subset of columns.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1:D6",
+            "where": [{"column": "D", "op": ">=", "value": 6300}, {"column": "Region", "op": "contains", "value": "emea"}],
+            "columns": ["Account", "Net"]}));
+        assert_eq!(rows(&res), vec![2, 5], "{}", res.text);
+        assert_eq!(
+            res.text.lines().nth(2).unwrap(),
+            "Sales row 5: A5 Account = A-4 | D5 Net = 10800"
+        );
+        assert_eq!(res.data["rows"][1]["range"], "Sales!A5:D5");
+        // Text is never ordered against a number.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1",
+            "where": [{"column": "Amount", "op": "<", "value": "5000"}]}));
+        assert_eq!(rows(&res), vec![4]);
+        // A range of several rows checks only those rows.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A4:D6"}));
+        assert_eq!(rows(&res), vec![4, 5, 6]);
+        assert!(
+            res.text
+                .starts_with("Table Sales!A1:D6, rows Sales!A4:D6: 3 of 3 rows match"),
+            "{}",
+            res.text
+        );
+        // The limit cuts the rows shown, not the count.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1", "limit": 2}));
+        assert_eq!(rows(&res), vec![2, 3]);
+        assert_eq!(res.data["matched"], 5);
+        assert_eq!(res.data["truncated"], true);
+
+        // Names a model gets nearly right.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1",
+            "where": [{"column": "Regoin", "op": "=", "value": "EMEA"}]}));
+        assert_eq!(res.data["error"]["kind"], "unknown_column");
+        assert_eq!(
+            res.text,
+            "no column Regoin in Sales!A1:D6 (did you mean Region?); its columns are Account (A), Region (B), Amount (C), Net (D)"
+        );
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sale!A1"}));
+        assert_eq!(
+            res.text,
+            "no sheet named Sale (did you mean Sales?); the sheets are Sales"
+        );
+        let res = tools.call(&ToolRequest::GetCells {
+            range: "sles!A1".into(),
+        });
+        assert!(res.text.contains("(did you mean Sales?)"), "{}", res.text);
+        assert!(serde_json::from_value::<ToolRequest>(
+            serde_json::json!({"tool": "filter", "range": "Sales!A1",
+            "where": [{"column": "Region", "op": "~", "value": "x"}]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn did_you_mean_takes_near_names_only() {
+        let names = ["Labour", "Rates", "Summary 2024"];
+        assert_eq!(did_you_mean("labor", &names), Some("Labour"));
+        assert_eq!(did_you_mean("Rats", &names), Some("Rates"));
+        assert_eq!(did_you_mean("Summary", &names), Some("Summary 2024"));
+        assert_eq!(did_you_mean("Debtors", &names), None);
+        assert_eq!(
+            did_you_mean("type", &["Debt Type", "Account"]),
+            Some("Debt Type")
+        );
+        assert_eq!(
+            did_you_mean("type", &["Debt Type", "Type Code"]),
+            Some("Type Code")
+        );
+        assert_eq!(did_you_mean("rate", &["Discount Rate", "Tax Rate"]), None);
+        assert_eq!(did_you_mean("", &names), None);
+        assert_eq!(column_letters("d"), Some(3));
+        assert_eq!(column_letters("XFD"), Some(16_383));
+        assert_eq!(column_letters("XFE"), None);
+        assert_eq!(column_letters("Region"), None);
     }
 
     fn fixture() -> (WorkbookSnapshot, Graph, HybridIndex) {
