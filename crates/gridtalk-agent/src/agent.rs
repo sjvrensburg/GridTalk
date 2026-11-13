@@ -379,6 +379,11 @@ pub(crate) fn tool_loop(
         .map(|s| s.name.len() + s.description.len() + s.parameters.to_string().len())
         .sum();
     let first_call = ask.adapter.is_none_or(|a| a.first_call);
+    // Whether the planner read more than its search hits: a call
+    // that ran and returned a result. Such reads put tool results in
+    // front of the model, which is what the forced first call is for
+    // (#47).
+    let opening_read = trail.iter().any(|s| s.ok && s.tool != "search");
 
     let mut system = LOOP_PROMPT.to_string();
     system.push_str(&gridtalk_adapter::prompt_text(
@@ -395,7 +400,7 @@ pub(crate) fn tool_loop(
     };
     trace(serde_json::json!({
         "event": "session", "backend": backend.name(), "question": question,
-        "max_steps": ask.max_steps, "first_call": first_call, "tools": specs,
+        "max_steps": ask.max_steps, "first_call": first_call, "opening_read": opening_read, "tools": specs,
         "opening": trail.iter().map(|s| serde_json::json!({
             "tool": s.tool, "args": s.args, "result": s.result
         })).collect::<Vec<_>>(),
@@ -451,6 +456,10 @@ pub(crate) fn tool_loop(
             (opening_text, opening_cut) = (text, cut);
         }
         shown.extend(qualified_ranges(&opening_text));
+        // The first turn must be a call unless the planner's reads
+        // reached the model whole: an answer then stands on tool
+        // results already, not on the question's own words.
+        let must_call = first_call && !(opening_read && !opening_cut);
 
         // Requests already answered, with the message that holds the
         // result (none for a planner step: it is in the user message).
@@ -477,7 +486,7 @@ pub(crate) fn tool_loop(
             }
             let choice = if calls_left == 0 {
                 ToolChoice::None
-            } else if first_call && reads == 0 && !nudged {
+            } else if must_call && reads == 0 && !nudged {
                 ToolChoice::Required
             } else {
                 ToolChoice::Auto
@@ -591,6 +600,7 @@ pub(crate) fn tool_loop(
                     },
                     args: args_text(call),
                     result: text.clone(),
+                    ok,
                 };
                 (run.on_step)(&step);
                 trail.push(step);
@@ -881,6 +891,10 @@ mod tests {
         calc: gridtalk_graph::eval::EvalCache,
     }
 
+    /// A question no region of the fixture matches, so the planner
+    /// reads nothing beyond its search.
+    const NO_MATCH: &str = "qzx vbnm?";
+
     impl Fixture {
         fn new() -> Self {
             let wb = workbook();
@@ -980,12 +994,14 @@ mod tests {
             true,
         );
         let asked = backend.asked();
-        // The first turn must be a call; later ones may answer.
+        // The planner read the cost column and its formulas, so the
+        // model may answer from them on its first turn (#47).
         let choices: Vec<ToolChoice> = asked.iter().map(|(c, _)| *c).collect();
         assert_eq!(
             choices,
-            [ToolChoice::Required, ToolChoice::Auto, ToolChoice::Auto]
+            [ToolChoice::Auto, ToolChoice::Auto, ToolChoice::Auto]
         );
+        assert_eq!(seen.events[0]["opening_read"], true);
         // The model starts from what the planner read.
         let first = &asked[0].1;
         assert_eq!(first.len(), 2);
@@ -1118,7 +1134,10 @@ mod tests {
             )]),
             says("E1 is paid 100 an hour (Staff!B2)."),
         ]);
-        let (inv, seen) = run_with(&fixture, &backend, "What is E1 paid?", 8, None, true);
+        // Words nothing in the workbook matches: the planner reads
+        // nothing beyond its search, so the first turn must be a call.
+        let (inv, seen) = run_with(&fixture, &backend, NO_MATCH, 8, None, true);
+        assert_eq!(seen.events[0]["opening_read"], false);
         let asked = backend.asked();
         assert_eq!(asked[0].0, ToolChoice::Required);
         assert_eq!(asked[1].0, ToolChoice::Auto);
@@ -1245,6 +1264,9 @@ mod tests {
         backend.context = Some(4_500);
         let (inv, seen) = run_with(&fixture, &backend, "What is the first cost?", 8, None, true);
         let asked = backend.asked();
+        // The planner's reads were cut to fit, so they do not stand in
+        // for the first call (#47).
+        assert_eq!(asked[0].0, ToolChoice::Required);
         // The whole table is 40 lines of some 45 characters; the model
         // is sent the top of it and told how to get the rest. (The
         // trace has the result as it was added; a later turn may
@@ -1372,7 +1394,7 @@ mod tests {
             )]),
             says("E1 is paid 100 an hour (Staff!B2)."),
         ]);
-        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 8, None, true);
+        let (inv, _) = run_with(&fixture, &backend, NO_MATCH, 8, None, true);
         let choices: Vec<ToolChoice> = backend.asked().iter().map(|(c, _)| *c).collect();
         assert_eq!(
             choices,

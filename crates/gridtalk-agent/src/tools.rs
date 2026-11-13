@@ -1483,6 +1483,12 @@ impl<'a> Tools<'a> {
     /// Legacy string interface kept for the planner's text context:
     /// parses `key=value;key=value` and renders the typed result.
     pub fn execute(&self, tool: &str, args: &str) -> String {
+        self.execute_step(tool, args).0
+    }
+
+    /// [`execute`](Self::execute), with whether the call ran and
+    /// returned a result.
+    pub fn execute_step(&self, tool: &str, args: &str) -> (String, bool) {
         let arg = |key: &str| -> Option<String> {
             split_legacy_args(args).iter().find_map(|kv| {
                 let (k, v) = kv.split_once('=')?;
@@ -1519,7 +1525,7 @@ impl<'a> Tools<'a> {
                     arg("value").and_then(|v| v.parse::<f64>().ok()),
                     arg("target"),
                 ) else {
-                    return "usage: cell=B2;value=10;target=Sheet1!D4".into();
+                    return ("usage: cell=B2;value=10;target=Sheet1!D4".into(), false);
                 };
                 ToolRequest::WhatIf {
                     cell,
@@ -1530,18 +1536,22 @@ impl<'a> Tools<'a> {
             "graph_overview" => ToolRequest::GraphOverview,
             "workbook_info" => ToolRequest::WorkbookInfo,
             "filter" | "aggregate" => {
-                return "filter and aggregate take a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into()
+                return ("filter and aggregate take a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into(), false)
             }
             "issues" => ToolRequest::Issues {
                 range: arg("range").filter(|r| !r.is_empty()),
             },
             other => {
-                return format!(
-                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, filter, aggregate, what_if, issues, graph_overview"
+                return (
+                    format!(
+                        "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, filter, aggregate, what_if, issues, graph_overview"
+                    ),
+                    false,
                 )
             }
         };
-        self.call(&req).text
+        let result = self.call(&req);
+        (result.text, result.ok)
     }
 }
 

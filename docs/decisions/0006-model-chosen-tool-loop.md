@@ -52,7 +52,12 @@ UI share one implementation.
 ## How the loop is kept in hand
 
 - The first model turn must be a tool call (`first_call`), so a
-  small model cannot answer from the question's own words.
+  small model cannot answer from the question's own words. The rule
+  applies only when the planner's opening read nothing beyond its
+  search hits, or was cut to fit the context (#47, 2026-11-13): when
+  its reads reach the model whole, they already put tool results in
+  front of it, and a forced call added nothing in 44% of the
+  answered questions of the 1,334-question set.
 - `max_steps` bounds the model's calls; the turn after the last one
   can only answer. The planner's opening reads come on top.
 - A result is cut to a share of the context when it is added. Older

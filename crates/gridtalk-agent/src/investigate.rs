@@ -17,6 +17,9 @@ pub struct TrailStep {
     pub tool: String,
     pub args: String,
     pub result: String,
+    /// Whether the call ran and returned a result (a search that
+    /// matched nothing, an error, a call that was not run: `false`).
+    pub ok: bool,
 }
 
 #[derive(Debug)]
@@ -276,11 +279,12 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
         (ask.question, ask.adapter, ask.history, ask.selection);
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
-        let result = tools.execute(tool, args);
+        let (result, ok) = tools.execute_step(tool, args);
         trail.push(TrailStep {
             tool: tool.to_string(),
             args: args.to_string(),
             result: result.clone(),
+            ok,
         });
         result
     };
@@ -307,6 +311,7 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
         tool: "search".into(),
         args: format!("q={standalone}"),
         result: search_result.clone(),
+        ok: !hits.is_empty(),
     });
 
     let mut context = format!("search results:\n{search_result}");

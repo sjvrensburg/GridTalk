@@ -29,8 +29,9 @@ retrieval missed it; on by default, as with no adapter, so set
 (decision 0006), both on by default: `tool_loop` (let the model
 choose its own tool calls when the backend can take tool turns;
 `false` keeps the fixed pipeline) and `first_call` (make the
-model's first turn a tool call; `false` lets it answer at once from
-what the planner already read). In the tool loop `max_steps` bounds
+model's first turn a tool call when the planner read nothing beyond
+its search hits, or its reads had to be cut to fit; `false` lets the
+model answer at once from what the planner read in every case). In the tool loop `max_steps` bounds
 the model's calls; the planner's opening reads, at most four, come
 on top.
 

@@ -52,9 +52,10 @@ pub struct Adapter {
     /// answer.
     pub tool_loop: bool,
     /// In the tool loop, make the model's first turn a tool call
-    /// (default): a small model otherwise answers from the question's
-    /// own words. `first_call = false` lets it answer at once from
-    /// what the planner already read.
+    /// (default) when the planner read nothing beyond its search hits
+    /// or its reads were cut: a small model otherwise answers from the
+    /// question's own words. `first_call = false` lets it answer at
+    /// once from what the planner read in every case.
     pub first_call: bool,
     pub skills: Vec<Skill>,
 }
