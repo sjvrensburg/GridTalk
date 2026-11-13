@@ -940,29 +940,12 @@ fn sheet_named_at<'a>(text: &str, sheets: &[&'a str]) -> Option<&'a str> {
             .strip_suffix("'s")
             .unwrap_or(&candidate)
             .trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
-        let d = edit_distance(candidate, &name_lower);
+        let d = crate::tools::edit_distance(candidate, &name_lower);
         if d <= 1 && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, name));
         }
     }
     best.map(|(_, name)| name)
-}
-
-/// Levenshtein distance over chars.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            cur[j + 1] = (prev[j] + usize::from(ca != cb))
-                .min(prev[j + 1] + 1)
-                .min(cur[j] + 1);
-        }
-        prev = cur;
-    }
-    prev[b.len()]
 }
 
 /// Whether the question is about the workbook as a whole — its

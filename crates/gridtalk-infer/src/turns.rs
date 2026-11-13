@@ -180,38 +180,128 @@ pub trait ToolSession {
 /// What an answer starts with in the text protocol.
 pub const ANSWER_MARK: &str = "ANSWER:";
 
-fn properties(spec: &ToolSpec) -> Vec<(&str, &str, bool)> {
-    let required: Vec<&str> = spec.parameters["required"]
+/// A schema's properties as (name, schema, required), required ones
+/// first, each group in name order: the order the grammar writes
+/// them in.
+fn object_properties(schema: &serde_json::Value) -> Vec<(&str, &serde_json::Value, bool)> {
+    let required: Vec<&str> = schema["required"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    let mut props: Vec<(&str, &str, bool)> = spec.parameters["properties"]
+    let mut props: Vec<(&str, &serde_json::Value, bool)> = schema["properties"]
         .as_object()
         .map(|map| {
             map.iter()
-                .map(|(name, schema)| {
-                    (
-                        name.as_str(),
-                        schema["type"].as_str().unwrap_or("string"),
-                        required.contains(&name.as_str()),
-                    )
-                })
+                .map(|(name, schema)| (name.as_str(), schema, required.contains(&name.as_str())))
                 .collect()
         })
         .unwrap_or_default();
-    // Required arguments first, each group by name: the order the
-    // grammar writes them in.
     props.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
     props
 }
 
+fn properties(spec: &ToolSpec) -> Vec<(&str, &serde_json::Value, bool)> {
+    object_properties(&spec.parameters)
+}
+
+/// How the tools prompt names a value's type: `string`, `integer`,
+/// `one of "=", "<"`, `array of {"column": string, ...}`.
+fn describe(schema: &serde_json::Value) -> String {
+    if let Some(choices) = schema["enum"].as_array() {
+        let choices: Vec<String> = choices.iter().map(|c| c.to_string()).collect();
+        return format!("one of {}", choices.join(", "));
+    }
+    match schema["type"].as_str().unwrap_or("string") {
+        "array" => format!("array of {}", describe(&schema["items"])),
+        "object" => {
+            let members: Vec<String> = object_properties(schema)
+                .iter()
+                .map(|(name, schema, required)| {
+                    let optional = if *required { "" } else { " (optional)" };
+                    format!("\"{name}\": {}{optional}", describe(schema))
+                })
+                .collect();
+            format!("{{{}}}", members.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The GBNF expression for a value of `schema`: a terminal rule
+/// (`string`, `integer`, `number`, `boolean`), a choice of literals
+/// for a string `enum`, or a rule named `name` added to `rules` for
+/// an array or an object (whose members follow the call's order:
+/// required ones, then optional ones after them).
+fn value_grammar(schema: &serde_json::Value, name: &str, rules: &mut Vec<String>) -> String {
+    if let Some(choices) = schema["enum"].as_array() {
+        let literals: Vec<String> = choices
+            .iter()
+            .filter_map(|c| c.as_str())
+            .map(gbnf_json_string)
+            .collect();
+        if !literals.is_empty() {
+            return format!("({})", literals.join(" | "));
+        }
+    }
+    match schema["type"].as_str().unwrap_or("string") {
+        "integer" => "integer".into(),
+        "number" => "number".into(),
+        "boolean" => "boolean".into(),
+        "array" => {
+            let item = value_grammar(&schema["items"], &format!("{name}-item"), rules);
+            rules.push(format!(
+                "{name} ::= \"[\" ws ({item} (ws \",\" ws {item})*)? ws \"]\"\n"
+            ));
+            name.to_string()
+        }
+        "object" => {
+            let mut body = String::from("\"{\" ws");
+            let mut first = true;
+            for (member, schema, required) in object_properties(schema) {
+                let value = value_grammar(schema, &format!("{name}-{}", rule_name(member)), rules);
+                let comma = if first { "" } else { "\",\" ws " };
+                let text = format!("{comma}{} ws \":\" ws {value}", gbnf_json_string(member));
+                if required || first {
+                    // A leading optional member would leave the next
+                    // one's comma dangling, so the first member is
+                    // always written.
+                    body.push_str(&format!(" {text}"));
+                } else {
+                    body.push_str(&format!(" ({text})?"));
+                }
+                first = false;
+            }
+            body.push_str(" ws \"}\"");
+            rules.push(format!("{name} ::= {body}\n"));
+            name.to_string()
+        }
+        _ => "string".into(),
+    }
+}
+
+/// A property name as part of a GBNF rule name (letters, digits and
+/// dashes).
+fn rule_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 fn example_call(spec: &ToolSpec) -> String {
     let mut text = format!("{{\"tool\":{}", serde_json::Value::from(spec.name.clone()));
-    for (name, kind, required) in properties(spec) {
+    for (name, schema, required) in properties(spec) {
         if required {
-            let value = match kind {
+            let value = match schema["type"].as_str().unwrap_or("string") {
                 "integer" | "number" => "1",
                 "boolean" => "true",
+                "array" => "[]",
+                "object" => "{}",
                 _ => "\"...\"",
             };
             text.push_str(&format!(",{}:{value}", serde_json::Value::from(name)));
@@ -234,7 +324,8 @@ pub fn tools_prompt(tools: &[ToolSpec]) -> String {
     for spec in tools {
         let args: Vec<String> = properties(spec)
             .iter()
-            .map(|(name, kind, required)| {
+            .map(|(name, schema, required)| {
+                let kind = describe(schema);
                 if *required {
                     format!("\"{name}\": {kind}")
                 } else {
@@ -292,15 +383,15 @@ pub fn tool_grammar(tools: &[ToolSpec], choice: ToolChoice) -> String {
         gbnf_json_string("tool"),
         alternatives.join(" | ")
     ));
+    let mut values: Vec<String> = Vec::new();
     for (i, spec) in tools.iter().enumerate() {
         let mut rule = format!("call-{i} ::= {}", gbnf_json_string(&spec.name));
-        for (name, kind, required) in properties(spec) {
-            let value = match kind {
-                "integer" => "integer",
-                "number" => "number",
-                "boolean" => "boolean",
-                _ => "string",
-            };
+        for (name, schema, required) in properties(spec) {
+            let value = value_grammar(
+                schema,
+                &format!("call-{i}-{}", rule_name(name)),
+                &mut values,
+            );
             let member = format!("\",\" ws {} ws \":\" ws {value}", gbnf_json_string(name));
             if required {
                 rule.push_str(&format!(" {member}"));
@@ -310,6 +401,9 @@ pub fn tool_grammar(tools: &[ToolSpec], choice: ToolChoice) -> String {
         }
         grammar.push_str(&rule);
         grammar.push('\n');
+    }
+    for rule in values {
+        grammar.push_str(&rule);
     }
     grammar.push_str(concat!(
         "string ::= \"\\\"\" ([^\"\\\\\\x00-\\x1f] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]))* \"\\\"\"\n",
@@ -538,6 +632,55 @@ mod tests {
             "{none}"
         );
         assert_eq!(tool_grammar(&[], ToolChoice::Required), none);
+    }
+
+    /// An argument that is a list of objects, one member a choice of
+    /// strings, gets rules of its own instead of being forced into a
+    /// string; the tools prompt spells the shape out.
+    #[test]
+    fn arrays_objects_and_enums_get_their_own_rules() {
+        let tools = vec![ToolSpec {
+            name: "filter".into(),
+            description: "Rows that match.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "range": {"type": "string"},
+                    "where": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": {"type": "string"},
+                            "op": {"type": "string", "enum": ["=", ">="]},
+                            "value": {"type": "string"}
+                        },
+                        "required": ["column", "op", "value"]
+                    }}
+                },
+                "required": ["range"]
+            }),
+        }];
+        let grammar = tool_grammar(&tools, ToolChoice::Required);
+        assert!(
+            grammar.contains("call-0 ::= \"\\\"filter\\\"\" \",\" ws \"\\\"range\\\"\" ws \":\" ws string (\",\" ws \"\\\"where\\\"\" ws \":\" ws call-0-where)?\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call-0-where ::= \"[\" ws (call-0-where-item (ws \",\" ws call-0-where-item)*)? ws \"]\"\n"),
+            "{grammar}"
+        );
+        assert!(
+            grammar.contains("call-0-where-item ::= \"{\" ws \"\\\"column\\\"\" ws \":\" ws string \",\" ws \"\\\"op\\\"\" ws \":\" ws (\"\\\"=\\\"\" | \"\\\">=\\\"\") \",\" ws \"\\\"value\\\"\" ws \":\" ws string ws \"}\"\n"),
+            "{grammar}"
+        );
+        // Every rule a call refers to is defined.
+        for rule in ["call-0-where", "call-0-where-item"] {
+            assert!(grammar.contains(&format!("\n{rule} ::= ")), "{grammar}");
+        }
+        let prompt = tools_prompt(&tools);
+        assert!(
+            prompt.contains("- filter {\"range\": string, \"where\": array of {\"column\": string, \"op\": one of \"=\", \">=\", \"value\": string} (optional)}"),
+            "{prompt}"
+        );
     }
 
     #[test]
