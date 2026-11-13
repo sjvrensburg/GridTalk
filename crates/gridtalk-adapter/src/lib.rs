@@ -52,9 +52,10 @@ pub struct Adapter {
     /// answer.
     pub tool_loop: bool,
     /// In the tool loop, make the model's first turn a tool call
-    /// (default) when the planner read nothing beyond its search hits
-    /// or its reads were cut: a small model otherwise answers from the
-    /// question's own words. `first_call = false` lets it answer at
+    /// (default) unless the planner read some of the workbook's content
+    /// (cells, formulas, figures, problems, the sheet list) and its
+    /// reads reached the model whole: a small model otherwise answers
+    /// from the question's own words. `first_call = false` lets it answer at
     /// once from what the planner read in every case.
     pub first_call: bool,
     pub skills: Vec<Skill>,
