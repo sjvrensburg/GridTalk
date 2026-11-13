@@ -1087,6 +1087,9 @@ impl<'a> Tools<'a> {
             tests: Vec::new(),
         };
         for condition in conditions {
+            if let Some(message) = operator_in_value(condition) {
+                return fail(ErrorKind::InvalidArguments, message);
+            }
             match rows.resolve(&condition.column) {
                 Ok(c) => rows.tests.push((c, condition.clone())),
                 Err(e) => return fail(ErrorKind::UnknownColumn, e),
@@ -2005,6 +2008,28 @@ fn condition_holds(value: &Result<Value, String>, condition: &Condition) -> bool
     }
 }
 
+/// What to say about a condition whose value starts with a
+/// comparison (`{"op": ">", "value": "> 44000"}`): compared as text,
+/// it would match nothing, and an empty result does not tell a model
+/// what it got wrong. `None` for an ordinary value.
+fn operator_in_value(condition: &Condition) -> Option<String> {
+    let value = condition.value.trim_start();
+    let op = [">=", "<=", "!=", "<>", "==", ">", "<", "="]
+        .into_iter()
+        .find(|op| value.starts_with(op))?;
+    let rest = value[op.len()..].trim();
+    let op = match op {
+        "<>" => "!=",
+        "==" => "=",
+        other => other,
+    };
+    Some(format!(
+        "the value of the condition on {} starts with {op:?}; put the comparison in op and only the value in value: {}",
+        condition.column,
+        serde_json::json!({"column": condition.column, "op": op, "value": rest})
+    ))
+}
+
 /// A column given by its letters (`D`, `aa`), 0-based, within
 /// Excel's columns.
 fn column_letters(text: &str) -> Option<usize> {
@@ -2445,6 +2470,26 @@ mod tests {
         assert_eq!(rows(&res), vec![2, 3]);
         assert_eq!(res.data["matched"], 5);
         assert_eq!(res.data["truncated"], true);
+
+        // A comparison written into the value is an error that says
+        // where it goes, for filter and aggregate alike.
+        let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1",
+            "where": [{"column": "Amount", "op": ">", "value": "> 5000"}]}));
+        assert_eq!(res.data["error"]["kind"], "invalid_arguments");
+        assert_eq!(
+            res.text,
+            r#"the value of the condition on Amount starts with ">"; put the comparison in op and only the value in value: {"column":"Amount","op":">","value":"5000"}"#
+        );
+        let res = call(
+            serde_json::json!({"tool": "aggregate", "range": "Sales!A1", "column": "Amount",
+            "where": [{"column": "Region", "op": "=", "value": "<>APAC"}]}),
+        );
+        assert!(
+            res.text
+                .contains(r#"{"column":"Region","op":"!=","value":"APAC"}"#),
+            "{}",
+            res.text
+        );
 
         // Names a model gets nearly right.
         let res = call(serde_json::json!({"tool": "filter", "range": "Sales!A1",
