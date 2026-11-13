@@ -303,16 +303,26 @@ struct RebuildJob {
 /// graph cache for the next rebuild.
 type RebuildResult = (Graph, Vec<String>, Option<Index>, GraphCache);
 
+/// The index a rebuild starts from. The chat worker of a question
+/// still being answered may share it, in which case the rebuild
+/// works on its own copy (made here, off the UI thread when the
+/// rebuild runs on a worker) and that answer finishes against the
+/// workbook as it was asked.
+fn owned_index(index: Option<Arc<Index>>) -> Option<Index> {
+    index.map(Arc::unwrap_or_clone)
+}
+
 /// Build the graph for `snapshot` and bring `index` up to date with
 /// it: incrementally from the edited `dirty` ranges when there is an
 /// index to update and a cache to reuse, else from scratch. A graph
 /// with invariant violations gets no index (never serve a stale one).
 fn compute_rebuild(
     snapshot: &gridtalk_graph::WorkbookSnapshot,
-    index: Option<Index>,
+    index: Option<Arc<Index>>,
     mut cache: GraphCache,
     dirty: Option<&[RangeRef]>,
 ) -> RebuildResult {
+    let index = owned_index(index);
     let (graph, violations) = build_graph_cached(snapshot, &mut cache, dirty);
     if !violations.is_empty() {
         return (graph, violations, None, cache);
@@ -424,8 +434,11 @@ fn answer_sources(
 
 pub struct GridTalkApp {
     inc: Option<IncrementalSnapshot>,
-    graph: Graph,
-    index: Option<Index>,
+    /// The graph and the index are shared, not copied, with the
+    /// workers that read them (a chat answer, the graph layout). A
+    /// rebuild replaces them; it never changes one in place.
+    graph: Arc<Graph>,
+    index: Option<Arc<Index>>,
     sync: SyncState,
     prefs: UiPrefs,
     workbook_name: String,
@@ -559,7 +572,7 @@ impl GridTalkApp {
         }
         GridTalkApp {
             inc: None,
-            graph: Graph::default(),
+            graph: Arc::default(),
             index: None,
             sync: SyncState::default(),
             prefs,
@@ -925,8 +938,8 @@ impl GridTalkApp {
             self.sync.highlighted_node = None;
             self.scrolled_for = None;
         }
-        self.index = index;
-        self.graph = graph;
+        self.index = index.map(Arc::new);
+        self.graph = Arc::new(graph);
         violations
     }
 
@@ -1079,15 +1092,17 @@ impl GridTalkApp {
                 self.ask_selected = self.sync.selected_range.clone();
             }
         }
-        // The worker answers from its own copy of the workbook as it
-        // stands now (rows and embedding vectors are shared, not
-        // copied), so edits made while it runs do not reach it.
+        // The worker answers from the workbook as it stands now: it
+        // shares the graph and the index (a rebuild replaces them and
+        // never changes them in place) and the snapshot's rows, so
+        // nothing is copied here and edits made while it runs do not
+        // reach it.
         let Some(snapshot) = self.inc.as_ref().map(|inc| inc.snapshot().clone()) else {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
-        let graph = self.graph.clone();
-        let index = index.clone();
+        let graph = Arc::clone(&self.graph);
+        let index = Arc::clone(index);
         let config_path = self.config_path.clone();
         let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         self.chat_cancel = Some(cancel.clone());
@@ -2934,7 +2949,7 @@ impl GridTalkApp {
         {
             self.layout_size = (layout_rect.width(), layout_rect.height());
             self.layout_worker = Some(spawn_layout(
-                self.graph.clone(),
+                Arc::clone(&self.graph),
                 self.graph_version,
                 layout_rect.width(),
                 layout_rect.height(),
@@ -3365,6 +3380,65 @@ mod tests {
             answer.sources
         );
         assert!(app.chat_progress.is_empty() && app.chat_rx.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chat worker shares the graph and the index instead of copying
+    /// them. A rebuild that starts while it still holds them works on
+    /// its own copy, so the worker goes on reading the workbook as it
+    /// was asked about.
+    #[test]
+    fn a_question_in_flight_keeps_its_graph_and_index_through_an_edit() {
+        let (mut app, dir) = app_with("chat-shared", "Item,Qty\nApples,2\nPears,4\n");
+        app.config_path = dir.join("none.toml").to_string_lossy().into_owned();
+        // What `ask` hands its worker.
+        let held_graph = Arc::clone(&app.graph);
+        let held_index = Arc::clone(app.index.as_ref().unwrap());
+        assert!(Arc::ptr_eq(&held_graph, &app.graph));
+        // A real question too, answered while the edit lands.
+        app.chat_input = "How many pears?".into();
+        app.ask();
+        let inc = app.inc.as_mut().unwrap();
+        inc.record_edit(
+            CellEdit {
+                sheet: "Sheet1".into(),
+                row: 2,
+                col: 0,
+                value: CellValue::Text("Zebrafruit".into()),
+            },
+            std::time::Instant::now(),
+        );
+        inc.flush();
+        app.pending_dirty.extend(inc.take_dirty_ranges());
+        app.start_rebuild(None);
+        assert!(app.poll_rebuild(true));
+        // The app has a new graph and an index that knows the edit...
+        let index = app.index.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(&held_index, index));
+        assert!(!Arc::ptr_eq(&held_graph, &app.graph));
+        assert!(!index.search("Zebrafruit", 3).is_empty());
+        // ...and the held ones are as they were.
+        assert!(held_index
+            .search("Zebrafruit", 3)
+            .iter()
+            .all(|hit| hit.vector_only));
+        assert!(held_index
+            .search("Pears", 3)
+            .iter()
+            .any(|hit| !hit.vector_only));
+        assert_eq!(held_graph.nodes.len(), app.graph.nodes.len());
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        while app.chat_busy {
+            assert!(started.elapsed().as_secs() < 60, "the chat worker hung");
+            app.poll_chat(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.chat.last().unwrap().role, "echo-local");
+        // With no worker left, a rebuild takes the index without
+        // copying it: nothing else holds it.
+        drop((held_graph, held_index));
+        assert_eq!(Arc::strong_count(app.index.as_ref().unwrap()), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
