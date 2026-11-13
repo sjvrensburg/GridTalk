@@ -32,6 +32,12 @@ pub enum ToolRequest {
     },
     GraphOverview,
     WorkbookInfo,
+    Issues {
+        /// Check only this range (one sheet); the whole workbook,
+        /// defined names included, when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<String>,
+    },
 }
 
 /// What went wrong in a failed tool call, so a client can branch on
@@ -97,6 +103,7 @@ impl ToolRequest {
             ToolRequest::WhatIf { .. } => "what_if",
             ToolRequest::GraphOverview => "graph_overview",
             ToolRequest::WorkbookInfo => "workbook_info",
+            ToolRequest::Issues { .. } => "issues",
         }
     }
 
@@ -122,6 +129,7 @@ impl ToolRequest {
                 tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2, each with its address. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. For each column it says how far one formula is filled down, which cells hold a different formula, and which hold a typed value where the column has formulas. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("issues", format!("Problems in the workbook's formulas, errors first: formulas that evaluate to an error (and those that only pass on an error from a cell they read), references to a missing sheet, #REF! left by deleted cells, broken defined names, values saved in the file that recalculation disagrees with, links to other workbooks, and numbers written into a formula's arithmetic (=B5*1.05). Cells with the same problem in one column are one issue. range: check one sheet's range only (e.g. Sheet1!A1:F200); absent checks the whole workbook. At most {MAX_ISSUES_LISTED} issues are listed; the counts cover all."), schema(serde_json::json!({"range": range}), &[])),
                 tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
                 tool("graph_overview", "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)".into(), schema(serde_json::json!({}), &[]))
             ]
@@ -367,6 +375,7 @@ impl<'a> Tools<'a> {
                 }
             }
             ToolRequest::GetCells { range } => self.get_cells(range),
+            ToolRequest::Issues { range } => self.issues(range.as_deref()),
             ToolRequest::ListFormulas { range } => self.list_formulas(range),
             ToolRequest::WhatIf {
                 cell,
@@ -855,6 +864,166 @@ impl<'a> Tools<'a> {
         (columns, lines.join("\n"))
     }
 
+    /// `issues`: the workbook's problems (see
+    /// [`gridtalk_graph::issues`]), errors first, at most
+    /// [`MAX_ISSUES_LISTED`] of them with their first cells.
+    fn issues(&self, range: Option<&str>) -> ToolResult {
+        use gridtalk_graph::issues::{find_issues, IssueKind, Severity};
+        let scope = match range {
+            None => None,
+            Some(range) => {
+                let Some((sheet_name, r0, c0, r1, c1)) = parse_range_uncapped(range) else {
+                    return ToolResult::err("issues", ErrorKind::InvalidRange, range_error(range));
+                };
+                let Some(index) = self
+                    .wb
+                    .sheets
+                    .iter()
+                    .position(|s| sheet_name_eq(&s.name, &sheet_name))
+                else {
+                    return ToolResult::err(
+                        "issues",
+                        ErrorKind::UnknownSheet,
+                        format!("no sheet named {sheet_name}"),
+                    );
+                };
+                Some((index, (r0, c0, r1, c1)))
+            }
+        };
+        let found = find_issues(self.wb, self.calc.get(self.wb), scope);
+        let errors = found
+            .iter()
+            .filter(|i| i.severity() == Severity::Error)
+            .count();
+        let warnings = found.len() - errors;
+        let place = range.map_or("the workbook".to_string(), |r| r.to_string());
+        if found.is_empty() {
+            return ToolResult::ok(
+                "issues",
+                serde_json::json!({"range": range, "errors": 0, "warnings": 0, "total": 0, "listed": 0, "truncated": false, "issues": []}),
+                format!("no issues found in {place}"),
+            );
+        }
+        let mut lines = vec![format!(
+            "{errors} {} and {warnings} {} in {place}{}",
+            if errors == 1 { "error" } else { "errors" },
+            if warnings == 1 { "warning" } else { "warnings" },
+            if found.len() > MAX_ISSUES_LISTED {
+                format!(" (the first {MAX_ISSUES_LISTED} of {} listed)", found.len())
+            } else {
+                String::new()
+            }
+        )];
+        let mut listed_issues = Vec::new();
+        let mut saved_note = false;
+        for issue in found.iter().take(MAX_ISSUES_LISTED) {
+            let sheet = issue.sheet.as_deref().unwrap_or_default();
+            let address = |row: usize| {
+                issue
+                    .col
+                    .map(|col| gridtalk_graph::issues::cell_range(sheet, row, col, row))
+                    .unwrap_or_default()
+            };
+            let cells: Vec<serde_json::Value> = issue
+                .cells
+                .iter()
+                .take(MAX_ISSUE_CELLS_JSON)
+                .map(|cell| {
+                    let (result, error) = match &cell.result {
+                        Ok(v) => (Some(value_json(v)), None),
+                        Err(e) => (None, Some(e.to_string())),
+                    };
+                    serde_json::json!({
+                        "address": address(cell.row), "formula": cell.formula,
+                        "result": result, "error": error, "saved": cell.saved
+                    })
+                })
+                .collect();
+            let message = match issue.kind {
+                IssueKind::FormulaError => format!("evaluates to {}", issue.detail),
+                IssueKind::ErrorFromPrecedent => {
+                    format!("passes on an error from a cell it reads: {}", issue.detail)
+                }
+                IssueKind::MissingSheet => {
+                    format!("refers to a sheet the workbook lacks: {}", issue.detail)
+                }
+                IssueKind::DeletedReference => {
+                    "holds #REF!, a reference whose cells were deleted".to_string()
+                }
+                IssueKind::BrokenName => issue.detail.clone(),
+                IssueKind::SavedValueDiffers => {
+                    saved_note = true;
+                    "the value saved in the file differs from the recalculated one".to_string()
+                }
+                IssueKind::ExternalReference => format!(
+                    "reads another workbook ({}), which GridTalk cannot open; the value shown is the one the file saved",
+                    issue.detail
+                ),
+                IssueKind::ConstantInFormula => format!(
+                    "writes {} into the formula's arithmetic; an assumption written there cannot be changed or traced from a cell",
+                    issue.detail
+                ),
+            };
+            let place = match (&issue.name, issue.range()) {
+                (Some(name), _) => format!("name {name}"),
+                (None, Some(range)) if issue.cells.len() > 1 => {
+                    format!("{range} ({} cells)", issue.cells.len())
+                }
+                (None, Some(range)) => range,
+                (None, None) => String::new(),
+            };
+            let mut line = format!(
+                "{} {} {place}: {message}",
+                issue.severity().as_str(),
+                issue.kind.as_str()
+            );
+            let examples: Vec<String> = issue
+                .cells
+                .iter()
+                .map(|cell| {
+                    let mut text = format!("{} = {}", address(cell.row), cell.formula);
+                    if issue.kind == IssueKind::SavedValueDiffers {
+                        let now = match &cell.result {
+                            Ok(v) => v.display(),
+                            Err(e) => e.to_string(),
+                        };
+                        text.push_str(&format!(
+                            " saved {}, recalculates to {now}",
+                            cell.saved.as_deref().unwrap_or("nothing")
+                        ));
+                    } else if issue.kind == IssueKind::ExternalReference {
+                        if let Some(saved) = &cell.saved {
+                            text.push_str(&format!(" (saved {saved})"));
+                        }
+                    }
+                    text
+                })
+                .collect();
+            if !examples.is_empty() {
+                line.push_str(&format!("; {}", listed(&examples, MAX_ISSUE_CELLS_TEXT)));
+            }
+            lines.push(line);
+            listed_issues.push(serde_json::json!({
+                "kind": issue.kind, "severity": issue.severity(), "sheet": issue.sheet,
+                "range": issue.range(), "name": issue.name, "detail": issue.detail,
+                "message": message, "count": issue.cells.len(), "cells": cells,
+                "cells_truncated": issue.cells.len() > MAX_ISSUE_CELLS_JSON,
+            }));
+        }
+        if saved_note {
+            lines.push("(a saved value differs when the file was saved without recalculating, a cell it reads changed since, or Gridcraft computes a function differently from the program that saved it)".into());
+        }
+        ToolResult::ok(
+            "issues",
+            serde_json::json!({
+                "range": range, "errors": errors, "warnings": warnings, "total": found.len(),
+                "listed": listed_issues.len(), "truncated": found.len() > MAX_ISSUES_LISTED,
+                "issues": listed_issues
+            }),
+            lines.join("\n"),
+        )
+    }
+
     /// Legacy string interface kept for the planner's text context:
     /// parses `key=value;key=value` and renders the typed result.
     pub fn execute(&self, tool: &str, args: &str) -> String {
@@ -904,9 +1073,12 @@ impl<'a> Tools<'a> {
             }
             "graph_overview" => ToolRequest::GraphOverview,
             "workbook_info" => ToolRequest::WorkbookInfo,
+            "issues" => ToolRequest::Issues {
+                range: arg("range").filter(|r| !r.is_empty()),
+            },
             other => {
                 return format!(
-                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, what_if, graph_overview"
+                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, what_if, issues, graph_overview"
                 )
             }
         };
@@ -1022,6 +1194,13 @@ fn listed(items: &[String], max: usize) -> String {
     }
     out
 }
+
+/// Most issues `issues` lists; the counts cover every issue.
+pub const MAX_ISSUES_LISTED: usize = 40;
+/// Cells an issue shows in its text line.
+const MAX_ISSUE_CELLS_TEXT: usize = 3;
+/// Cells an issue carries in its JSON.
+const MAX_ISSUE_CELLS_JSON: usize = 20;
 
 /// Largest range a GetCells/ListFormulas call may materialise.
 pub const MAX_RANGE_CELLS: usize = 10_000;
@@ -1219,6 +1398,82 @@ mod tests {
             .and_then(|n| n.parse().ok())
             .expect("row label");
         assert_eq!(rows[0][0]["value"], format!("BG-{}", number - 1));
+    }
+
+    /// `issues` over a CSV: an error that starts in one cell and is
+    /// passed on, a number written into a column of formulas, the
+    /// typed request with and without a range, and the legacy form.
+    #[test]
+    fn issues_lists_errors_first_and_groups_a_column() {
+        let wb = parse_delimited(
+            "demo",
+            "Calc",
+            "Qty,Price,Net,Share\n2,0,=A2*1.15,=A2/B2\n4,5,=A3*1.15,=D2+1\n6,7,=A4*1.15,=A4/B4\n",
+            ',',
+        );
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let res = tools.call(&ToolRequest::Issues { range: None });
+        assert!(res.ok, "{}", res.text);
+        assert_eq!(res.data["errors"], 1, "{}", res.text);
+        assert_eq!(res.data["warnings"], 2, "{}", res.text);
+        let issues = res.data["issues"].as_array().unwrap();
+        assert_eq!(issues[0]["kind"], "formula_error");
+        assert_eq!(issues[0]["range"], "Calc!D2");
+        assert_eq!(issues[0]["cells"][0]["address"], "Calc!D2");
+        let net = issues
+            .iter()
+            .find(|i| i["kind"] == "constant_in_formula")
+            .expect("the written-in 1.15");
+        assert_eq!(net["range"], "Calc!C2:C4");
+        assert_eq!(net["count"], 3);
+        assert_eq!(net["detail"], "1.15");
+        assert!(issues
+            .iter()
+            .any(|i| i["kind"] == "error_from_precedent" && i["range"] == "Calc!D3"));
+        let lines: Vec<&str> = res.text.lines().collect();
+        assert_eq!(lines[0], "1 error and 2 warnings in the workbook");
+        assert!(
+            lines[1].starts_with("error formula_error Calc!D2: evaluates to #DIV/0!"),
+            "{}",
+            res.text
+        );
+        assert!(
+            res.text
+                .contains("warning constant_in_formula Calc!C2:C4 (3 cells): writes 1.15"),
+            "{}",
+            res.text
+        );
+
+        // A range limits the check; a column without problems has none.
+        let res = tools.call(&ToolRequest::Issues {
+            range: Some("calc!A1:B4".into()),
+        });
+        assert_eq!(res.text, "no issues found in calc!A1:B4");
+        assert_eq!(res.data["total"], 0);
+        let res = tools.call(&ToolRequest::Issues {
+            range: Some("Nope!A1".into()),
+        });
+        assert_eq!(res.data["error"]["kind"], "unknown_sheet");
+
+        // The JSON request: `range` is optional, unknown fields are not.
+        let req: ToolRequest = serde_json::from_str(r#"{"tool":"issues"}"#).unwrap();
+        assert_eq!(req, ToolRequest::Issues { range: None });
+        assert!(
+            serde_json::from_str::<ToolRequest>(r#"{"tool":"issues","sheet":"Calc"}"#).is_err()
+        );
+        assert!(tools
+            .execute("issues", "")
+            .starts_with("1 error and 2 warnings"));
+        assert!(tools
+            .execute("issues", "range=Calc!D2:D4")
+            .starts_with("1 error and 1 warning in Calc!D2:D4"));
     }
 
     fn fixture() -> (WorkbookSnapshot, Graph, HybridIndex) {

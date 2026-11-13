@@ -109,6 +109,23 @@ case-insensitively, and cells must lie inside the sheet grid
   (a formula that has been typed over).
 - `what_if`: before and after values of a target when one cell is
   set to a number, evaluated on a copy.
+- `issues`: problems in the workbook's formulas, errors first. Each
+  issue has a `kind`, a `severity` (`error` or `warning`), the
+  `range` of its cells (or the defined `name`), a `detail`, a
+  `message`, a `count` and up to 20 `cells` (`address`, `formula`,
+  typed `result` or `error`, and the value the file `saved`). Errors:
+  `formula_error` (evaluates to an error that starts there),
+  `missing_sheet`, `deleted_reference` (`#REF!` in the formula) and
+  `broken_name`. Warnings: `error_from_precedent` (passes on an error
+  from a cell it reads), `saved_value_differs` (the file's saved
+  value disagrees with Gridcraft's recalculation; volatile functions
+  such as `NOW()` are skipped), `external_reference` (reads another
+  workbook) and `constant_in_formula` (a number other than 0 or 1
+  written into the formula's arithmetic, `=B5*1.05`). Cells of one
+  column with the same problem and detail are one issue. An optional
+  `range` checks one sheet's range and leaves defined names out. At
+  most 40 issues are listed; `errors`, `warnings` and `total` count
+  all of them, and `truncated` says when more exist.
 - `graph_overview`: nodes and edges, capped at 500 / 2,000.
 
 Formula results are typed like `get_cells` values:

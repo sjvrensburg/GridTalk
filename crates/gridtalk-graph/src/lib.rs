@@ -2611,6 +2611,7 @@ impl IncrementalSnapshot {
 
 mod calc;
 pub mod eval;
+pub mod issues;
 pub mod lineage;
 
 /// Render a region as a cited passage for the LLM context.

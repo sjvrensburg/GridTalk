@@ -176,6 +176,22 @@ Dependencies:
 - [ ] Not done: a local model whose chat template llama.cpp's built-in applier does not recognise fails in the local backend (seen with a Gemma 4 GGUF; the limit predates the loop and applies to `ask`); needs a Jinja template path or a prompt-format setting
 - [ ] Not done: the loop has been run by hand against one external model and one local model on small sheets, not measured on the 1,334-question set that motivated it; `scripts/hermit` passes no trace through
 
+## Ideas from OfficeCLI and AionUi (2026-11-13)
+
+Reviewed [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) and [AionUi](https://github.com/iOfficeAI/AionUi) (both Apache-2.0; credit them in a NOTICE if code or skill text is adapted). Both are built for agents that create and edit Office files, so their editing features (`set`/`add`, `batch`, template `merge`, `dump` round-trips, creating pivots), resident mode (MCP sessions and `EvalCache` already cover it), the single `command`-string MCP tool (it would undo decision 0006) and AionUi's workbook-to-Markdown conversion (drops formulas and structure) are not taken.
+
+- [x] `issues` tool (2026-11-13): read-only workbook health checks in `gridtalk_graph::issues`, served by `tools.rs` to the planner, `tools call`, MCP and the tool loop. Errors: formulas that evaluate to an error starting there, references to a missing sheet, `#REF!` left in a formula, broken defined names (Excel's own `_xlnm.` names skipped). Warnings: errors passed on from a cell a formula reads (through Gridcraft's precedents), saved values that Gridcraft's recalculation disagrees with (volatile functions skipped), links to other workbooks (read from the formula text, since Gridcraft's parser does not take them), and numbers other than 0 and 1 written into a formula's arithmetic. Cells of one column with the same problem are one issue; an optional range limits the check. The planner runs it for questions about errors, broken, stale or hard-coded values. Modelled on OfficeCLI's `view issues`. Not done: numbers Excel's General format shows rounded (needs number formats from the kept Gridcraft workbook's styles), and a 100,000-row sheet takes about 0.4 s beyond the recalculation
+- [ ] `filter` tool: exact row selection by column name within a region (`{"column": "Region", "op": "=", "value": "EMEA"}`, several conditions joined by `and`), typed rather than OfficeCLI's CSS-style selector string so it fits `deny_unknown_fields` and the llama.cpp grammar; returns the matching rows with their addresses
+- [ ] `aggregate` tool: group a region by one column and sum/count/mean/min/max another, plus per-column stats (count, blanks, min, max, mean), so a model never does the arithmetic itself; every result cites the range it read
+- [ ] Domain skills as reading rules: short adapter `skills/*.md` adapted from OfficeCLI's financial-model skill (blue text inputs, black formulas, green links to other sheets, red links to other files; inputs → calculations → outputs zones), to help pick a `what_if` input and explain a model's layout. Needs cell font colour available to the tools from the kept Gridcraft workbook. Keep each skill far shorter than OfficeCLI's (400–800 lines) so it fits a local model's context, and model-agnostic (decision 0006)
+
+Smaller items:
+
+- [ ] "Did you mean …?" in tool errors: `UnknownSheet` (and unknown columns once `filter` exists) suggest the closest name, reusing the planner's `edit_distance` (`investigate.rs`)
+- [ ] Keep tool schemas free of union types (`"type": [...]`): Gemini's function calling rejects them with HTTP 400 (OfficeCLI's finding); use `anyOf` if a union is ever needed. None today (checked 2026-11-13)
+- [ ] `gridtalk mcp install <client>`: write the MCP config for Claude Code, Cursor or VS Code, as `officecli mcp claude` does
+- [ ] Low priority: render a cited range to HTML for MCP clients that cannot show a grid
+
 Deprioritised: macOS CI (decision 0004), the Tantivy swap, the HTTP MCP
 transport, ODS formula import (needs upstream Gridcraft work) and an MCP
 write path (a product decision, not a fix).
