@@ -132,31 +132,54 @@ struct Generated {
 }
 
 /// The model's chat template applied to `(role, content)` messages,
-/// ending where the assistant's reply starts. ChatML when the model
+/// ending where the assistant's reply starts, and whether tokenizing
+/// it should add the model's start token (`false` when the template
+/// wrote it already). llama.cpp's built-in applier handles the
+/// template families it knows; any other template the GGUF carries
+/// is rendered as Jinja (see [`crate::jinja`]). ChatML when the model
 /// carries no template.
-fn render_prompt(model: &LlamaModel, messages: &[(&str, String)]) -> Result<String, InferError> {
-    match model.chat_template(None) {
-        Ok(tmpl) => {
-            let messages = messages
-                .iter()
-                .map(|(role, content)| {
-                    LlamaChatMessage::new((*role).into(), content.clone())
-                        .map_err(|e| InferError::EngineUnavailable(e.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            model
-                .apply_chat_template(&tmpl, &messages, true)
-                .map_err(|e| InferError::EngineUnavailable(format!("chat template: {e}")))
+fn render_prompt(
+    model: &LlamaModel,
+    messages: &[(&str, String)],
+) -> Result<(String, bool), InferError> {
+    let Ok(tmpl) = model.chat_template(None) else {
+        let mut prompt = String::new();
+        for (role, content) in messages {
+            prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
         }
-        Err(_) => {
-            let mut prompt = String::new();
-            for (role, content) in messages {
-                prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
-            }
-            prompt.push_str("<|im_start|>assistant\n");
-            Ok(prompt)
+        prompt.push_str("<|im_start|>assistant\n");
+        return Ok((prompt, true));
+    };
+    let chat = messages
+        .iter()
+        .map(|(role, content)| {
+            LlamaChatMessage::new((*role).into(), content.clone())
+                .map_err(|e| InferError::EngineUnavailable(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let builtin = match model.apply_chat_template(&tmpl, &chat, true) {
+        Ok(prompt) => return Ok((prompt, true)),
+        Err(e) => e,
+    };
+    let source = tmpl.to_str().map_err(|e| {
+        InferError::EngineUnavailable(format!("chat template: {builtin}; not UTF-8: {e}"))
+    })?;
+    let vocab = model.vocab();
+    let piece = |token: LlamaToken| {
+        if token.0 < 0 {
+            return String::new();
         }
-    }
+        String::from_utf8_lossy(&vocab.token_to_piece(token, true, None)).into_owned()
+    };
+    let bos = piece(vocab.bos());
+    let prompt =
+        crate::jinja::render(source, messages, &bos, &piece(vocab.eos())).map_err(|e| {
+            InferError::EngineUnavailable(format!(
+                "chat template: llama.cpp does not know it ({builtin}), and as Jinja: {e}"
+            ))
+        })?;
+    let add_start = bos.is_empty() || !prompt.starts_with(&bos);
+    Ok((prompt, add_start))
 }
 
 /// One llama.cpp context and the tokens it holds. A second
@@ -206,8 +229,11 @@ impl<'m> LocalSession<'m> {
     /// text protocol, through the model's chat template.
     fn tokens_of(&self, req: &TurnRequest) -> Result<Vec<LlamaToken>, InferError> {
         let messages = turns::text_messages(req.messages, req.tools);
-        let prompt = render_prompt(self.model, &messages)?;
-        Ok(self.model.vocab().tokenize(prompt.as_bytes(), true, true))
+        let (prompt, add_start) = render_prompt(self.model, &messages)?;
+        Ok(self
+            .model
+            .vocab()
+            .tokenize(prompt.as_bytes(), add_start, true))
     }
 
     /// Generate up to `max_tokens` after `prompt_tokens`, the reply
@@ -628,14 +654,14 @@ impl LlamaCppBackend {
                 return Err(InferError::Cancelled);
             }
             // Prompt via the model's own chat template when it has one.
-            let prompt = render_prompt(
+            let (prompt, add_start) = render_prompt(
                 model,
                 &[("system", req.system.clone()), ("user", req.user.clone())],
             )?;
             // Context comes from the model's own training length, not a
             // hard-coded window; fall back to MAX_CONTEXT when unknown.
             let context_len = context_window(model.n_ctx_train(), self.n_ctx);
-            let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
+            let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), add_start, true);
             if prompt_tokens.is_empty() {
                 return Err(InferError::EngineUnavailable("empty prompt".into()));
             }

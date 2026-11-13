@@ -54,6 +54,7 @@ impl From<std::io::Error> for InferError {
 
 pub type CancelToken = Arc<AtomicBool>;
 
+pub mod jinja;
 pub mod models;
 pub mod probe;
 pub mod transport;
