@@ -404,7 +404,7 @@ fn selection_context(
         .map(|n| n.id);
     if let Some(id) = covering {
         if let Some(node) = graph.nodes.iter().find(|n| n.id == id) {
-            out.push_str(&format!("node {} ({})\n", node.id, node.label));
+            out.push_str(&format!("node {} ({})\n", node.id, node.cited_label()));
             let mut shown = 0usize;
             for e in &graph.edges {
                 let (other, arrow) = if e.from == id {
@@ -419,7 +419,7 @@ fn selection_context(
                     break;
                 }
                 if let Some(t) = graph.nodes.iter().find(|n| n.id == other) {
-                    out.push_str(&format!(" {}{} {}\n", arrow, e.kind, t.label));
+                    out.push_str(&format!(" {}{} {}\n", arrow, e.kind, t.cited_label()));
                     shown += 1;
                 }
             }

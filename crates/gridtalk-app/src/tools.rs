@@ -302,7 +302,7 @@ impl<'a> Tools<'a> {
                 match node {
                     Some(n) => {
                         let mut edges = Vec::new();
-                        let mut lines = vec![format!("node {} ({})", n.id, n.label)];
+                        let mut lines = vec![format!("node {} ({})", n.id, n.cited_label())];
                         // Counted per listed entry: a self-edge (a
                         // running total) is listed both out and in, and
                         // an edge to a missing node is not listed.
@@ -323,7 +323,7 @@ impl<'a> Tools<'a> {
                                 if edges.len() >= MAX_EXPAND_EDGES {
                                     continue;
                                 }
-                                lines.push(format!(" {left}{}{right} {}", e.kind, t.label));
+                                lines.push(format!(" {left}{}{right} {}", e.kind, t.cited_label()));
                                 edges.push(serde_json::json!({
                                     "direction": direction, "kind": e.kind, "label": t.label,
                                     "range": t.range.as_ref().map(|r| r.a1())
@@ -1197,6 +1197,29 @@ mod tests {
         });
         let listed = out2.data["edges"].as_array().unwrap().len();
         assert_eq!(out2.data["total_edges"], listed);
+        // The text names every neighbour with its range, so the model
+        // can cite what the column reads (#39).
+        let amount = g2.nodes.iter().find(|n| n.label == "Amount").unwrap();
+        let amount_a1 = amount.range.as_ref().unwrap().a1();
+        let running_a1 = running.range.as_ref().unwrap().a1();
+        assert!(
+            out2.text
+                .contains(&format!("node {} (Running  {running_a1})", running.id)),
+            "{}",
+            out2.text
+        );
+        assert!(
+            out2.text
+                .contains(&format!("-depends_on-> Amount  {amount_a1}")),
+            "{}",
+            out2.text
+        );
+        assert!(
+            out2.text
+                .contains(&format!("-depends_on-> Running  {running_a1}")),
+            "{}",
+            out2.text
+        );
         assert_eq!(out2.data["truncated"], false);
         let info = tools.call(&ToolRequest::WorkbookInfo);
         assert_eq!(info.data["sheets"][0]["cols"], 250);

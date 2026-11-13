@@ -315,6 +315,31 @@ pub struct Node {
     pub visibility: Option<SheetVisibility>,
 }
 
+impl Node {
+    /// The label with the node's range, for text a model reads and
+    /// cites: `Rate per Hour  Staff!C4:C44`. A label that already holds
+    /// the range (a region's) is returned as is. A column with no
+    /// heading (an empty label, or the column letter that stands in for
+    /// one) gets its range in place of a name, so it never prints blank
+    /// or as a bare letter with no sheet.
+    pub fn cited_label(&self) -> String {
+        let Some(r) = &self.range else {
+            return self.label.clone();
+        };
+        let a1 = r.a1();
+        let label = self.label.trim();
+        let unheaded =
+            label.is_empty() || (self.kind == NodeKind::Column && label == col_name(r.c0));
+        if unheaded {
+            a1
+        } else if self.label.contains(&a1) {
+            self.label.clone()
+        } else {
+            format!("{}  {a1}", self.label)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub from: usize,
@@ -2543,6 +2568,40 @@ pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cited_label_carries_the_range_and_stands_in_for_a_missing_heading() {
+        let range = RangeRef {
+            sheet: "Staff".into(),
+            r0: 3,
+            c0: 2,
+            r1: 43,
+            c1: 2,
+        };
+        let node = |kind, label: &str| Node {
+            id: 0,
+            kind,
+            label: label.into(),
+            range: Some(range.clone()),
+            visibility: None,
+        };
+        assert_eq!(
+            node(NodeKind::Column, "Rate per Hour").cited_label(),
+            "Rate per Hour  Staff!C4:C44"
+        );
+        // No heading: the range in place of a blank or a bare letter.
+        assert_eq!(node(NodeKind::Column, "").cited_label(), "Staff!C4:C44");
+        assert_eq!(node(NodeKind::Column, "C").cited_label(), "Staff!C4:C44");
+        // A region's label already holds its range.
+        let region = node(NodeKind::Region, "Staff region Staff!C4:C44");
+        assert_eq!(region.cited_label(), "Staff region Staff!C4:C44");
+        // No range: the label alone.
+        let sheet = Node {
+            range: None,
+            ..node(NodeKind::Sheet, "Staff")
+        };
+        assert_eq!(sheet.cited_label(), "Staff");
+    }
 
     #[test]
     fn render_passage_keeps_each_sheet_row_on_one_line() {
