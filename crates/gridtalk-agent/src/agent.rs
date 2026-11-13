@@ -86,6 +86,16 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         .unwrap_or_default()
 }
 
+/// Whether a tool's result carries the workbook's content (cells,
+/// formulas, figures, problems, the sheet list), not only where things
+/// are (`search`) or how they connect (`expand`, `graph_overview`).
+fn reads_content(tool: &str) -> bool {
+    matches!(
+        tool,
+        "get_cells" | "list_formulas" | "filter" | "aggregate" | "issues" | "workbook_info"
+    )
+}
+
 /// The answer when the model's last turn was a call in its own
 /// format rather than an answer.
 pub const MARKUP_ANSWER: &str = "The model did not answer: its last reply was a tool call in a format GridTalk does not read, and no tool calls were left.";
@@ -405,11 +415,13 @@ pub(crate) fn tool_loop(
         .map(|s| s.name.len() + s.description.len() + s.parameters.to_string().len())
         .sum();
     let first_call = ask.adapter.is_none_or(|a| a.first_call);
-    // Whether the planner read more than its search hits: a call
-    // that ran and returned a result. Such reads put tool results in
-    // front of the model, which is what the forced first call is for
-    // (#47).
-    let opening_read = trail.iter().any(|s| s.ok && s.tool != "search");
+    // Whether the planner read some of the workbook's content: a call
+    // that ran and returned cells, formulas, figures, problems or the
+    // sheet list. Such reads put tool results in front of the model,
+    // which is what the forced first call is for (#47). Search hits
+    // and graph expansions do not count: with only those, Gemma 4 E2B
+    // answered a value lookup with a search score.
+    let opening_read = trail.iter().any(|s| s.ok && reads_content(&s.tool));
 
     let mut system = LOOP_PROMPT.to_string();
     system.push_str(&gridtalk_adapter::prompt_text(
@@ -1454,10 +1466,18 @@ mod tests {
             )]),
             says("E1 is paid 100 an hour (Staff!B2)."),
         ]);
-        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 8, None, true);
+        let (inv, _) = run_with(
+            &fixture,
+            &backend,
+            "How is the labour cost worked out?",
+            8,
+            None,
+            true,
+        );
         let asked = backend.asked();
-        // The planner read the staff table, so the first turn was free
-        // to answer (#47); its markup was sent back all the same.
+        // The planner read the cost column's formulas, so the first
+        // turn was free to answer (#47); its markup was sent back all
+        // the same.
         assert_eq!(asked[0].0, ToolChoice::Auto);
         let note = asked[1].1.last().unwrap();
         assert_eq!(note.role, Role::User);
@@ -1468,15 +1488,59 @@ mod tests {
 
         // Each such reply spends a step; when the answer-only turn is
         // markup too, the answer says the model did not answer.
+        // (With two steps the planner reads no content, so the first
+        // turn must be a call and its markup gets that nudge instead.)
         let markup = || says("<tool_call>get_cells</tool_call>");
-        let backend = Scripted::new(vec![markup(), markup(), markup()]);
-        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 2, None, true);
+        let backend = Scripted::new(vec![markup(), markup(), markup(), markup()]);
+        let (inv, _) = run_with(
+            &fixture,
+            &backend,
+            "How is the labour cost worked out?",
+            2,
+            None,
+            true,
+        );
         let choices: Vec<ToolChoice> = backend.asked().iter().map(|(c, _)| *c).collect();
         assert_eq!(
             choices,
-            [ToolChoice::Auto, ToolChoice::Auto, ToolChoice::None]
+            [
+                ToolChoice::Required,
+                ToolChoice::Auto,
+                ToolChoice::Auto,
+                ToolChoice::None
+            ]
         );
         assert_eq!(inv.answer_body(), MARKUP_ANSWER);
+    }
+
+    /// An opening of search hits and graph expansions only (no cells,
+    /// formulas or figures) still makes the first turn a call: with
+    /// only those, a small model answered a value lookup with a search
+    /// score.
+    #[test]
+    fn an_opening_of_structure_only_keeps_the_first_call() {
+        let fixture = Fixture::new();
+        let backend = Scripted::new(vec![
+            calls(vec![call(
+                1,
+                "get_cells",
+                serde_json::json!({"range": "Staff!A2:B2"}),
+            )]),
+            says("E1 is paid 100 an hour (Staff!B2)."),
+        ]);
+        // Two steps: the planner gets as far as a search and one
+        // expansion.
+        let (inv, seen) = run_with(&fixture, &backend, "What is E1 paid?", 2, None, true);
+        let opening: Vec<&str> = seen.events[0]["opening"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["tool"].as_str().unwrap())
+            .collect();
+        assert!(opening.iter().all(|t| !reads_content(t)), "{opening:?}");
+        assert_eq!(seen.events[0]["opening_read"], false);
+        assert_eq!(backend.asked()[0].0, ToolChoice::Required);
+        assert_eq!(inv.answer_body(), "E1 is paid 100 an hour (Staff!B2).");
     }
 
     #[test]
