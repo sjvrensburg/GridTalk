@@ -332,10 +332,10 @@ impl Node {
             label.is_empty() || (self.kind == NodeKind::Column && label == col_name(r.c0));
         if unheaded {
             a1
-        } else if self.label.contains(&a1) {
-            self.label.clone()
+        } else if label.contains(&a1) {
+            label.to_string()
         } else {
-            format!("{}  {a1}", self.label)
+            format!("{label}  {a1}")
         }
     }
 }
@@ -2592,6 +2592,10 @@ mod tests {
         // No heading: the range in place of a blank or a bare letter.
         assert_eq!(node(NodeKind::Column, "").cited_label(), "Staff!C4:C44");
         assert_eq!(node(NodeKind::Column, "C").cited_label(), "Staff!C4:C44");
+        assert_eq!(
+            node(NodeKind::Column, " Rate ").cited_label(),
+            "Rate  Staff!C4:C44"
+        );
         // A region's label already holds its range.
         let region = node(NodeKind::Region, "Staff region Staff!C4:C44");
         assert_eq!(region.cited_label(), "Staff region Staff!C4:C44");
