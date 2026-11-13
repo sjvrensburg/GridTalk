@@ -378,3 +378,16 @@ fn commands_succeed_with_exit_0() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn graph_and_view_print_each_node_with_its_range() {
+    let demo = demo();
+    let graph = stdout(&expect(&["graph", &demo], 0));
+    assert!(graph.contains("[column] Total  Sheet1!D1:D4"), "{graph}");
+    assert!(
+        graph.contains("[region] Sheet1 region Sheet1!A1:D4\n"),
+        "{graph}"
+    );
+    let view = stdout(&expect(&["view", &demo], 0));
+    assert!(view.contains("  3 Item  Sheet1!A1:A4\n"), "{view}");
+}
