@@ -92,7 +92,13 @@ case-insensitively, and cells must lie inside the sheet grid
   when a larger request was cut down.
 - `expand`: graph neighbours of the region or column containing a
   range, at most 200 edges; `total_edges` and `truncated` tell when
-  there are more.
+  there are more. When no node contains the range (a column run
+  across two sections of a table, or a table made of several
+  regions), the nodes it overlaps are expanded one after the other:
+  `contained: false`, `overlapping` (how many), and `nodes`, up to
+  four, each shaped like a single expansion. Within one column those
+  are column nodes, otherwise region nodes. A range that overlaps no
+  node is still `no_graph_node`.
 - `get_cells`: typed values; a formula cell carries `result`, what it
   computes, and `cached_result`, what the file cached, both typed,
   plus `error` when evaluation failed. Every cell carries its

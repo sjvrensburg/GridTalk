@@ -191,6 +191,8 @@ pub fn error_payload(kind: ErrorKind, message: &str) -> serde_json::Value {
 pub const MAX_SEARCH_LIMIT: usize = 25;
 /// Most edges `expand` returns; the rest are counted, not listed.
 pub const MAX_EXPAND_EDGES: usize = 200;
+/// Most nodes `expand` expands for a range no node contains.
+pub const MAX_EXPAND_OVERLAP: usize = 4;
 
 fn default_limit() -> usize {
     3
@@ -231,7 +233,7 @@ impl ToolRequest {
             "tools": [
                 tool("workbook_info", "Sheets (name, rows, cols, visibility: visible/hidden/veryHidden), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
                 tool("search", format!("Hybrid lexical+embedding search over workbook regions. Returns ranked regions with a cited passage each. limit: 1-{MAX_SEARCH_LIMIT} (default 3; larger values are clamped and the response says so)."), schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "default": 3}}), &["query"])),
-                tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4. At most {MAX_EXPAND_EDGES} edges; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
+                tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4; when no node contains it (a column across two sections of a table), each node it overlaps, up to {MAX_EXPAND_OVERLAP}. At most {MAX_EXPAND_EDGES} edges a node; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2, each with its address. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("list_formulas", format!("Formulas in a range (e.g. Sheet1!A1:D40) with their evaluated values. For each column it says how far one formula is filled down, which cells hold a different formula, and which hold a typed value where the column has formulas. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("filter", format!("Rows of a table whose columns meet every condition in where, e.g. {{\"column\": \"Region\", \"op\": \"=\", \"value\": \"EMEA\"}}. range: the table or any cell in it (several rows: only those rows). column: a heading or letter. Numbers compare as numbers, text ignoring case; formula cells by their result. Rows carry cell addresses. limit: 1-{MAX_FILTER_ROWS} (default {DEFAULT_FILTER_ROWS})"), schema(serde_json::json!({
@@ -471,56 +473,11 @@ impl<'a> Tools<'a> {
                                         .unwrap_or(usize::MAX)
                                 })
                         });
-                match node {
-                    Some(n) => {
-                        let mut edges = Vec::new();
-                        let mut lines = vec![format!("node {} ({})", n.id, n.cited_label())];
-                        // Counted per listed entry: a self-edge (a
-                        // running total) is listed both out and in, and
-                        // an edge to a missing node is not listed.
-                        let mut total_edges = 0usize;
-                        for e in &self.graph.edges {
-                            let sides = [
-                                (e.from == n.id, e.to, "out", "-", "->"),
-                                (e.to == n.id, e.from, "in", "<-", "-"),
-                            ];
-                            for (touches, other, direction, left, right) in sides {
-                                if !touches {
-                                    continue;
-                                }
-                                let Some(t) = nodes_by_id.get(&other) else {
-                                    continue;
-                                };
-                                total_edges += 1;
-                                if edges.len() >= MAX_EXPAND_EDGES {
-                                    continue;
-                                }
-                                lines.push(format!(" {left}{}{right} {}", e.kind, t.cited_label()));
-                                edges.push(serde_json::json!({
-                                    "direction": direction, "kind": e.kind, "label": t.label,
-                                    "range": t.range.as_ref().map(|r| r.a1())
-                                }));
-                            }
-                        }
-                        let truncated = total_edges > edges.len();
-                        if truncated {
-                            lines.push(format!(
-                                "({} of {total_edges} edges shown; the cap is {MAX_EXPAND_EDGES})",
-                                edges.len()
-                            ));
-                        }
-                        ToolResult::ok(
-                            "expand",
-                            serde_json::json!({"node_id": n.id, "label": n.label, "range": n.range.as_ref().map(|r| r.a1()), "edges": edges, "total_edges": total_edges, "truncated": truncated}),
-                            lines.join("\n"),
-                        )
-                    }
-                    None => ToolResult::err(
-                        "expand",
-                        ErrorKind::NoGraphNode,
-                        format!("no graph node for range {range}"),
-                    ),
+                if let Some(n) = node {
+                    let (data, text) = self.expand_node(n, &nodes_by_id);
+                    return ToolResult::ok("expand", data, text);
                 }
+                self.expand_overlapping(range, wanted, &nodes_by_id)
             }
             ToolRequest::GetCells { range } => self.get_cells(range),
             ToolRequest::Issues { range } => self.issues(range.as_deref()),
@@ -712,6 +669,138 @@ impl<'a> Tools<'a> {
                 )
             }
         }
+    }
+
+    /// One node and its edges, as `expand` prints it.
+    fn expand_node(
+        &self,
+        n: &gridtalk_graph::Node,
+        nodes_by_id: &std::collections::HashMap<usize, &gridtalk_graph::Node>,
+    ) -> (serde_json::Value, String) {
+        let mut edges = Vec::new();
+        let mut lines = vec![format!("node {} ({})", n.id, n.cited_label())];
+        // Counted per listed entry: a self-edge (a running total) is
+        // listed both out and in, and an edge to a missing node is
+        // not listed.
+        let mut total_edges = 0usize;
+        for e in &self.graph.edges {
+            let sides = [
+                (e.from == n.id, e.to, "out", "-", "->"),
+                (e.to == n.id, e.from, "in", "<-", "-"),
+            ];
+            for (touches, other, direction, left, right) in sides {
+                if !touches {
+                    continue;
+                }
+                let Some(t) = nodes_by_id.get(&other) else {
+                    continue;
+                };
+                total_edges += 1;
+                if edges.len() >= MAX_EXPAND_EDGES {
+                    continue;
+                }
+                lines.push(format!(" {left}{}{right} {}", e.kind, t.cited_label()));
+                edges.push(serde_json::json!({
+                    "direction": direction, "kind": e.kind, "label": t.label,
+                    "range": t.range.as_ref().map(|r| r.a1())
+                }));
+            }
+        }
+        let truncated = total_edges > edges.len();
+        if truncated {
+            lines.push(format!(
+                "({} of {total_edges} edges shown; the cap is {MAX_EXPAND_EDGES})",
+                edges.len()
+            ));
+        }
+        (
+            serde_json::json!({"node_id": n.id, "label": n.label, "range": n.range.as_ref().map(|r| r.a1()), "edges": edges, "total_edges": total_edges, "truncated": truncated}),
+            lines.join("\n"),
+        )
+    }
+
+    /// `expand` on a range no node contains: a column run across two
+    /// sections of a table, or a table made of several regions (#48).
+    /// The nodes it overlaps are expanded one after the other: the
+    /// column nodes for a range within one column, the region nodes
+    /// otherwise (either kind when the preferred one has none).
+    fn expand_overlapping(
+        &self,
+        range: &str,
+        wanted: &str,
+        nodes_by_id: &std::collections::HashMap<usize, &gridtalk_graph::Node>,
+    ) -> ToolResult {
+        use gridtalk_graph::NodeKind;
+        let none = || {
+            ToolResult::err(
+                "expand",
+                ErrorKind::NoGraphNode,
+                format!("no graph node for range {range}; nothing in the graph covers any of its cells (workbook_info lists the tables)"),
+            )
+        };
+        let Some((sheet, r0, c0, r1, c1)) = parse_range_uncapped(range) else {
+            return none();
+        };
+        let overlapping = |kind: NodeKind| -> Vec<&gridtalk_graph::Node> {
+            let mut found: Vec<&gridtalk_graph::Node> = self
+                .graph
+                .nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .filter(|n| {
+                    n.range.as_ref().is_some_and(|r| {
+                        sheet_name_eq(&r.sheet, &sheet)
+                            && r.r0 <= r1
+                            && r0 <= r.r1
+                            && r.c0 <= c1
+                            && c0 <= r.c1
+                    })
+                })
+                .collect();
+            found.sort_by_key(|n| n.range.as_ref().map(|r| (r.c0, r.r0)));
+            found
+        };
+        let (first, second) = if c0 == c1 {
+            (NodeKind::Column, NodeKind::Region)
+        } else {
+            (NodeKind::Region, NodeKind::Column)
+        };
+        let mut found = overlapping(first);
+        if found.is_empty() {
+            found = overlapping(second);
+        }
+        if found.is_empty() {
+            return none();
+        }
+        let labels: Vec<String> = found.iter().map(|n| n.cited_label()).collect();
+        let mut text = format!(
+            "no node contains {wanted}; it overlaps {} {}: {}",
+            found.len(),
+            if found.len() == 1 { "node" } else { "nodes" },
+            listed(&labels, MAX_EXPAND_OVERLAP)
+        );
+        if found.len() > MAX_EXPAND_OVERLAP {
+            text.push_str(&format!(
+                ". The first {MAX_EXPAND_OVERLAP} are expanded below; expand the others by their ranges"
+            ));
+        } else {
+            text.push_str(". Each is expanded below");
+        }
+        let mut nodes = Vec::new();
+        for n in found.iter().take(MAX_EXPAND_OVERLAP) {
+            let (data, node_text) = self.expand_node(n, nodes_by_id);
+            text.push_str("\n\n");
+            text.push_str(&node_text);
+            nodes.push(data);
+        }
+        ToolResult::ok(
+            "expand",
+            serde_json::json!({
+                "range": wanted, "contained": false, "overlapping": found.len(),
+                "truncated": found.len() > MAX_EXPAND_OVERLAP, "nodes": nodes
+            }),
+            text,
+        )
     }
 
     /// `get_cells`: every cell carries its address, in the JSON
@@ -2643,6 +2732,60 @@ mod tests {
         assert_eq!(column_letters("XFD"), Some(16_383));
         assert_eq!(column_letters("XFE"), None);
         assert_eq!(column_letters("Region"), None);
+    }
+
+    /// A table in two sections (a block, a blank row, the headings
+    /// again, another block) is two regions with a column node each;
+    /// a range across both expands both, and one over nothing still
+    /// fails (#48).
+    #[test]
+    fn expand_a_range_across_two_sections() {
+        let wb = parse_delimited(
+            "demo",
+            "Deliveries",
+            "Item,Qty\nA,1\nB,2\n\nItem,Qty\nC,3\nD,4\n",
+            ',',
+        );
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let regions: Vec<String> = g.regions.iter().map(|r| r.range.a1()).collect();
+        assert_eq!(regions, ["Deliveries!A1:B3", "Deliveries!A5:B7"]);
+        let res = tools.call(&ToolRequest::Expand {
+            range: "deliveries!b2:b7".into(),
+        });
+        assert!(res.ok, "{}", res.text);
+        assert!(
+            res.text.starts_with("no node contains Deliveries!B2:B7; it overlaps 2 nodes: Qty  Deliveries!B1:B3, Qty  Deliveries!B5:B7. Each is expanded below\n\nnode "),
+            "{}",
+            res.text
+        );
+        assert_eq!(res.data["overlapping"], 2);
+        assert_eq!(res.data["nodes"][1]["range"], "Deliveries!B5:B7");
+        // Several columns across both sections: the two regions.
+        let res = tools.call(&ToolRequest::Expand {
+            range: "Deliveries!A2:B6".into(),
+        });
+        assert_eq!(
+            res.data["nodes"][0]["range"], "Deliveries!A1:B3",
+            "{}",
+            res.text
+        );
+        assert_eq!(res.data["nodes"][1]["range"], "Deliveries!A5:B7");
+        // A range one node contains is unchanged.
+        let res = tools.call(&ToolRequest::Expand {
+            range: "Deliveries!B6".into(),
+        });
+        assert_eq!(res.data["range"], "Deliveries!B5:B7");
+        let res = tools.call(&ToolRequest::Expand {
+            range: "Deliveries!F1:F3".into(),
+        });
+        assert_eq!(res.data["error"]["kind"], "no_graph_node");
     }
 
     fn fixture() -> (WorkbookSnapshot, Graph, HybridIndex) {
