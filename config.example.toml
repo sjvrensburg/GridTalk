@@ -22,3 +22,9 @@ engine = "llamacpp"
 # otherwise. Extra trusted CAs (corporate or self-signed): set
 # GRIDTALK_CA_FILE=/path/to/ca.pem
 # api_key_env = "GRIDTALK_API_KEY"
+# protocol = "text"   # external backend: speak the local backend's text
+#                     # protocol (tools in the system message, a call as one
+#                     # JSON object, no `tools` field) instead of function
+#                     # calling. For capturing what the local backend sends a
+#                     # model, or an endpoint without tool calling. Nothing
+#                     # holds the reply to the protocol's grammar here.

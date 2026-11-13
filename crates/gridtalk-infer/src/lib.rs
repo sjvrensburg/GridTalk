@@ -164,6 +164,42 @@ pub struct OpenAiCompatibleBackend {
     /// config's `n_ctx`); `None` when the endpoint's window is not
     /// known.
     pub context_tokens: Option<usize>,
+    /// How tool turns go over the wire (the config's `protocol`).
+    pub protocol: Protocol,
+}
+
+/// How an OpenAI-compatible backend takes tool turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    /// Function definitions and `tool_calls` (the default).
+    #[default]
+    Native,
+    /// The text protocol the local backend speaks (#49): the tools
+    /// described in the system message, a call as one JSON object, a
+    /// result as a user message, plain system/user/assistant messages
+    /// and no `tools` field. A scripted endpoint then sees exactly
+    /// what the local backend sends a model, less the chat template;
+    /// it also lets the loop run against an endpoint without tool
+    /// calling. Unlike the local backend, nothing holds the reply to
+    /// the protocol's grammar.
+    Text,
+}
+
+impl Protocol {
+    /// The config's `protocol` value: `"text"`, or `"native"` (and
+    /// when unset). Anything else is native, with a warning.
+    pub fn from_config(value: Option<&str>) -> Protocol {
+        match value.map(str::trim) {
+            None | Some("") | Some("native") => Protocol::Native,
+            Some("text") => Protocol::Text,
+            Some(other) => {
+                eprintln!(
+                    "gridtalk: warning: unknown protocol {other:?}; expected \"native\" or \"text\" — using native"
+                );
+                Protocol::Native
+            }
+        }
+    }
 }
 
 fn reject_crlf(field: &str, value: &str) -> Result<(), InferError> {
@@ -574,6 +610,7 @@ impl ChatBackend for OpenAiCompatibleBackend {
         run(&mut OpenAiSession {
             backend: self,
             required_refused: false,
+            calls: 0,
         })
     }
 }
@@ -586,6 +623,8 @@ struct OpenAiSession<'a> {
     /// The endpoint refused `tool_choice: "required"`; later turns
     /// ask with `"auto"` and leave the check to the caller.
     required_refused: bool,
+    /// Turns taken in the text protocol, for its calls' ids.
+    calls: usize,
 }
 
 /// One message in the OpenAI wire format.
@@ -617,6 +656,9 @@ impl ToolSession for OpenAiSession<'_> {
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Turn, InferError> {
+        if self.backend.protocol == Protocol::Text {
+            return self.text_turn(req, cancel, on_token);
+        }
         let body = |choice: &str| {
             let mut body = serde_json::json!({
                 "model": self.backend.model,
@@ -729,6 +771,62 @@ impl ToolSession for OpenAiSession<'_> {
     }
 }
 
+impl OpenAiSession<'_> {
+    /// A turn in the text protocol (see [`Protocol::Text`]): the
+    /// messages the local backend would build, sent as plain chat
+    /// messages, and the reply read as the local backend reads it.
+    fn text_turn(
+        &mut self,
+        req: &TurnRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Turn, InferError> {
+        let messages: Vec<serde_json::Value> = turns::text_messages(req.messages, req.tools)
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect();
+        let body = serde_json::json!({
+            "model": self.backend.model,
+            "stream": false,
+            "max_tokens": req.max_tokens,
+            "messages": messages,
+        });
+        let value = self.backend.post_chat(&body, cancel)?;
+        let message = &value["choices"][0]["message"];
+        if !message.is_object() {
+            return Err(InferError::Http(
+                "response has no choices[0].message".into(),
+            ));
+        }
+        let text = message_content(&message["content"]).unwrap_or_default();
+        if text.trim().is_empty() && value["choices"][0]["finish_reason"] == "length" {
+            return Err(InferError::Http(format!(
+                "the model used all {} tokens of its turn before replying",
+                req.max_tokens
+            )));
+        }
+        self.calls += 1;
+        let mut turn = turns::parse_text_turn(&text, &format!("call_{}", self.calls));
+        if turn.calls.is_empty() {
+            for word in turn.text.split_inclusive(' ') {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(InferError::Cancelled);
+                }
+                on_token(word);
+            }
+        }
+        let count = |key: &str| value["usage"][key].as_u64().map(|n| n as usize);
+        turn.usage = count("prompt_tokens").map(|prompt_tokens| Usage {
+            prompt_tokens,
+            reused_tokens: value["usage"]["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0) as usize,
+            generated_tokens: count("completion_tokens").unwrap_or(0),
+        });
+        Ok(turn)
+    }
+}
+
 /// Resolve a backend from settings. `local` with no compiled engine
 /// falls back to EchoBackend so the app always runs; the UI surfaces
 /// that no real model is loaded.
@@ -751,6 +849,7 @@ pub fn backend_from_config(cfg: &crate::config::InferenceConfig) -> Box<dyn Chat
                 .as_ref()
                 .and_then(|env| std::env::var(env).ok()),
             context_tokens: cfg.n_ctx.map(|n| n as usize),
+            protocol: Protocol::from_config(cfg.protocol.as_deref()),
         }),
         _ => {
             if !matches!(
@@ -810,6 +909,11 @@ pub mod config {
         /// model's own training length (capped at 64K).
         #[serde(default)]
         pub n_ctx: Option<u32>,
+        /// OpenAI-compatible backend: how tool turns go over the
+        /// wire, `"native"` (function definitions, the default) or
+        /// `"text"` (the local backend's text protocol; #49).
+        #[serde(default)]
+        pub protocol: Option<String>,
     }
 
     fn default_backend() -> String {
@@ -832,6 +936,7 @@ pub mod config {
                 seed: None,
                 n_gpu_layers: None,
                 n_ctx: None,
+                protocol: None,
             }
         }
     }
@@ -994,6 +1099,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_tokens: None,
+            protocol: Protocol::Native,
         };
         let req = ChatRequest {
             system: "s".into(),
@@ -1053,6 +1159,113 @@ mod tests {
         (port, server)
     }
 
+    /// `protocol = "text"`: an OpenAI-compatible endpoint is sent the
+    /// local backend's text protocol, the messages `text_messages`
+    /// builds and no `tools` field, and its replies are read as the
+    /// local backend reads them (#49).
+    #[test]
+    fn external_backend_can_speak_the_text_protocol() {
+        let reply = |content: &str| {
+            serde_json::json!({"choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 7}})
+            .to_string()
+        };
+        let (port, server) = mock_chat_server(vec![
+            (
+                200,
+                reply("{\"tool\":\"get_cells\",\"range\":\"Sheet1!A1:B2\"}"),
+            ),
+            (200, reply("ANSWER: It is 6 (Sheet1!B2).")),
+        ]);
+        let cfg = config::Config::parse(&format!(
+            "[inference]\nbackend = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nmodel = \"m\"\nprotocol = \"text\"\n"
+        ));
+        assert_eq!(cfg.inference.protocol.as_deref(), Some("text"));
+        let backend = backend_from_config(&cfg.inference);
+        let tools = vec![ToolSpec {
+            name: "get_cells".into(),
+            description: "Read cells.".into(),
+            parameters: serde_json::json!({
+                "type": "object", "properties": {"range": {"type": "string"}}, "required": ["range"]
+            }),
+        }];
+        let cancel: CancelToken = Arc::new(AtomicBool::new(false));
+        let mut streamed = String::new();
+        let mut sent_messages = Vec::new();
+        backend
+            .with_tool_session(&mut |session| {
+                let mut messages = vec![
+                    Message::system("Answer from the workbook."),
+                    Message::user("What is B2?"),
+                ];
+                let first = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::Required,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |t| streamed.push_str(t),
+                )?;
+                assert_eq!(
+                    first.calls,
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "get_cells".into(),
+                        arguments: serde_json::json!({"range": "Sheet1!A1:B2"}),
+                    }]
+                );
+                assert_eq!(first.usage.map(|u| u.prompt_tokens), Some(50));
+                sent_messages.push(turns::text_messages(&messages, &tools));
+                messages.push(Message::assistant("", first.calls.clone()));
+                messages.push(Message::tool(&first.calls[0], "Sheet1!B2: 6"));
+                let second = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::Auto,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |t| streamed.push_str(t),
+                )?;
+                assert_eq!(second.text, "It is 6 (Sheet1!B2).");
+                assert!(second.calls.is_empty());
+                sent_messages.push(turns::text_messages(&messages, &tools));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(streamed, "It is 6 (Sheet1!B2).");
+        let bodies = server.join().unwrap();
+        for (body, expected) in bodies.iter().zip(&sent_messages) {
+            assert!(body.get("tools").is_none(), "{body}");
+            assert!(body.get("tool_choice").is_none(), "{body}");
+            let expected: Vec<serde_json::Value> = expected
+                .iter()
+                .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+                .collect();
+            assert_eq!(body["messages"], serde_json::Value::from(expected));
+        }
+        // The second request carries the call as the assistant's JSON
+        // and the result as a user message, as the local backend
+        // builds them.
+        let roles: Vec<&str> = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert!(bodies[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("get_cells"));
+        assert_eq!(Protocol::from_config(Some("native")), Protocol::Native);
+        assert_eq!(Protocol::from_config(None), Protocol::Native);
+        assert_eq!(Protocol::from_config(Some("bogus")), Protocol::Native);
+    }
+
     #[test]
     fn external_backend_takes_tool_turns_on_the_openai_wire_format() {
         let call_reply = serde_json::json!({"choices": [{"message": {
@@ -1087,6 +1300,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_tokens: Some(8_192),
+            protocol: Protocol::Native,
         };
         assert!(backend.supports_tools());
         let tools = vec![ToolSpec {
@@ -1253,6 +1467,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_tokens: None,
+            protocol: Protocol::Native,
         };
         let req = ChatRequest {
             system: "s".into(),
@@ -1270,6 +1485,7 @@ mod tests {
             model: "m".into(),
             api_key: Some("secret".into()),
             context_tokens: None,
+            protocol: Protocol::Native,
         };
         assert!(matches!(
             remote.stream(&req, &cancel, &mut |_| {}),
@@ -1281,6 +1497,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_tokens: None,
+            protocol: Protocol::Native,
         };
         assert!(bad.stream(&req, &cancel, &mut |_| {}).is_err());
     }
@@ -1304,6 +1521,7 @@ mod tests {
             model: "m".into(),
             api_key: Some("secret".into()),
             context_tokens: None,
+            protocol: Protocol::Native,
         };
         let req = ChatRequest {
             system: "s".into(),
