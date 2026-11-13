@@ -86,6 +86,32 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         .unwrap_or_default()
 }
 
+/// The answer when the model's last turn was a call in its own
+/// format rather than an answer.
+pub const MARKUP_ANSWER: &str = "The model did not answer: its last reply was a tool call in a format GridTalk does not read, and no tool calls were left.";
+
+/// Whether an answer is really a tool call in some model's own
+/// format: it starts with markup (`<`, `[`) and its first line names
+/// one of the tools as a word (`<tool_call>get_cells…`,
+/// `[get_cells(range=…)]`). An answer in words that mentions a tool
+/// does not start with markup.
+fn looks_like_a_call(text: &str, specs: &[ToolSpec]) -> bool {
+    let text = text.trim_start();
+    if !text.starts_with(['<', '[']) {
+        return false;
+    }
+    let first = text.lines().next().unwrap_or("");
+    let head: String = first.chars().take(200).collect();
+    specs.iter().any(|spec| {
+        head.match_indices(spec.name.as_str()).any(|(at, _)| {
+            let before = head[..at].chars().next_back();
+            let after = head[at + spec.name.len()..].chars().next();
+            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !word(before) && !word(after)
+        })
+    })
+}
+
 /// `text` cut to at most `max` characters at a line end, with a note
 /// of how much was cut. The second value says whether it was cut.
 fn cut_to(text: &str, max: usize, note: &str) -> (String, bool) {
@@ -526,6 +552,22 @@ pub(crate) fn tool_loop(
                     messages.push(Message::assistant(turn.text, Vec::new()));
                     messages.push(Message::user(
                         "Call a tool before you answer: read the cells the answer rests on.",
+                    ));
+                    continue;
+                }
+                if looks_like_a_call(&turn.text, &specs) {
+                    if choice == ToolChoice::None {
+                        // The last turn, and still no answer.
+                        answer = MARKUP_ANSWER.to_string();
+                        return Ok(());
+                    }
+                    // A model writing calls in its own format: not an
+                    // answer. Say so, whatever the format; like a call
+                    // that could not run, it spends a step.
+                    calls_left = calls_left.saturating_sub(1);
+                    messages.push(Message::assistant(turn.text, Vec::new()));
+                    messages.push(Message::user(
+                        "That reply names a tool but is not a tool call, so it was not run. Call the tool as the tool definitions say, or answer in words.",
                     ));
                     continue;
                 }
@@ -1382,6 +1424,59 @@ mod tests {
             assert!(tokens + 500 <= 2_000, "{tokens}");
         }
         assert!(inv.answer.starts_with("Four people"), "{}", inv.answer);
+    }
+
+    /// A reply that writes a call in a model's own markup is sent back
+    /// once instead of being taken as the answer, whether or not the
+    /// turn had to be a call; words that mention a tool are an answer.
+    #[test]
+    fn a_call_written_in_markup_is_sent_back_once() {
+        let specs = tool_specs();
+        assert!(looks_like_a_call(
+            "<tool_call>get_cells<arg_key>range</arg_key></tool_call>",
+            &specs
+        ));
+        assert!(looks_like_a_call("  [workbook_info()]", &specs));
+        assert!(!looks_like_a_call(
+            "Use get_cells on Staff!B2: it is 100.",
+            &specs
+        ));
+        assert!(!looks_like_a_call("<b>100</b> an hour", &specs));
+        assert!(!looks_like_a_call("<get_cellsx>", &specs));
+
+        let fixture = Fixture::new();
+        let backend = Scripted::new(vec![
+            says("<tool_call>get_cells<arg_key>range</arg_key><arg_value>Staff!A2:B2</arg_value></tool_call>"),
+            calls(vec![call(
+                1,
+                "get_cells",
+                serde_json::json!({"range": "Staff!A2:B2"}),
+            )]),
+            says("E1 is paid 100 an hour (Staff!B2)."),
+        ]);
+        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 8, None, true);
+        let asked = backend.asked();
+        // The planner read the staff table, so the first turn was free
+        // to answer (#47); its markup was sent back all the same.
+        assert_eq!(asked[0].0, ToolChoice::Auto);
+        let note = asked[1].1.last().unwrap();
+        assert_eq!(note.role, Role::User);
+        assert!(note
+            .content
+            .starts_with("That reply names a tool but is not a tool call"));
+        assert_eq!(inv.answer, "E1 is paid 100 an hour (Staff!B2).");
+
+        // Each such reply spends a step; when the answer-only turn is
+        // markup too, the answer says the model did not answer.
+        let markup = || says("<tool_call>get_cells</tool_call>");
+        let backend = Scripted::new(vec![markup(), markup(), markup()]);
+        let (inv, _) = run_with(&fixture, &backend, "What is E1 paid?", 2, None, true);
+        let choices: Vec<ToolChoice> = backend.asked().iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            choices,
+            [ToolChoice::Auto, ToolChoice::Auto, ToolChoice::None]
+        );
+        assert_eq!(inv.answer_body(), MARKUP_ANSWER);
     }
 
     #[test]
