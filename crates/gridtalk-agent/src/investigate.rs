@@ -592,6 +592,18 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
             skipped.push("the workbook sheet list");
         }
     }
+    // "Are there any errors?", "is anything broken or hard-coded?":
+    // the issues check reads every formula, which no search hit's
+    // cells cover. Capped in the prompt like the sheet list.
+    if asks_about_issues(question) {
+        if trail.len() < max_steps {
+            let found = run("issues", "", &mut trail);
+            let found = truncate_chars(&found, 4_000);
+            context.push_str(&format!("\n\nworkbook issues:\n{found}"));
+        } else {
+            skipped.push("the workbook issues check");
+        }
+    }
     if let Some(range) = &top_range {
         let mut top_done = true;
         if !expanded_ranges.iter().any(|done| same_range(done, range)) {
@@ -978,6 +990,44 @@ fn asks_about_the_workbook(question: &str) -> bool {
                 || has("tab")
                 || has("tabs")))
         || (has("this") && has("file"))
+}
+
+/// Whether a question asks what is wrong with the workbook's
+/// formulas: errors (by name or code), broken or stale results,
+/// hard-coded numbers, or an audit.
+fn asks_about_issues(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    if [
+        "#ref",
+        "#div",
+        "#n/a",
+        "#value",
+        "#name",
+        "#num",
+        "hard-coded",
+        "hard coded",
+    ]
+    .iter()
+    .any(|code| lower.contains(code))
+    {
+        return true;
+    }
+    lower.split(|c: char| !c.is_alphanumeric()).any(|w| {
+        matches!(
+            w,
+            "error"
+                | "errors"
+                | "broken"
+                | "stale"
+                | "hardcoded"
+                | "audit"
+                | "mistake"
+                | "mistakes"
+                | "issues"
+                | "problems"
+                | "wrong"
+        )
+    })
 }
 
 /// `text` cut to at most `max` chars on a char boundary.
@@ -1390,6 +1440,11 @@ mod tests {
         let inv = investigate("are there any hidden sheets?", &tools, &EchoBackend, 12).unwrap();
         assert!(inv.trail.iter().any(|s| s.tool == "workbook_info"));
         assert!(inv.answer.contains("sheet Sheet1"), "{}", inv.answer);
+        // A question about what is wrong runs the issues check.
+        let inv = investigate("are there any #REF errors?", &tools, &EchoBackend, 12).unwrap();
+        assert!(inv.trail.iter().any(|s| s.tool == "issues"));
+        let inv = investigate("what is the total for apples?", &tools, &EchoBackend, 12).unwrap();
+        assert!(inv.trail.iter().all(|s| s.tool != "issues"));
     }
 
     /// A cover sheet whose notes mention "Marks Capture", a 260-row
