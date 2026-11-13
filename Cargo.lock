@@ -1809,6 +1809,8 @@ name = "gridtalk-infer"
 version = "0.3.0"
 dependencies = [
  "llama-cpp-2",
+ "minijinja",
+ "minijinja-contrib",
  "rcgen",
  "rustls",
  "serde",
@@ -2344,6 +2346,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "minijinja"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "509eeb2603a84eccabb4d75f6ec8ba23b46bbf441aaeb863d6b83a5887fd51e4"
+
+[[package]]
+name = "minijinja-contrib"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64b62a39daf92d02b89f7888ab57f08d15d22dab862e5c95353253f91e9344f0"
+dependencies = [
+ "minijinja",
 ]
 
 [[package]]

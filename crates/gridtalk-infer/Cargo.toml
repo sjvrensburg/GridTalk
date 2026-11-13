@@ -10,6 +10,10 @@ serde.workspace = true
 serde_json.workspace = true
 toml = "0.9"
 llama-cpp-2 = { version = "=0.1.160", features = ["vulkan"] }
+# Renders a GGUF's own Jinja chat template when llama.cpp's built-in
+# applier does not recognise it (Gemma 4, Spark-X2.6).
+minijinja = { version = "3.1", features = ["json"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
 # TLS for https endpoints and model downloads: pure-Rust rustls on the
 # ring provider (no CMake/NASM toolchain), Mozilla roots bundled.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
