@@ -82,7 +82,14 @@ case-insensitively, and cells must lie inside the sheet grid
   also on `open_workbook`'s sheets and on the sheet nodes of
   `graph_overview`), defined names, regions,
   load warnings and the tools' limits (`range_cells` 10,000,
-  `search_limit` 25, `expand_edges` 200). Call it first.
+  `search_limit` 25, `expand_edges` 200). Call it first. The text
+  lists every sheet, then the names and warnings, then each sheet's
+  regions under it; when that would run past about 3,800 characters,
+  every sheet's region list is cut to the same length and ends with
+  a note naming the sheet to ask for (`regions_cut_on` lists them;
+  the JSON `regions` always holds all of them). An optional `sheet`
+  returns that sheet only: its line, all its regions, and the names
+  scoped to it or referring to it.
 - `search`: hybrid lexical + embedding, ranges with `vector_only`
   flags. A passage longer than 4,000 characters is cut to the header
   plus the rows matching the query, labelled with their sheet rows,

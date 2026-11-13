@@ -276,7 +276,7 @@ fn ranges_read(request: &ToolRequest, data: &serde_json::Value, tools: &Tools) -
             .and_then(canonical)
             .into_iter()
             .collect(),
-        ToolRequest::WorkbookInfo | ToolRequest::GraphOverview => Vec::new(),
+        ToolRequest::WorkbookInfo { .. } | ToolRequest::GraphOverview => Vec::new(),
     }
 }
 
@@ -604,10 +604,16 @@ pub(crate) fn tool_loop(
                 };
                 (run.on_step)(&step);
                 trail.push(step);
+                // What to do about a cut result: a narrower range,
+                // or for the workbook's list, one sheet (#50).
                 let (sent, _) = cut_to(
                     &text,
                     result_cap,
-                    "call again with a narrower range for the rest",
+                    if call.name == "workbook_info" {
+                        "call workbook_info with sheet for one sheet's regions and names"
+                    } else {
+                        "call again with a narrower range for the rest"
+                    },
                 );
                 trace(serde_json::json!({
                     "event": "tool", "turn": model_turns, "id": call.id, "name": call.name,

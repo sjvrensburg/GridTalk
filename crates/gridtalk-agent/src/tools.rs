@@ -31,7 +31,12 @@ pub enum ToolRequest {
         target: String,
     },
     GraphOverview,
-    WorkbookInfo,
+    WorkbookInfo {
+        /// One sheet's regions and names; the whole workbook when
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sheet: Option<String>,
+    },
     Issues {
         /// Check only this range (one sheet); the whole workbook,
         /// defined names included, when absent.
@@ -191,6 +196,10 @@ pub fn error_payload(kind: ErrorKind, message: &str) -> serde_json::Value {
 pub const MAX_SEARCH_LIMIT: usize = 25;
 /// Most edges `expand` returns; the rest are counted, not listed.
 pub const MAX_EXPAND_EDGES: usize = 200;
+/// About how long `workbook_info`'s text for the whole workbook may
+/// run before each sheet's region list is cut; under the planner's
+/// 4,000-character cut of it.
+pub const WORKBOOK_INFO_CHARS: usize = 3_800;
 /// Most nodes `expand` expands for a range no node contains.
 pub const MAX_EXPAND_OVERLAP: usize = 4;
 
@@ -207,7 +216,7 @@ impl ToolRequest {
             ToolRequest::ListFormulas { .. } => "list_formulas",
             ToolRequest::WhatIf { .. } => "what_if",
             ToolRequest::GraphOverview => "graph_overview",
-            ToolRequest::WorkbookInfo => "workbook_info",
+            ToolRequest::WorkbookInfo { .. } => "workbook_info",
             ToolRequest::Issues { .. } => "issues",
             ToolRequest::Filter { .. } => "filter",
             ToolRequest::Aggregate { .. } => "aggregate",
@@ -231,7 +240,7 @@ impl ToolRequest {
         serde_json::json!({
             "request_format": "A ToolRequest is a JSON object with a \"tool\" discriminator, e.g. {\"tool\": \"search\", \"query\": \"...\", \"limit\": 3}. Unknown fields are rejected. A failed call returns {\"error\": {\"kind\": ..., \"message\": ...}}.",
             "tools": [
-                tool("workbook_info", "Sheets (name, rows, cols, visibility: visible/hidden/veryHidden), defined names, detected regions, load warnings and the tools' limits. Call it first to learn sheet names and ranges.".into(), schema(serde_json::json!({}), &[])),
+                tool("workbook_info", format!("Sheets (rows, cols, visibility), defined names, regions (tables) with headings, load warnings and limits. Call it first. sheet: one sheet only; a long list caps each sheet's regions (about {WORKBOOK_INFO_CHARS} characters) and says which sheets to ask for."), schema(serde_json::json!({"sheet": {"type": "string"}}), &[])),
                 tool("search", format!("Hybrid lexical+embedding search over workbook regions. Returns ranked regions with a cited passage each. limit: 1-{MAX_SEARCH_LIMIT} (default 3; larger values are clamped and the response says so)."), schema(serde_json::json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "default": 3}}), &["query"])),
                 tool("expand", format!("Graph neighbours (contains/depends_on edges) of the region or column containing a range, e.g. Sheet1!A1:D4; when no node contains it (a column across two sections of a table), each node it overlaps, up to {MAX_EXPAND_OVERLAP}. At most {MAX_EXPAND_EDGES} edges a node; total_edges and truncated tell when more exist."), schema(serde_json::json!({"range": range}), &["range"])),
                 tool("get_cells", format!("Typed cell values in a range, e.g. Sheet1!A1:D4 or 'My Sheet'!B2, each with its address. Formula cells carry their computed result and the file's cached value. At most {MAX_RANGE_CELLS} cells per call."), schema(serde_json::json!({"range": range}), &["range"])),
@@ -575,58 +584,7 @@ impl<'a> Tools<'a> {
                     ),
                 }
             }
-            ToolRequest::WorkbookInfo => {
-                let sheets: Vec<serde_json::Value> = self
-                    .wb
-                    .sheets
-                    .iter()
-                    .map(|s| serde_json::json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col(), "visibility": s.visibility.as_str()}))
-                    .collect();
-                let names: Vec<serde_json::Value> = self
-                    .wb
-                    .names
-                    .iter()
-                    .map(|n| serde_json::json!({"name": n.name, "scope": n.scope, "refers_to": n.formula}))
-                    .collect();
-                let regions: Vec<serde_json::Value> = self
-                    .graph
-                    .regions
-                    .iter()
-                    .map(|r| serde_json::json!({"range": r.range.a1(), "headers": r.headers}))
-                    .collect();
-                let mut lines = vec![format!("workbook {}", self.wb.name)];
-                for s in &self.wb.sheets {
-                    let hidden = if s.visibility == gridtalk_graph::SheetVisibility::Visible {
-                        String::new()
-                    } else {
-                        format!(", {}", s.visibility.as_str())
-                    };
-                    lines.push(format!(
-                        "sheet {} ({} rows x {} cols{hidden})",
-                        quote_sheet(&s.name),
-                        s.cells.len(),
-                        s.max_col()
-                    ));
-                }
-                for n in &self.wb.names {
-                    lines.push(format!("name {} = {}", n.name, n.formula));
-                }
-                for r in &self.graph.regions {
-                    lines.push(format!("region {}: {}", r.range.a1(), r.headers.join(", ")));
-                }
-                for w in &self.wb.warnings {
-                    lines.push(format!("warning: {w}"));
-                }
-                ToolResult::ok(
-                    "workbook_info",
-                    serde_json::json!({
-                        "name": self.wb.name, "sheets": sheets, "defined_names": names,
-                        "regions": regions, "warnings": self.wb.warnings,
-                        "limits": {"range_cells": MAX_RANGE_CELLS, "search_limit": MAX_SEARCH_LIMIT, "expand_edges": MAX_EXPAND_EDGES, "grid_end": "XFD1048576"}
-                    }),
-                    lines.join("\n"),
-                )
-            }
+            ToolRequest::WorkbookInfo { sheet } => self.workbook_info(sheet.as_deref()),
             ToolRequest::GraphOverview => {
                 const MAX_OVERVIEW_NODES: usize = 500;
                 const MAX_OVERVIEW_EDGES: usize = 2000;
@@ -800,6 +758,150 @@ impl<'a> Tools<'a> {
                 "truncated": found.len() > MAX_EXPAND_OVERLAP, "nodes": nodes
             }),
             text,
+        )
+    }
+
+    /// `workbook_info`: every sheet's line, then the defined names and
+    /// load warnings, then each sheet's regions under its name. With
+    /// `sheet`, that sheet's line, its regions and the names that are
+    /// scoped to it or refer to it. Without, when the whole text would
+    /// run past [`WORKBOOK_INFO_CHARS`], every sheet's region list is
+    /// cut to the same length, so a cut loses the tail of each sheet's
+    /// list rather than the last sheets (#50).
+    fn workbook_info(&self, only: Option<&str>) -> ToolResult {
+        let sheets: Vec<&gridtalk_graph::SheetSnapshot> = match only {
+            None => self.wb.sheets.iter().collect(),
+            Some(name) => match self.sheet(name) {
+                Some(sheet) => vec![sheet],
+                None => {
+                    return ToolResult::err(
+                        "workbook_info",
+                        ErrorKind::UnknownSheet,
+                        self.no_sheet(name),
+                    )
+                }
+            },
+        };
+        let on = |name: &str| -> Vec<&gridtalk_graph::Region> {
+            self.graph
+                .regions
+                .iter()
+                .filter(|r| sheet_name_eq(&r.range.sheet, name))
+                .collect()
+        };
+        let names: Vec<&gridtalk_graph::DefinedName> = match only {
+            None => self.wb.names.iter().collect(),
+            Some(_) => {
+                let sheet = &sheets[0].name;
+                let lower = sheet.to_lowercase();
+                let quoted = quote_sheet(sheet).to_lowercase();
+                self.wb
+                    .names
+                    .iter()
+                    .filter(|n| {
+                        let refers = n.formula.to_lowercase();
+                        n.scope.as_deref().is_some_and(|s| sheet_name_eq(s, sheet))
+                            || refers.contains(&format!("{lower}!"))
+                            || refers.contains(&format!("{quoted}!"))
+                    })
+                    .collect()
+            }
+        };
+        let sheet_line = |s: &gridtalk_graph::SheetSnapshot| {
+            let hidden = if s.visibility == gridtalk_graph::SheetVisibility::Visible {
+                String::new()
+            } else {
+                format!(", {}", s.visibility.as_str())
+            };
+            format!(
+                "sheet {} ({} rows x {} cols{hidden})",
+                quote_sheet(&s.name),
+                s.cells.len(),
+                s.max_col()
+            )
+        };
+        let region_line = |r: &gridtalk_graph::Region| {
+            format!("  region {}: {}", r.range.a1(), r.headers.join(", "))
+        };
+
+        let mut head = vec![format!("workbook {}", self.wb.name)];
+        head.extend(sheets.iter().map(|s| sheet_line(s)));
+        head.extend(
+            names
+                .iter()
+                .map(|n| format!("name {} = {}", n.name, n.formula)),
+        );
+        if only.is_none() {
+            head.extend(self.wb.warnings.iter().map(|w| format!("warning: {w}")));
+        }
+        let groups: Vec<(&str, Vec<String>)> = sheets
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    on(&s.name).into_iter().map(region_line).collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, lines)| !lines.is_empty())
+            .collect();
+        let size = |cap: usize| -> usize {
+            let head: usize = head.iter().map(|l| l.chars().count() + 1).sum();
+            head + groups
+                .iter()
+                .map(|(name, lines)| {
+                    let shown: usize = lines.iter().take(cap).map(|l| l.chars().count() + 1).sum();
+                    name.len() + 24 + shown + if lines.len() > cap { 90 } else { 0 }
+                })
+                .sum::<usize>()
+        };
+        let most = groups.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+        // The longest region list each sheet may keep: all of them when
+        // the text fits, else the most that fits (at least one).
+        let cap = if only.is_some() || size(most) <= WORKBOOK_INFO_CHARS {
+            most
+        } else {
+            (1..most)
+                .rev()
+                .find(|&k| size(k) <= WORKBOOK_INFO_CHARS)
+                .unwrap_or(1)
+        };
+        let mut lines = head;
+        let mut cut_sheets = Vec::new();
+        for (name, regions) in &groups {
+            lines.push(format!("regions on {}:", quote_sheet(name)));
+            lines.extend(regions.iter().take(cap).cloned());
+            if regions.len() > cap {
+                lines.push(format!(
+                    "  ({} more regions on this sheet; workbook_info with sheet {} lists them all)",
+                    regions.len() - cap,
+                    quote_sheet(name)
+                ));
+                cut_sheets.push(name.to_string());
+            }
+        }
+        let regions_json: Vec<serde_json::Value> = sheets
+            .iter()
+            .flat_map(|s| on(&s.name))
+            .map(|r| serde_json::json!({"range": r.range.a1(), "headers": r.headers}))
+            .collect();
+        let sheets_json: Vec<serde_json::Value> = sheets
+            .iter()
+            .map(|s| serde_json::json!({"name": s.name, "rows": s.cells.len(), "cols": s.max_col(), "visibility": s.visibility.as_str()}))
+            .collect();
+        let names_json: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n.name, "scope": n.scope, "refers_to": n.formula}))
+            .collect();
+        ToolResult::ok(
+            "workbook_info",
+            serde_json::json!({
+                "name": self.wb.name, "sheet": only.map(|_| sheets[0].name.clone()),
+                "sheets": sheets_json, "defined_names": names_json,
+                "regions": regions_json, "warnings": self.wb.warnings,
+                "regions_cut_on": cut_sheets,
+                "limits": {"range_cells": MAX_RANGE_CELLS, "search_limit": MAX_SEARCH_LIMIT, "expand_edges": MAX_EXPAND_EDGES, "grid_end": "XFD1048576"}
+            }),
+            lines.join("\n"),
         )
     }
 
@@ -1623,7 +1725,9 @@ impl<'a> Tools<'a> {
                 }
             }
             "graph_overview" => ToolRequest::GraphOverview,
-            "workbook_info" => ToolRequest::WorkbookInfo,
+            "workbook_info" => ToolRequest::WorkbookInfo {
+                sheet: arg("sheet").filter(|s| !s.is_empty()),
+            },
             "filter" | "aggregate" => {
                 return ("filter and aggregate take a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into(), false)
             }
@@ -2788,6 +2892,89 @@ mod tests {
         assert_eq!(res.data["error"]["kind"], "no_graph_node");
     }
 
+    /// A workbook whose region list is longer than workbook_info's
+    /// text may run: each sheet's list is cut to the same length, the
+    /// last (hidden) sheet keeps its region, the cut says how to get
+    /// the rest, and `sheet` lists one sheet whole (#50).
+    #[test]
+    fn workbook_info_cuts_every_sheet_a_little_and_takes_a_sheet() {
+        use gridtalk_graph::{CellValue as C, SheetSnapshot};
+        let mut rows = Vec::new();
+        for i in 0..150 {
+            rows.push(vec![C::Text(format!("Item {i}")), C::Text("Qty".into())]);
+            rows.push(vec![C::Text("a".into()), C::Number(i as f64)]);
+            rows.push(vec![]);
+        }
+        let mut calc = SheetSnapshot::new(
+            "_Calc",
+            vec![
+                vec![C::Text("Key".into()), C::Text("Value".into())],
+                vec![C::Text("k".into()), C::Number(1.0)],
+            ],
+        );
+        calc.visibility = gridtalk_graph::SheetVisibility::Hidden;
+        let wb = WorkbookSnapshot {
+            name: "sam".into(),
+            sheets: vec![SheetSnapshot::new("Blocks", rows), calc],
+            names: vec![],
+            warnings: vec![],
+            source: None,
+        };
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let all = tools.call(&ToolRequest::WorkbookInfo { sheet: None });
+        assert!(
+            all.text.chars().count() <= WORKBOOK_INFO_CHARS,
+            "{}",
+            all.text.len()
+        );
+        assert!(
+            all.text.contains("\nsheet _Calc (2 rows x 2 cols, hidden)"),
+            "{}",
+            all.text
+        );
+        assert!(
+            all.text
+                .contains("\nregions on _Calc:\n  region _Calc!A1:B2: Key, Value"),
+            "{}",
+            all.text
+        );
+        assert!(
+            all.text.contains(
+                "more regions on this sheet; workbook_info with sheet Blocks lists them all)"
+            ),
+            "{}",
+            all.text
+        );
+        assert_eq!(all.data["regions_cut_on"], serde_json::json!(["Blocks"]));
+        // The JSON keeps every region.
+        assert_eq!(all.data["regions"].as_array().unwrap().len(), 151);
+
+        let one = tools.call(&ToolRequest::WorkbookInfo {
+            sheet: Some("blocks".into()),
+        });
+        assert_eq!(one.text.matches("\n  region Blocks!").count(), 150);
+        assert!(!one.text.contains("_Calc"), "{}", one.text);
+        assert_eq!(one.data["sheet"], "Blocks");
+        let req: ToolRequest = serde_json::from_str(r#"{"tool":"workbook_info"}"#).unwrap();
+        assert_eq!(req, ToolRequest::WorkbookInfo { sheet: None });
+        let missing = tools.call(&ToolRequest::WorkbookInfo {
+            sheet: Some("Calc".into()),
+        });
+        assert_eq!(missing.data["error"]["kind"], "unknown_sheet");
+        assert!(
+            missing.text.contains("(did you mean _Calc?)"),
+            "{}",
+            missing.text
+        );
+    }
+
     fn fixture() -> (WorkbookSnapshot, Graph, HybridIndex) {
         let wb = parse_delimited(
             "demo",
@@ -3197,7 +3384,7 @@ mod tests {
             out2.text
         );
         assert_eq!(out2.data["truncated"], false);
-        let info = tools.call(&ToolRequest::WorkbookInfo);
+        let info = tools.call(&ToolRequest::WorkbookInfo { sheet: None });
         assert_eq!(info.data["sheets"][0]["cols"], 250);
         assert_eq!(info.data["limits"]["expand_edges"], MAX_EXPAND_EDGES);
     }
@@ -3215,7 +3402,7 @@ mod tests {
             hybrid: &hybrid,
             calc: &gridtalk_graph::eval::EvalCache::new(),
         };
-        let info = tools.call(&ToolRequest::WorkbookInfo);
+        let info = tools.call(&ToolRequest::WorkbookInfo { sheet: None });
         assert_eq!(info.data["sheets"][0]["visibility"], "hidden");
         assert!(info.text.contains("hidden"), "{}", info.text);
         let overview = tools.call(&ToolRequest::GraphOverview);
