@@ -1756,11 +1756,11 @@ dependencies = [
 
 [[package]]
 name = "gridtalk-adapter"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "gridtalk-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gridtalk-adapter",
  "gridtalk-graph",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "gridtalk-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gridcraft-calc",
  "gridcraft-core",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "gridtalk-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gridtalk-graph",
  "serde",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "gridtalk-infer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-cpp-2",
  "rcgen",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "gridtalk-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "eframe",

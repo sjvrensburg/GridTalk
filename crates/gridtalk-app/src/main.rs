@@ -215,7 +215,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                     NodeKind::Region => "region",
                     NodeKind::Column => "column",
                 };
-                println!("{} [{}] {}", n.id, kind, n.label);
+                println!("{} [{}] {}", n.id, kind, n.cited_label());
             }
             for e in &graph.edges {
                 println!("{} -{}-> {}", e.from, e.kind, e.to);
@@ -243,7 +243,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
             }
             println!("\nGraph nodes:");
             for n in &graph.nodes {
-                println!("  {} {}", n.id, n.label);
+                println!("  {} {}", n.id, n.cited_label());
             }
             // Demonstrate two-way sync.
             if let Some(region) = graph.nodes.iter().find(|n| n.kind == NodeKind::Region) {

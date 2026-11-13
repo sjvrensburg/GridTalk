@@ -294,14 +294,37 @@ impl AreaNodes {
             let more_specific = |other_column: bool, ob: Bounds| {
                 size(ob) < size(b) || (size(ob) == size(b) && other_column && !column)
             };
-            // A column of the overlap is covered when a more specific
-            // node spans it across all the overlap's rows; only the
-            // nodes on that column can.
+            // A column of the overlap is covered when more specific
+            // nodes span it across all the overlap's rows, together:
+            // a labelled block's value cells cover their region's
+            // column one row each. Only the nodes on that column can.
+            let mut spans: Vec<(usize, usize)> = Vec::new();
             let uncovered = (overlap.1..=overlap.3).any(|col| {
-                !by_column[col].iter().any(|&j| {
+                spans.clear();
+                spans.extend(by_column[col].iter().filter_map(|&j| {
                     let (other, oc, ob) = nodes[j];
-                    other != id && more_specific(oc, ob) && ob.0 <= overlap.0 && ob.2 >= overlap.2
-                })
+                    (other != id && more_specific(oc, ob) && ob.0 <= overlap.2 && ob.2 >= overlap.0)
+                        .then_some((ob.0, ob.2))
+                }));
+                spans.sort_unstable();
+                // Sweep the overlap's rows: each span must start at or
+                // before the first row not yet covered.
+                let mut next = overlap.0;
+                for &(s, e) in &spans {
+                    if s > next {
+                        break;
+                    }
+                    if e >= next {
+                        match e.checked_add(1) {
+                            Some(n) => next = n,
+                            None => return false,
+                        }
+                    }
+                    if next > overlap.2 {
+                        break;
+                    }
+                }
+                next <= overlap.2
             });
             if uncovered {
                 out.push(id);
@@ -315,8 +338,8 @@ mod tests {
     use super::*;
     use crate::{build_graph, parse_delimited};
 
-    /// The coverage rule as first written: every node on the sheet is
-    /// scanned for each node the area touches.
+    /// The coverage rule cell by cell: every node on the sheet is
+    /// scanned for each cell of each node the area touches.
     fn coverage_by_scan(an: &AreaNodes, area: &Area) -> Vec<usize> {
         let mut out = Vec::new();
         let nodes = &an.flat[area.0];
@@ -340,9 +363,11 @@ mod tests {
                 .map(|&(_, _, ob)| ob)
                 .collect();
             if (overlap.1..=overlap.3).any(|col| {
-                !smaller
-                    .iter()
-                    .any(|ob| ob.1 <= col && col <= ob.3 && ob.0 <= overlap.0 && ob.2 >= overlap.2)
+                (overlap.0..=overlap.2).any(|row| {
+                    !smaller
+                        .iter()
+                        .any(|ob| ob.1 <= col && col <= ob.3 && ob.0 <= row && row <= ob.2)
+                })
             }) {
                 out.push(id);
             }
@@ -359,6 +384,9 @@ mod tests {
             "H1,H2,H3,H4,H5\n1,,,,2\n3,,9,,4\n5,,,,6\n7,,,,8\n",
             // A header-only row over ragged data.
             "P,Q,R\n1\n2,3\n,,4\n",
+            // Labelled blocks: one node per value cell, under a title
+            // and without one.
+            "Assumptions,,,\nRate,0.3,,Min,50\nWeight,0.7,,Max,90\nCap,,,,\n",
         ];
         // One workbook, a layout per sheet in a different order from
         // the list, and an empty sheet (no nodes) between them, so a
@@ -366,7 +394,11 @@ mod tests {
         let mut wb = parse_delimited("d", "Overlap", layouts[1], ',');
         wb.sheets
             .push(crate::SheetSnapshot::new("Empty", Vec::new()));
-        for (name, csv) in [("Gaps", layouts[0]), ("Ragged", layouts[2])] {
+        for (name, csv) in [
+            ("Gaps", layouts[0]),
+            ("Ragged", layouts[2]),
+            ("Labelled", layouts[3]),
+        ] {
             wb.sheets
                 .extend(parse_delimited("d", name, csv, ',').sheets);
         }
