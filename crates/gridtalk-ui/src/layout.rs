@@ -147,7 +147,7 @@ impl LayoutWorker {
 }
 
 pub fn spawn_layout(
-    graph: Graph,
+    graph: std::sync::Arc<Graph>,
     revision: u64,
     width: f32,
     height: f32,
