@@ -17,6 +17,9 @@ pub struct TrailStep {
     pub tool: String,
     pub args: String,
     pub result: String,
+    /// Whether the call ran and returned a result (a search that
+    /// matched nothing, an error, a call that was not run: `false`).
+    pub ok: bool,
 }
 
 #[derive(Debug)]
@@ -276,11 +279,12 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
         (ask.question, ask.adapter, ask.history, ask.selection);
     let mut trail: Vec<TrailStep> = Vec::new();
     let run = |tool: &str, args: &str, trail: &mut Vec<TrailStep>| -> String {
-        let result = tools.execute(tool, args);
+        let (result, ok) = tools.execute_step(tool, args);
         trail.push(TrailStep {
             tool: tool.to_string(),
             args: args.to_string(),
             result: result.clone(),
+            ok,
         });
         result
     };
@@ -307,6 +311,7 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
         tool: "search".into(),
         args: format!("q={standalone}"),
         result: search_result.clone(),
+        ok: !hits.is_empty(),
     });
 
     let mut context = format!("search results:\n{search_result}");
@@ -586,7 +591,12 @@ pub fn gather(ask: &Ask, tools: &Tools, max_steps: usize) -> Gathered {
     if asks_about_the_workbook(question) {
         if trail.len() < max_steps {
             let info = run("workbook_info", "", &mut trail);
-            let info = truncate_chars(&info, 4_000);
+            let mut info = truncate_chars(&info, 4_000).to_string();
+            if info.len() < run_len(&trail) {
+                info.push_str(
+                    "\n[cut; workbook_info with sheet lists one sheet's regions and names]",
+                );
+            }
             context.push_str(&format!("\n\nworkbook:\n{info}"));
         } else {
             skipped.push("the workbook sheet list");
@@ -1011,6 +1021,11 @@ fn asks_about_issues(question: &str) -> bool {
                 | "wrong"
         )
     })
+}
+
+/// The length of the last step's result.
+fn run_len(trail: &[TrailStep]) -> usize {
+    trail.last().map_or(0, |step| step.result.len())
 }
 
 /// `text` cut to at most `max` chars on a char boundary.

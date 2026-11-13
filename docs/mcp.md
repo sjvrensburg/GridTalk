@@ -82,7 +82,14 @@ case-insensitively, and cells must lie inside the sheet grid
   also on `open_workbook`'s sheets and on the sheet nodes of
   `graph_overview`), defined names, regions,
   load warnings and the tools' limits (`range_cells` 10,000,
-  `search_limit` 25, `expand_edges` 200). Call it first.
+  `search_limit` 25, `expand_edges` 200). Call it first. The text
+  lists every sheet, then the names and warnings, then each sheet's
+  regions under it; when that would run past about 3,800 characters,
+  every sheet's region list is cut to the same length and ends with
+  a note naming the sheet to ask for (`regions_cut_on` lists them;
+  the JSON `regions` always holds all of them). An optional `sheet`
+  returns that sheet only: its line, all its regions, and the names
+  scoped to it or referring to it.
 - `search`: hybrid lexical + embedding, ranges with `vector_only`
   flags. A passage longer than 4,000 characters is cut to the header
   plus the rows matching the query, labelled with their sheet rows,
@@ -92,7 +99,13 @@ case-insensitively, and cells must lie inside the sheet grid
   when a larger request was cut down.
 - `expand`: graph neighbours of the region or column containing a
   range, at most 200 edges; `total_edges` and `truncated` tell when
-  there are more.
+  there are more. When no node contains the range (a column run
+  across two sections of a table, or a table made of several
+  regions), the nodes it overlaps are expanded one after the other:
+  `contained: false`, `overlapping` (how many), and `nodes`, up to
+  four, each shaped like a single expansion. Within one column those
+  are column nodes, otherwise region nodes. A range that overlaps no
+  node is still `no_graph_node`.
 - `get_cells`: typed values; a formula cell carries `result`, what it
   computes, and `cached_result`, what the file cached, both typed,
   plus `error` when evaluation failed. Every cell carries its
