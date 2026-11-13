@@ -51,6 +51,20 @@ pub enum ToolRequest {
         #[serde(default = "default_filter_limit")]
         limit: usize,
     },
+    Aggregate {
+        /// A table's range, or any cell or column in it.
+        range: String,
+        /// The column to add up; every column when absent (and no
+        /// group_by).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<String>,
+        /// The column whose values form the groups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_by: Option<String>,
+        /// Only the rows meeting every condition, as in `filter`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        r#where: Vec<Condition>,
+    },
 }
 
 /// One `filter` condition: a column (by heading, or by letter), a
@@ -194,6 +208,7 @@ impl ToolRequest {
             ToolRequest::WorkbookInfo => "workbook_info",
             ToolRequest::Issues { .. } => "issues",
             ToolRequest::Filter { .. } => "filter",
+            ToolRequest::Aggregate { .. } => "aggregate",
         }
     }
 
@@ -233,6 +248,21 @@ impl ToolRequest {
                     }},
                     "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to show; all when absent"},
                     "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_FILTER_ROWS}
+                }), &["range"])),
+                tool("aggregate", format!("Sum, mean, min, max (with their cells) and counts of a table's column, over the rows meeting where (as in filter). group_by gives the figures per value of another column (groups ignore case); group_by without column counts rows per group; neither profiles every column. range: the table or any cell in it. At most {MAX_AGGREGATE_GROUPS} groups."), schema(serde_json::json!({
+                    "range": range,
+                    "column": {"type": "string", "description": "Heading or letter of the column to add up"},
+                    "group_by": {"type": "string", "description": "Heading or letter of the column to group by"},
+                    "where": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "column": {"type": "string"},
+                            "op": {"type": "string", "enum": FilterOp::ALL.iter().map(|op| op.as_str()).collect::<Vec<_>>()},
+                            "value": {"type": "string"}
+                        },
+                        "required": ["column", "op", "value"],
+                        "additionalProperties": false
+                    }},
                 }), &["range"])),
                 tool("issues", format!("Problems in the workbook's formulas, errors first: formulas that evaluate to an error (and those that only pass on an error from a cell they read), references to a missing sheet, #REF! left by deleted cells, broken defined names, values saved in the file that recalculation disagrees with, links to other workbooks, and numbers written into a formula's arithmetic (=B5*1.05). Cells with the same problem in one column are one issue. range: check one sheet's range only (e.g. Sheet1!A1:F200); absent checks the whole workbook. At most {MAX_ISSUES_LISTED} issues are listed; the counts cover all."), schema(serde_json::json!({"range": range}), &[])),
                 tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
@@ -500,6 +530,12 @@ impl<'a> Tools<'a> {
                 columns,
                 limit,
             } => self.filter(range, r#where, columns, *limit),
+            ToolRequest::Aggregate {
+                range,
+                column,
+                group_by,
+                r#where,
+            } => self.aggregate(range, column.as_deref(), group_by.as_deref(), r#where),
             ToolRequest::ListFormulas { range } => self.list_formulas(range),
             ToolRequest::WhatIf {
                 cell,
@@ -991,16 +1027,15 @@ impl<'a> Tools<'a> {
         (columns, lines.join("\n"))
     }
 
-    /// `filter`: the data rows of the table at `range` whose cells
-    /// meet every condition, with their addresses.
-    fn filter(
-        &self,
+    /// The table at `range` with its data rows and `conditions`
+    /// resolved, for `filter` and `aggregate`; or the error to return.
+    fn table_rows<'t>(
+        &'t self,
+        tool: &str,
         range: &str,
         conditions: &[Condition],
-        shown: &[String],
-        requested: usize,
-    ) -> ToolResult {
-        let fail = |kind, message: String| ToolResult::err("filter", kind, message);
+    ) -> Result<TableRows<'t>, ToolResult> {
+        let fail = |kind, message: String| Err(ToolResult::err(tool, kind, message));
         let Some((sheet_name, r0, c0, r1, c1)) = parse_range_uncapped(range) else {
             return fail(ErrorKind::InvalidRange, range_error(range));
         };
@@ -1042,119 +1077,73 @@ impl<'a> Tools<'a> {
         } else {
             (first_data, table.r1)
         };
-        let headings: Vec<String> = region
-            .headers
-            .iter()
-            .map(|h| h.trim().to_string())
-            .collect();
-        // A heading, or a letter; with no heading row the headings are
-        // the letters themselves.
-        let heading_of = |c: usize| -> Option<&str> {
-            let h = headings.get(c - table.c0)?.as_str();
-            (!h.is_empty() && region.header_row.is_some()).then_some(h)
+        let mut rows = TableRows {
+            sheet,
+            region,
+            first_data,
+            top,
+            bottom,
+            computed: Default::default(),
+            tests: Vec::new(),
         };
-        let resolve = |name: &str| -> Result<usize, String> {
-            let wanted = name.trim();
-            if let Some(c) = (table.c0..=table.c1)
-                .find(|&c| heading_of(c).is_some_and(|h| h.eq_ignore_ascii_case(wanted)))
-            {
-                return Ok(c);
-            }
-            if let Some(c) = column_letters(wanted) {
-                if (table.c0..=table.c1).contains(&c) {
-                    return Ok(c);
-                }
-            }
-            let named: Vec<&str> = (table.c0..=table.c1).filter_map(heading_of).collect();
-            let mut text = format!("no column {wanted} in {}", table.a1());
-            if let Some(near) = did_you_mean(wanted, &named) {
-                text.push_str(&format!(" (did you mean {near}?)"));
-            }
-            let all: Vec<String> = (table.c0..=table.c1)
-                .map(|c| match heading_of(c) {
-                    Some(h) => format!("{h} ({})", gridtalk_graph::col_name(c)),
-                    None => gridtalk_graph::col_name(c),
-                })
-                .collect();
-            text.push_str(&format!("; its columns are {}", listed(&all, 40)));
-            Err(text)
-        };
-        let mut tests = Vec::new();
         for condition in conditions {
-            match resolve(&condition.column) {
-                Ok(c) => tests.push((c, condition)),
+            match rows.resolve(&condition.column) {
+                Ok(c) => rows.tests.push((c, condition.clone())),
                 Err(e) => return fail(ErrorKind::UnknownColumn, e),
             }
         }
+        // What each formula cell of the rows computes, in one batch.
+        let formulas: Vec<(usize, usize)> = (top..=bottom)
+            .flat_map(|r| (table.c0..=table.c1).map(move |c| (r, c)))
+            .filter(|(r, c)| matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. }))
+            .collect();
+        if !formulas.is_empty() {
+            let values = self.calc.get(self.wb).values(&sheet.name, &formulas);
+            rows.computed = formulas
+                .into_iter()
+                .zip(values)
+                .map(|(at, v)| (at, v.map_err(|e| e.to_string())))
+                .collect();
+        }
+        Ok(rows)
+    }
+
+    /// `filter`: the data rows of the table at `range` whose cells
+    /// meet every condition, with their addresses.
+    fn filter(
+        &self,
+        range: &str,
+        conditions: &[Condition],
+        shown: &[String],
+        requested: usize,
+    ) -> ToolResult {
+        let t = match self.table_rows("filter", range, conditions) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let table = &t.region.range;
         let mut show = Vec::new();
         for name in shown {
-            match resolve(name) {
+            match t.resolve(name) {
                 Ok(c) if !show.contains(&c) => show.push(c),
                 Ok(_) => {}
-                Err(e) => return fail(ErrorKind::UnknownColumn, e),
+                Err(e) => return ToolResult::err("filter", ErrorKind::UnknownColumn, e),
             }
         }
         if show.is_empty() {
             show = (table.c0..=table.c1).collect();
         }
         let limit = requested.clamp(1, MAX_FILTER_ROWS);
-
-        // What each formula cell of the rows computes, in one batch.
-        let formulas: Vec<(usize, usize)> = (top..=bottom)
-            .flat_map(|r| (table.c0..=table.c1).map(move |c| (r, c)))
-            .filter(|(r, c)| matches!(sheet.get_ref(*r, *c), CellValue::Formula { .. }))
-            .collect();
-        let computed: std::collections::HashMap<(usize, usize), Result<Value, String>> =
-            if formulas.is_empty() {
-                Default::default()
-            } else {
-                let values = self.calc.get(self.wb).values(&sheet.name, &formulas);
-                formulas
-                    .into_iter()
-                    .zip(values)
-                    .map(|(at, v)| (at, v.map_err(|e| e.to_string())))
-                    .collect()
-            };
-        let value_at = |r: usize, c: usize| -> Result<Value, String> {
-            match sheet.get_ref(r, c) {
-                CellValue::Formula { .. } => {
-                    computed.get(&(r, c)).cloned().unwrap_or(Ok(Value::Empty))
-                }
-                CellValue::Empty => Ok(Value::Empty),
-                CellValue::Text(t) => Ok(Value::Text(t.clone())),
-                CellValue::Number(n) => Ok(Value::Number(*n)),
-                CellValue::Bool(b) => Ok(Value::Bool(*b)),
-            }
-        };
-        let blank = |r: usize| {
-            (table.c0..=table.c1).all(|c| matches!(sheet.get_ref(r, c), CellValue::Empty))
-        };
-
-        let quoted = quote_sheet(&sheet.name);
-        let mut matched = 0usize;
-        let mut checked = 0usize;
+        let quoted = quote_sheet(&t.sheet.name);
+        let (matching, checked) = t.matching_rows();
         let mut rows = Vec::new();
         let mut lines = Vec::new();
-        for r in top..=bottom {
-            if blank(r) {
-                continue;
-            }
-            checked += 1;
-            if !tests
-                .iter()
-                .all(|(c, condition)| condition_holds(&value_at(r, *c), condition))
-            {
-                continue;
-            }
-            matched += 1;
-            if rows.len() >= limit {
-                continue;
-            }
+        for &r in matching.iter().take(limit) {
             let mut cells = Vec::new();
             let mut parts = Vec::new();
             for &c in &show {
                 let address = format!("{}{}", gridtalk_graph::col_name(c), r + 1);
-                let (mut json, display) = match &value_at(r, c) {
+                let (mut json, display) = match &t.value_at(r, c) {
                     Ok(v) => (value_json(v), v.display()),
                     Err(e) => (
                         serde_json::json!({"type": "error", "error": e}),
@@ -1162,15 +1151,15 @@ impl<'a> Tools<'a> {
                     ),
                 };
                 json["address"] = serde_json::json!(format!("{quoted}!{address}"));
-                json["column"] = serde_json::json!(heading_of(c));
+                json["column"] = serde_json::json!(t.heading_of(c));
                 cells.push(json);
-                parts.push(match heading_of(c) {
+                parts.push(match t.heading_of(c) {
                     Some(h) => format!("{address} {h} = {display}"),
                     None => format!("{address} = {display}"),
                 });
             }
             let row_range = gridtalk_graph::RangeRef {
-                sheet: sheet.name.clone(),
+                sheet: t.sheet.name.clone(),
                 r0: r,
                 c0: *show.iter().min().unwrap_or(&table.c0),
                 r1: r,
@@ -1180,30 +1169,8 @@ impl<'a> Tools<'a> {
             lines.push(format!("{quoted} row {}: {}", r + 1, parts.join(" | ")));
             rows.push(serde_json::json!({"row": r + 1, "range": row_range, "cells": cells}));
         }
-        let name_of = |c: usize| {
-            heading_of(c)
-                .map(str::to_string)
-                .unwrap_or_else(|| gridtalk_graph::col_name(c))
-        };
-        let described: Vec<String> = tests
-            .iter()
-            .map(|(c, cond)| format!("{} {} {}", name_of(*c), cond.op.as_str(), cond.value))
-            .collect();
-        let checked_range = gridtalk_graph::RangeRef {
-            sheet: sheet.name.clone(),
-            r0: top,
-            c0: table.c0,
-            r1: bottom.max(top),
-            c1: table.c1,
-        }
-        .a1();
-        let mut text = format!("Table {}", table.a1());
-        if (top, bottom) != (first_data, table.r1) {
-            text.push_str(&format!(", rows {checked_range}"));
-        }
-        if !described.is_empty() {
-            text.push_str(&format!(" where {}", described.join(" and ")));
-        }
+        let matched = matching.len();
+        let mut text = t.heading_line();
         text.push_str(&format!(": {matched} of {checked} rows match"));
         if matched > rows.len() {
             text.push_str(&format!(
@@ -1218,29 +1185,136 @@ impl<'a> Tools<'a> {
             text.push('\n');
             text.push_str(line);
         }
-        let where_json: Vec<serde_json::Value> = tests
-            .iter()
-            .map(|(c, cond)| {
-                serde_json::json!({
-                    "column": cond.column, "letter": gridtalk_graph::col_name(*c),
-                    "op": cond.op, "value": cond.value
-                })
-            })
-            .collect();
         let columns_json: Vec<serde_json::Value> = show
             .iter()
-            .map(|&c| serde_json::json!({"name": heading_of(c), "letter": gridtalk_graph::col_name(c)}))
+            .map(|&c| serde_json::json!({"name": t.heading_of(c), "letter": gridtalk_graph::col_name(c)}))
             .collect();
         ToolResult::ok(
             "filter",
             serde_json::json!({
-                "table": table.a1(), "checked": checked_range, "where": where_json,
+                "table": table.a1(), "checked": t.checked_range(), "where": t.where_json(),
                 "columns": columns_json, "matched": matched, "rows_checked": checked,
                 "shown": rows.len(), "limit": limit, "limit_clamped": requested != limit,
                 "truncated": matched > rows.len(), "rows": rows
             }),
             text,
         )
+    }
+
+    /// `aggregate`: figures over the matching rows of a table: of one
+    /// column, of one column per group, rows per group, or (with
+    /// neither) of every column.
+    fn aggregate(
+        &self,
+        range: &str,
+        column: Option<&str>,
+        group_by: Option<&str>,
+        conditions: &[Condition],
+    ) -> ToolResult {
+        let t = match self.table_rows("aggregate", range, conditions) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let resolve = |name: Option<&str>| match name.map(str::trim).filter(|n| !n.is_empty()) {
+            None => Ok(None),
+            Some(name) => t.resolve(name).map(Some),
+        };
+        let (column, group_by) = match (resolve(column), resolve(group_by)) {
+            (Ok(c), Ok(g)) => (c, g),
+            (Err(e), _) | (_, Err(e)) => {
+                return ToolResult::err("aggregate", ErrorKind::UnknownColumn, e)
+            }
+        };
+        let table = &t.region.range;
+        let (matching, checked) = t.matching_rows();
+        let mut text = t.heading_line();
+        text.push_str(&format!(": {} of {checked} rows match", matching.len()));
+        let mut data = serde_json::json!({
+            "table": table.a1(), "checked": t.checked_range(), "where": t.where_json(),
+            "rows_matched": matching.len(), "rows_checked": checked,
+        });
+        match group_by {
+            None => {
+                let columns: Vec<usize> = match column {
+                    Some(c) => vec![c],
+                    None => (table.c0..=table.c1).collect(),
+                };
+                let mut stats_json = Vec::new();
+                for c in columns {
+                    let stats = Stats::of(&t, c, &matching);
+                    text.push('\n');
+                    text.push_str(&stats.line(&t.sheet.name, &t.name_of(c), &t.column_range(c)));
+                    let mut json = stats.json(&t.sheet.name);
+                    json["column"] = serde_json::json!(t.name_of(c));
+                    json["letter"] = serde_json::json!(gridtalk_graph::col_name(c));
+                    json["range"] = serde_json::json!(t.column_range(c));
+                    stats_json.push(json);
+                }
+                data["columns"] = serde_json::Value::Array(stats_json);
+            }
+            Some(g) => {
+                // Groups in the order they first appear, merged
+                // ignoring case and surrounding spaces; the label is
+                // the first spelling seen.
+                let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new();
+                for &r in &matching {
+                    let label = match t.value_at(r, g) {
+                        Ok(v) => v.display().trim().to_string(),
+                        Err(e) => format!("#ERROR({e})"),
+                    };
+                    let key = label.to_lowercase();
+                    match groups.iter_mut().find(|(k, _, _)| *k == key) {
+                        Some(group) => group.2.push(r),
+                        None => groups.push((key, label, vec![r])),
+                    }
+                }
+                let total = groups.len();
+                let what = match column {
+                    Some(c) => format!("{} by {}", t.name_of(c), t.name_of(g)),
+                    None => format!("rows by {}", t.name_of(g)),
+                };
+                text.push_str(&format!("\n{total} groups of {what}"));
+                if total > MAX_AGGREGATE_GROUPS {
+                    text.push_str(&format!(" (the first {MAX_AGGREGATE_GROUPS} shown, in the order they appear; add a condition to narrow)"));
+                }
+                let mut groups_json = Vec::new();
+                for (_, label, rows) in groups.iter().take(MAX_AGGREGATE_GROUPS) {
+                    let shown = if label.is_empty() {
+                        "(blank)"
+                    } else {
+                        label.as_str()
+                    };
+                    let mut json = serde_json::json!({"group": label, "rows": rows.len()});
+                    match column {
+                        Some(c) => {
+                            let stats = Stats::of(&t, c, rows);
+                            text.push('\n');
+                            text.push_str(&stats.line(
+                                &t.sheet.name,
+                                shown,
+                                &plural(rows.len(), "row"),
+                            ));
+                            let figures = stats.json(&t.sheet.name);
+                            if let (Some(json), Some(figures)) =
+                                (json.as_object_mut(), figures.as_object())
+                            {
+                                json.extend(figures.clone());
+                            }
+                        }
+                        None => text.push_str(&format!("\n{shown}: {}", plural(rows.len(), "row"))),
+                    }
+                    groups_json.push(json);
+                }
+                data["group_by"] = serde_json::json!({"column": t.name_of(g), "letter": gridtalk_graph::col_name(g)});
+                if let Some(c) = column {
+                    data["column"] = serde_json::json!({"column": t.name_of(c), "letter": gridtalk_graph::col_name(c), "range": t.column_range(c)});
+                }
+                data["groups_total"] = serde_json::json!(total);
+                data["truncated"] = serde_json::json!(total > MAX_AGGREGATE_GROUPS);
+                data["groups"] = serde_json::Value::Array(groups_json);
+            }
+        }
+        ToolResult::ok("aggregate", data, text)
     }
 
     /// `issues`: the workbook's problems (see
@@ -1452,15 +1526,15 @@ impl<'a> Tools<'a> {
             }
             "graph_overview" => ToolRequest::GraphOverview,
             "workbook_info" => ToolRequest::WorkbookInfo,
-            "filter" => {
-                return "filter takes a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into()
+            "filter" | "aggregate" => {
+                return "filter and aggregate take a JSON request: {\"tool\": \"filter\", \"range\": ..., \"where\": [...]}".into()
             }
             "issues" => ToolRequest::Issues {
                 range: arg("range").filter(|r| !r.is_empty()),
             },
             other => {
                 return format!(
-                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, filter, what_if, issues, graph_overview"
+                    "unknown tool {other}; available: workbook_info, search, expand, get_cells, list_formulas, filter, aggregate, what_if, issues, graph_overview"
                 )
             }
         };
@@ -1576,6 +1650,306 @@ fn listed(items: &[String], max: usize) -> String {
     }
     out
 }
+
+/// A table's data rows, as `filter` and `aggregate` read them: the
+/// rows checked, what each formula cell computes, and the conditions
+/// resolved to columns.
+struct TableRows<'t> {
+    sheet: &'t gridtalk_graph::SheetSnapshot,
+    region: &'t gridtalk_graph::Region,
+    /// The first row below the heading.
+    first_data: usize,
+    /// The rows checked, inclusive.
+    top: usize,
+    bottom: usize,
+    computed: std::collections::HashMap<(usize, usize), Result<Value, String>>,
+    tests: Vec<(usize, Condition)>,
+}
+
+impl TableRows<'_> {
+    /// A column's heading; `None` without a heading row (the headings
+    /// are then the letters themselves) or for an empty heading.
+    fn heading_of(&self, c: usize) -> Option<&str> {
+        let h = self.region.headers.get(c - self.region.range.c0)?.trim();
+        (!h.is_empty() && self.region.header_row.is_some()).then_some(h)
+    }
+
+    /// A column's heading, or its letter.
+    fn name_of(&self, c: usize) -> String {
+        self.heading_of(c)
+            .map(str::to_string)
+            .unwrap_or_else(|| gridtalk_graph::col_name(c))
+    }
+
+    /// A column named by heading (ignoring case) or letter, or what
+    /// to say about a name that is neither.
+    fn resolve(&self, name: &str) -> Result<usize, String> {
+        let table = &self.region.range;
+        let wanted = name.trim();
+        if let Some(c) = (table.c0..=table.c1).find(|&c| {
+            self.heading_of(c)
+                .is_some_and(|h| h.eq_ignore_ascii_case(wanted))
+        }) {
+            return Ok(c);
+        }
+        if let Some(c) = column_letters(wanted) {
+            if (table.c0..=table.c1).contains(&c) {
+                return Ok(c);
+            }
+        }
+        let named: Vec<&str> = (table.c0..=table.c1)
+            .filter_map(|c| self.heading_of(c))
+            .collect();
+        let mut text = format!("no column {wanted} in {}", table.a1());
+        if let Some(near) = did_you_mean(wanted, &named) {
+            text.push_str(&format!(" (did you mean {near}?)"));
+        }
+        let all: Vec<String> = (table.c0..=table.c1)
+            .map(|c| match self.heading_of(c) {
+                Some(h) => format!("{h} ({})", gridtalk_graph::col_name(c)),
+                None => gridtalk_graph::col_name(c),
+            })
+            .collect();
+        text.push_str(&format!("; its columns are {}", listed(&all, 40)));
+        Err(text)
+    }
+
+    /// What a cell holds, or what its formula computes.
+    fn value_at(&self, r: usize, c: usize) -> Result<Value, String> {
+        match self.sheet.get_ref(r, c) {
+            CellValue::Formula { .. } => self
+                .computed
+                .get(&(r, c))
+                .cloned()
+                .unwrap_or(Ok(Value::Empty)),
+            CellValue::Empty => Ok(Value::Empty),
+            CellValue::Text(t) => Ok(Value::Text(t.clone())),
+            CellValue::Number(n) => Ok(Value::Number(*n)),
+            CellValue::Bool(b) => Ok(Value::Bool(*b)),
+        }
+    }
+
+    /// The rows that meet every condition, top down, and how many
+    /// non-empty rows were checked.
+    fn matching_rows(&self) -> (Vec<usize>, usize) {
+        let table = &self.region.range;
+        let mut checked = 0;
+        let rows = (self.top..=self.bottom)
+            .filter(|&r| {
+                !(table.c0..=table.c1).all(|c| matches!(self.sheet.get_ref(r, c), CellValue::Empty))
+            })
+            .inspect(|_| checked += 1)
+            .filter(|&r| {
+                self.tests
+                    .iter()
+                    .all(|(c, condition)| condition_holds(&self.value_at(r, *c), condition))
+            })
+            .collect();
+        (rows, checked)
+    }
+
+    /// The rows checked, as a range over the whole table's width.
+    fn checked_range(&self) -> String {
+        let table = &self.region.range;
+        gridtalk_graph::RangeRef {
+            sheet: self.sheet.name.clone(),
+            r0: self.top,
+            c0: table.c0,
+            r1: self.bottom.max(self.top),
+            c1: table.c1,
+        }
+        .a1()
+    }
+
+    /// One column over the rows checked.
+    fn column_range(&self, c: usize) -> String {
+        gridtalk_graph::RangeRef {
+            sheet: self.sheet.name.clone(),
+            r0: self.top,
+            c0: c,
+            r1: self.bottom.max(self.top),
+            c1: c,
+        }
+        .a1()
+    }
+
+    /// `Table Sheet!A1:D9[, rows ...][ where ...]`.
+    fn heading_line(&self) -> String {
+        let table = &self.region.range;
+        let mut text = format!("Table {}", table.a1());
+        if (self.top, self.bottom) != (self.first_data, table.r1) {
+            text.push_str(&format!(", rows {}", self.checked_range()));
+        }
+        if !self.tests.is_empty() {
+            let described: Vec<String> = self
+                .tests
+                .iter()
+                .map(|(c, cond)| {
+                    format!("{} {} {}", self.name_of(*c), cond.op.as_str(), cond.value)
+                })
+                .collect();
+            text.push_str(&format!(" where {}", described.join(" and ")));
+        }
+        text
+    }
+
+    fn where_json(&self) -> Vec<serde_json::Value> {
+        self.tests
+            .iter()
+            .map(|(c, cond)| {
+                serde_json::json!({
+                    "column": cond.column, "letter": gridtalk_graph::col_name(*c),
+                    "op": cond.op, "value": cond.value
+                })
+            })
+            .collect()
+    }
+}
+
+/// `aggregate`'s figures for one column over some rows.
+struct Stats {
+    rows: usize,
+    blanks: usize,
+    numbers: usize,
+    texts: usize,
+    errors: usize,
+    /// Distinct non-empty values that are not numbers, ignoring case.
+    distinct_text: usize,
+    sum: f64,
+    /// (value, 0-based row) of the smallest and largest number.
+    min: Option<(f64, usize)>,
+    max: Option<(f64, usize)>,
+    column: usize,
+}
+
+impl Stats {
+    fn of(t: &TableRows, c: usize, rows: &[usize]) -> Stats {
+        let mut stats = Stats {
+            rows: rows.len(),
+            blanks: 0,
+            numbers: 0,
+            texts: 0,
+            errors: 0,
+            distinct_text: 0,
+            sum: 0.0,
+            min: None,
+            max: None,
+            column: c,
+        };
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for &r in rows {
+            match t.value_at(r, c) {
+                Ok(Value::Number(n)) => {
+                    stats.numbers += 1;
+                    stats.sum += n;
+                    if stats.min.is_none_or(|(m, _)| n < m) {
+                        stats.min = Some((n, r));
+                    }
+                    if stats.max.is_none_or(|(m, _)| n > m) {
+                        stats.max = Some((n, r));
+                    }
+                }
+                Ok(Value::Empty) => stats.blanks += 1,
+                Ok(Value::Text(s)) if s.trim().is_empty() => stats.blanks += 1,
+                Ok(other) => {
+                    stats.texts += 1;
+                    seen.insert(other.display().trim().to_lowercase());
+                }
+                Err(_) => stats.errors += 1,
+            }
+        }
+        stats.distinct_text = seen.len();
+        stats
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.numbers > 0).then(|| self.sum / self.numbers as f64)
+    }
+
+    fn address(&self, sheet: &str, row: usize) -> String {
+        format!(
+            "{}!{}{}",
+            quote_sheet(sheet),
+            gridtalk_graph::col_name(self.column),
+            row + 1
+        )
+    }
+
+    /// `label (where): 12 numbers, sum 1200, mean 100, min 5 (Sheet!C4),
+    /// max 300 (Sheet!C9); 2 blank; 1 text (1 distinct); 1 error`.
+    fn line(&self, sheet: &str, label: &str, place: &str) -> String {
+        let n = |x: f64| CellValue::Number(significant(x, 12)).display();
+        let mut parts = Vec::new();
+        if self.numbers > 0 {
+            let mut figures = format!("{}, sum {}", plural(self.numbers, "number"), n(self.sum));
+            if let Some(mean) = self.mean() {
+                figures.push_str(&format!(", mean {}", n(mean)));
+            }
+            if let (Some((lo, lo_row)), Some((hi, hi_row))) = (self.min, self.max) {
+                figures.push_str(&format!(
+                    ", min {} ({}), max {} ({})",
+                    n(lo),
+                    self.address(sheet, lo_row),
+                    n(hi),
+                    self.address(sheet, hi_row)
+                ));
+            }
+            parts.push(figures);
+        }
+        if self.texts > 0 {
+            parts.push(format!(
+                "{} text ({} distinct)",
+                self.texts, self.distinct_text
+            ));
+        }
+        if self.blanks > 0 {
+            parts.push(format!("{} blank", self.blanks));
+        }
+        if self.errors > 0 {
+            parts.push(plural(self.errors, "error"));
+        }
+        if parts.is_empty() {
+            parts.push("no rows".into());
+        }
+        format!("{label} ({place}): {}", parts.join("; "))
+    }
+
+    fn json(&self, sheet: &str) -> serde_json::Value {
+        let at = |m: Option<(f64, usize)>| {
+            m.map(|(v, r)| serde_json::json!({"value": v, "address": self.address(sheet, r)}))
+        };
+        serde_json::json!({
+            "rows": self.rows, "numbers": self.numbers, "text": self.texts,
+            "distinct_text": self.distinct_text, "blanks": self.blanks, "errors": self.errors,
+            "sum": (self.numbers > 0).then_some(self.sum), "mean": self.mean(),
+            "min": at(self.min), "max": at(self.max),
+        })
+    }
+}
+
+/// `x` rounded to `digits` significant digits, so a sum of many
+/// decimals reads `447088.07`, not `447088.0700000005`. The JSON keeps
+/// the exact value.
+fn significant(x: f64, digits: i32) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let decimals = (digits - 1 - x.abs().log10().floor() as i32).clamp(0, 15);
+    let scale = 10f64.powi(decimals);
+    (x * scale).round() / scale
+}
+
+/// `1 row`, `3 rows`.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// Most groups `aggregate` lists; `groups_total` counts them all.
+pub const MAX_AGGREGATE_GROUPS: usize = 100;
 
 /// Rows `filter` returns by default.
 pub const DEFAULT_FILTER_ROWS: usize = 50;
@@ -2096,6 +2470,100 @@ mod tests {
         .is_err());
     }
 
+    /// `aggregate` over the same table as the `filter` test: one
+    /// column, per group (merged ignoring case), rows per group, every
+    /// column, and only the rows a condition keeps.
+    #[test]
+    fn aggregate_adds_up_columns_and_groups() {
+        let wb = parse_delimited(
+            "demo",
+            "Sales",
+            "Account,Region,Amount,Net\nA-1,EMEA,7000,=C2*0.9\nA-2,APAC,9000,=C3*0.9\nA-3,emea,4000,=C4*0.9\nA-4,EMEA North,12000,=C5*0.9\nA-5,EMEA,abc,=1/0\n",
+            ',',
+        );
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        let tools = Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        };
+        let call = |json: serde_json::Value| {
+            let req: ToolRequest = serde_json::from_value(json).unwrap();
+            tools.call(&req)
+        };
+
+        let res =
+            call(serde_json::json!({"tool": "aggregate", "range": "Sales!A1", "column": "amount"}));
+        assert!(res.ok, "{}", res.text);
+        assert_eq!(
+            res.text,
+            "Table Sales!A1:D6: 5 of 5 rows match\nAmount (Sales!C2:C6): 4 numbers, sum 32000, mean 8000, min 4000 (Sales!C4), max 12000 (Sales!C5); 1 text (1 distinct)"
+        );
+        let amount = &res.data["columns"][0];
+        assert_eq!(amount["sum"], 32000.0);
+        assert_eq!(amount["min"]["address"], "Sales!C4");
+        assert_eq!(amount["text"], 1);
+
+        // Per group, on a formula column: the failed formula is an
+        // error, not a zero.
+        let res = call(
+            serde_json::json!({"tool": "aggregate", "range": "Sales!A1:D6", "column": "Net", "group_by": "B"}),
+        );
+        let lines: Vec<&str> = res.text.lines().collect();
+        assert_eq!(lines[1], "3 groups of Net by Region", "{}", res.text);
+        assert_eq!(
+            lines[2],
+            "EMEA (3 rows): 2 numbers, sum 9900, mean 4950, min 3600 (Sales!D4), max 6300 (Sales!D2); 1 error"
+        );
+        assert!(
+            lines[3].starts_with("APAC (1 row): 1 number, sum 8100"),
+            "{}",
+            res.text
+        );
+        assert!(lines[4].starts_with("EMEA North (1 row)"), "{}", res.text);
+        assert_eq!(res.data["groups"][0]["group"], "EMEA");
+        assert_eq!(res.data["groups"][0]["sum"], 9900.0);
+        assert_eq!(res.data["groups"][0]["errors"], 1);
+        assert_eq!(res.data["groups_total"], 3);
+
+        // Rows per group; a profile of every column; a condition.
+        let res = call(
+            serde_json::json!({"tool": "aggregate", "range": "Sales!A1", "group_by": "Region"}),
+        );
+        assert!(
+            res.text
+                .ends_with("\nEMEA: 3 rows\nAPAC: 1 row\nEMEA North: 1 row"),
+            "{}",
+            res.text
+        );
+        let res = call(serde_json::json!({"tool": "aggregate", "range": "Sales!B2"}));
+        assert_eq!(res.data["columns"].as_array().unwrap().len(), 4);
+        assert!(
+            res.text
+                .contains("\nAccount (Sales!A2:A6): 5 text (5 distinct)"),
+            "{}",
+            res.text
+        );
+        assert!(
+            res.text
+                .contains("\nRegion (Sales!B2:B6): 5 text (3 distinct)"),
+            "{}",
+            res.text
+        );
+        let res = call(
+            serde_json::json!({"tool": "aggregate", "range": "Sales!A1", "column": "Amount",
+            "where": [{"column": "Region", "op": "contains", "value": "emea"}]}),
+        );
+        assert!(res.text.starts_with("Table Sales!A1:D6 where Region contains emea: 4 of 5 rows match\nAmount (Sales!C2:C6): 3 numbers, sum 23000"), "{}", res.text);
+        let res = call(
+            serde_json::json!({"tool": "aggregate", "range": "Sales!A1", "group_by": "Regoin"}),
+        );
+        assert_eq!(res.data["error"]["kind"], "unknown_column");
+        assert!(res.text.contains("(did you mean Region?)"), "{}", res.text);
+    }
+
     #[test]
     fn did_you_mean_takes_near_names_only() {
         let names = ["Labour", "Rates", "Summary 2024"];
@@ -2113,6 +2581,9 @@ mod tests {
         );
         assert_eq!(did_you_mean("rate", &["Discount Rate", "Tax Rate"]), None);
         assert_eq!(did_you_mean("", &names), None);
+        assert_eq!(significant(447_088.070_000_000_5, 12), 447_088.07);
+        assert_eq!(significant(931.433_479_166_667_7, 12), 931.433_479_167);
+        assert_eq!(significant(1e20, 12), 1e20);
         assert_eq!(column_letters("d"), Some(3));
         assert_eq!(column_letters("XFD"), Some(16_383));
         assert_eq!(column_letters("XFE"), None);

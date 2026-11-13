@@ -59,7 +59,7 @@ How to work:
 1. Find what the question is about. `search` finds tables by the words in them. `workbook_info` lists the sheets, defined names and tables, and is where a question about the workbook or a whole sheet starts.
 2. See how it connects. A column reads the columns its formulas refer to, and feeds the columns whose formulas refer to it. `expand` on a column or table range lists what it reads (-depends_on->) and what reads it (<-depends_on-), each with its range. To follow an input to a result, expand each step of the chain.
 3. Read the cells. `list_formulas` gives a column's formula, how far it is filled down and any cell that breaks the pattern. `get_cells` gives values with their addresses.
-   `filter` finds a table's rows by value (Region = EMEA, Amount > 5000). `issues` lists formula errors and other problems.
+   `filter` finds a table's rows by value (Region = EMEA, Amount > 5000); `aggregate` adds a column up, per group if asked. `issues` lists formula errors and other problems.
 4. Answer as soon as the results show the answer. Do not repeat a call or read something a result already shows.
 
 Rules:
@@ -269,6 +269,12 @@ fn ranges_read(request: &ToolRequest, data: &serde_json::Value, tools: &Tools) -
             .flatten()
             .filter_map(|row| row["range"].as_str())
             .filter_map(canonical)
+            .collect(),
+        // The rows it added up, over the table's width.
+        ToolRequest::Aggregate { .. } => data["checked"]
+            .as_str()
+            .and_then(canonical)
+            .into_iter()
             .collect(),
         ToolRequest::WorkbookInfo | ToolRequest::GraphOverview => Vec::new(),
     }
@@ -1054,7 +1060,7 @@ mod tests {
                 "response", "answer"
             ]
         );
-        assert_eq!(seen.events[0]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(seen.events[0]["tools"].as_array().unwrap().len(), 9);
         assert_eq!(seen.events[1]["messages"].as_array().unwrap().len(), 2);
         assert_eq!(seen.events[3]["name"], "expand");
         assert_eq!(seen.events[9]["tool_calls"], 2);
@@ -1172,7 +1178,7 @@ mod tests {
             .filter(|m| m.role == Role::Tool)
             .map(|m| m.content.as_str())
             .collect();
-        assert!(results[0].starts_with("error: no tool named read_cells. The tools are workbook_info, search, expand, get_cells, list_formulas, filter, issues, what_if."), "{}", results[0]);
+        assert!(results[0].starts_with("error: no tool named read_cells. The tools are workbook_info, search, expand, get_cells, list_formulas, filter, aggregate, issues, what_if."), "{}", results[0]);
         assert!(
             results[1].starts_with("error: bad arguments for get_cells: unknown field `cells`"),
             "{}",
@@ -1233,9 +1239,10 @@ mod tests {
             read(6, "Labour!A6:E41"),
             says("Labour!E2 is the first cost."),
         ]);
-        // A small window: 4,000 tokens, a quarter of them kept for the
-        // model's turn.
-        backend.context = Some(4_000);
+        // A small window: 4,500 tokens, a quarter of them kept for the
+        // model's turn. It must hold the prompt and every tool's spec
+        // and still cut the first result, so it grows with the tools.
+        backend.context = Some(4_500);
         let (inv, seen) = run_with(&fixture, &backend, "What is the first cost?", 8, None, true);
         let asked = backend.asked();
         // The whole table is 40 lines of some 45 characters; the model
@@ -1280,7 +1287,7 @@ mod tests {
         );
         for (_, messages) in &asked {
             assert!(
-                conversation_chars(messages) < 4_000 * 3,
+                conversation_chars(messages) < 4_500 * 3,
                 "{}",
                 conversation_chars(messages)
             );

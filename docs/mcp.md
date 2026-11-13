@@ -124,6 +124,16 @@ case-insensitively, and cells must lie inside the sheet grid
   `address` and `column` heading. `limit` is 1-200 (default 50);
   `matched` counts every matching row, `rows_checked` the non-empty
   rows, and `truncated` says when more matched than are shown.
+- `aggregate`: figures over the rows of a table that meet `where`
+  (the same conditions as `filter`; none keeps every row). With a
+  `column`: `rows`, `numbers`, `text` (with `distinct_text`),
+  `blanks`, `errors` (formulas that fail; never counted as zero),
+  `sum`, `mean`, and `min`/`max` each with the `address` of its cell.
+  With `group_by` too: the same per value of that column (`groups`,
+  merged ignoring case and surrounding spaces, in the order they first
+  appear; at most 100, `groups_total` counts all). `group_by` alone
+  counts rows per group; neither profiles every column (`columns`).
+  Columns are named by heading or letter, as in `filter`.
 - `issues`: problems in the workbook's formulas, errors first. Each
   issue has a `kind`, a `severity` (`error` or `warning`), the
   `range` of its cells (or the defined `name`), a `detail`, a
