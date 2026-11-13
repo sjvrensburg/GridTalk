@@ -326,7 +326,13 @@ impl Node {
         let Some(r) = &self.range else {
             return self.label.clone();
         };
-        let a1 = r.a1();
+        // A single cell reads as one, `Lists!Q4` rather than
+        // `Lists!Q4:Q4`.
+        let a1 = if r.r0 == r.r1 && r.c0 == r.c1 {
+            format!("{}!{}{}", quote_sheet(&r.sheet), col_name(r.c0), r.r0 + 1)
+        } else {
+            r.a1()
+        };
         let label = self.label.trim();
         let unheaded =
             label.is_empty() || (self.kind == NodeKind::Column && label == col_name(r.c0));
@@ -1918,8 +1924,30 @@ pub fn build_graph_cached(
                 to: rid,
                 kind: "contains".into(),
             });
+            let labelled = labelled_cells(sheet, &region);
             for (i, h) in region.headers.iter().enumerate() {
                 let col = region.range.c0 + i;
+                if let (Some(cells), 1) = (&labelled, i) {
+                    // A labelled block's values: one node per cell,
+                    // named by the label to its left, so a formula
+                    // reading two parameters names both (#42).
+                    for (row, label) in cells {
+                        let crange = RangeRef {
+                            sheet: sheet.name.clone(),
+                            r0: *row,
+                            c0: col,
+                            r1: *row,
+                            c1: col,
+                        };
+                        let cid = push(&mut g, NodeKind::Column, label.clone(), Some(crange), None);
+                        g.edges.push(Edge {
+                            from: rid,
+                            to: cid,
+                            kind: "contains".into(),
+                        });
+                    }
+                    continue;
+                }
                 let crange = RangeRef {
                     sheet: sheet.name.clone(),
                     r0: region.range.r0,
@@ -2017,6 +2045,48 @@ pub fn build_graph_cached(
     cache.audit_cursor = (audit_start + CACHE_AUDIT_SAMPLE) % window;
     let violations = check_invariants_with(wb, &g, &precedents, &area_nodes);
     (g, violations)
+}
+
+/// The most rows a labelled block may have: past this a two-column
+/// list is data (names and scores), not a block of parameters.
+pub const MAX_LABELLED_ROWS: usize = 50;
+
+/// A labelled block's value cells: in a two-column region whose right
+/// column has no heading, a text label in every row on the left and
+/// no text on the right ("Examination Weight | 0.7"), each row's value
+/// cell with its label (trimmed, a trailing colon dropped). `None` for
+/// any other region, or when a label repeats (it would not tell its
+/// cells apart).
+fn labelled_cells(sheet: &SheetSnapshot, region: &Region) -> Option<Vec<(usize, String)>> {
+    let r = &region.range;
+    if r.c1 != r.c0 + 1 {
+        return None;
+    }
+    let first = match region.header_row {
+        // A heading over the values names them all; keep the column.
+        Some(h) if !sheet.get_ref(h, r.c1).display().trim().is_empty() => return None,
+        Some(h) => h + 1,
+        None => r.r0,
+    };
+    if first > r.r1 || r.r1 - first + 1 > MAX_LABELLED_ROWS {
+        return None;
+    }
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for row in first..=r.r1 {
+        let CellValue::Text(label) = sheet.get_ref(row, r.c0) else {
+            return None;
+        };
+        let label = label.trim();
+        let label = label.strip_suffix(':').unwrap_or(label).trim_end();
+        if label.is_empty()
+            || matches!(sheet.get_ref(row, r.c1), CellValue::Text(_))
+            || out.iter().any(|(_, l)| l.eq_ignore_ascii_case(label))
+        {
+            return None;
+        }
+        out.push((row, label.to_string()));
+    }
+    Some(out)
 }
 
 fn col_from_letters(letters: &str) -> Option<usize> {
@@ -2568,6 +2638,61 @@ pub fn render_passage(sheet: &SheetSnapshot, region: &Region) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_labelled_block_gives_each_value_cell_its_label() {
+        let csv = "Exam,Year,Mark,,Semester Mark Weight,0.3\n\
+                   60,70,\"=ROUND(B2*$F$1+A2*$F$2,0)\",,Examination Weight:,0.7\n\
+                   50,40,\"=ROUND(B3*$F$1+A3*$F$2,0)\",,Minimum to Pass,50\n";
+        let wb = parse_delimited("book", "Sheet1", csv, ',');
+        let (g, violations) = build_graph(&wb);
+        assert!(violations.is_empty(), "{violations:?}");
+        let named = |label: &str| g.nodes.iter().find(|n| n.label == label);
+        let mark = named("Mark").unwrap().id;
+        let reads: Vec<String> = g
+            .edges
+            .iter()
+            .filter(|e| e.kind == "depends_on" && e.from == mark)
+            .map(|e| g.nodes[e.to].cited_label())
+            .collect();
+        for want in [
+            "Semester Mark Weight  Sheet1!F1",
+            "Examination Weight  Sheet1!F2",
+            "Exam  Sheet1!A1:A3",
+            "Year  Sheet1!B1:B3",
+        ] {
+            assert!(reads.iter().any(|r| r == want), "{want} not in {reads:?}");
+        }
+        // The cell the formula does not read is not a precedent, and
+        // no whole-column node stands for the values.
+        let min_pass = named("Minimum to Pass").unwrap().id;
+        assert!(!g.edges.iter().any(|e| e.from == mark && e.to == min_pass));
+        assert!(named("F").is_none());
+        // The label column keeps its column node.
+        assert!(named("E").is_some());
+    }
+
+    #[test]
+    fn a_two_column_list_with_a_heading_or_repeats_keeps_its_column() {
+        for csv in [
+            // A heading over the values names them all.
+            "Name,Score\nAda,90\nBo,80\n",
+            // A repeated label could not tell its cells apart.
+            "Rate,1\nRate,2\n",
+            // Text on the right is not a value.
+            "Rate,high\nCap,2\n",
+        ] {
+            let wb = parse_delimited("book", "Sheet1", csv, ',');
+            let (g, violations) = build_graph(&wb);
+            assert!(violations.is_empty(), "{violations:?}");
+            let columns = g
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Column)
+                .count();
+            assert_eq!(columns, 2, "{csv}: {:?}", g.nodes);
+        }
+    }
 
     #[test]
     fn cited_label_carries_the_range_and_stands_in_for_a_missing_heading() {
