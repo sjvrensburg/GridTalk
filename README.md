@@ -21,8 +21,8 @@ practice and we have no Apple hardware to test on.
 
 Working local-first prototype: CSV/TSV/XLSX/XLSM/XLS/ODS ingestion, XLSB as values only (via the
 vendored Gridcraft engine), a lifted property graph with cited
-answers, hybrid lexical+embedding search, an investigate tool
-harness, a dual-view desktop UI, and real local GGUF generation on
+answers, hybrid lexical+embedding search, an investigate harness in
+which the model chooses its own tool calls, a dual-view desktop UI, and real local GGUF generation on
 llama.cpp over Vulkan for any GGUF model (including Qwen3-MoE)
 on Linux and Windows. macOS is not a target. With no
 model configured, chat uses a deterministic echo backend so the

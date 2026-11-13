@@ -9,7 +9,8 @@ local agent on a workbook shape *without retraining the model*.
 ```
 <config>/gridtalk/adapters/<name>/
   ADAPTER.md     learned rules (plain markdown, human-reviewable)
-  adapter.toml   version pointer + knobs: top_k, max_steps, ref_context
+  adapter.toml   version pointer + knobs: top_k, max_steps, ref_context,
+                 tool_loop, first_call
   CARD.md        eval record appended every optimise round
   skills/*.md    optional skills; the first `Triggers: a, b` line
                  scopes a skill to matching questions (no line =
@@ -24,7 +25,14 @@ Knobs the harness honours today: `top_k` (search hits),
 `max_steps` (investigate budget), `ref_context` (when a question
 names a cell like `Sheet1!D2`, include that cell directly even if
 retrieval missed it; on by default, as with no adapter, so set
-`ref_context = false` to turn it off).
+`ref_context = false` to turn it off), and two for the tool loop
+(decision 0006), both on by default: `tool_loop` (let the model
+choose its own tool calls when the backend can take tool turns;
+`false` keeps the fixed pipeline) and `first_call` (make the
+model's first turn a tool call; `false` lets it answer at once from
+what the planner already read). In the tool loop `max_steps` bounds
+the model's calls; the planner's opening reads, at most four, come
+on top.
 
 Loading order: built-in prompt → adapter rules → matched skills
 → per-workbook sidecar. The sidecar is `<workbook>.gridtalk.md`,

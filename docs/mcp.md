@@ -95,8 +95,18 @@ case-insensitively, and cells must lie inside the sheet grid
   there are more.
 - `get_cells`: typed values; a formula cell carries `result`, what it
   computes, and `cached_result`, what the file cached, both typed,
-  plus `error` when evaluation failed. At most 10,000 cells per call.
-- `list_formulas`: formulas with evaluated values.
+  plus `error` when evaluation failed. Every cell carries its
+  `address` (`Labour!D2`), and the result names the `sheet`, the
+  `first_row` and the `columns`, so a cell can be cited without
+  counting columns. At most 10,000 cells per call.
+- `list_formulas`: formulas with evaluated values, each with its
+  `cell` (`F2`) and its sheet-qualified `address` (`Labour!F2`).
+  `columns` describes each column of the range that holds three or
+  more formulas: how many share its commonest `pattern` (compared in
+  R1C1, so a formula filled down is one pattern), an `example`, the
+  `other_formulas` that differ, and `typed_values`, the cells
+  holding a typed value where the column otherwise holds formulas
+  (a formula that has been typed over).
 - `what_if`: before and after values of a target when one cell is
   set to a number, evaluated on a copy.
 - `graph_overview`: nodes and edges, capped at 500 / 2,000.

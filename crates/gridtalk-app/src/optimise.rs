@@ -211,12 +211,14 @@ pub fn optimise_round(
      -> Result<(Option<f64>, Vec<TaskResult>), String> {
         let key = match adapter {
             Some(a) => format!(
-                "{}|{}|{}|{}|{}|{:?}",
+                "{}|{}|{}|{}|{}|{}|{}|{:?}",
                 split,
                 a.rules,
                 a.top_k,
                 a.max_steps,
                 a.ref_context,
+                a.tool_loop,
+                a.first_call,
                 a.skills
                     .iter()
                     .map(|sk| format!("{}:{:?}:{}", sk.name, sk.triggers, sk.body))
@@ -234,6 +236,7 @@ pub fn optimise_round(
             split,
             adapter.map(|a| a.max_steps).unwrap_or(8),
             adapter,
+            true,
         )
         .map_err(|e| e.to_string())?;
         // Errored tasks (backend/tool failures folded into results
@@ -526,6 +529,8 @@ mod tests {
             citation_hit: None,
             latency_ms: 0.0,
             trail_steps: steps,
+            carried: false,
+            model_turns: 1,
             error: None,
         };
         let current = Adapter::empty("demo");

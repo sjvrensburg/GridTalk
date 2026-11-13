@@ -12,16 +12,18 @@ mod layout;
 use egui::{Key, KeyboardShortcut, Modifiers};
 use eval_worker::{Lookup, ValueCache};
 use gridtalk_adapter::{
-    adapters_root, cap_prompt, list_adapters, load_adapter, prompt_text, sidecar_rules,
-    valid_adapter_name, write_atomic_bytes,
+    adapters_root, list_adapters, load_adapter, sidecar_rules, valid_adapter_name,
+    write_atomic_bytes,
 };
+use gridtalk_agent::investigate::{contains_bounded, investigate_run, Ask, Run};
+use gridtalk_agent::tools::{parse_range_uncapped, Tools};
 use gridtalk_graph::{
     build_graph_cached, load_path, CellEdit, CellValue, Graph, GraphCache, IncrementalSnapshot,
     NodeKind, RangeRef,
 };
 use gridtalk_index::HybridIndex as Index;
 use gridtalk_infer::config::Config;
-use gridtalk_infer::{backend_from_config, cleartext_url_warning, cleartext_warning, ChatRequest};
+use gridtalk_infer::{backend_from_config, cleartext_url_warning, cleartext_warning};
 use history::History;
 use layout::{spawn_layout, LayoutWorker, Pos};
 use serde::{Deserialize, Serialize};
@@ -364,105 +366,60 @@ fn chat_history(chat: &[ChatMsg]) -> Vec<gridtalk_index::ChatTurn> {
     turns
 }
 
-/// What a question about the selection stands on: the selected
-/// node's graph neighbours (what it reads, what reads it) and
-/// the selected cells themselves, bounded so a whole-column
-/// selection cannot flood the prompt.
-fn selection_context(
-    graph: &Graph,
+/// What the chat worker sends back.
+enum ChatEvent {
+    /// A tool call that has just run (`get_cells range=Sheet1!A1:B2`).
+    Step(String),
+    /// The answer, or the error that ended the run (`who` is then
+    /// `error`).
+    Done {
+        workbook: String,
+        who: String,
+        text: String,
+        sources: Vec<RangeRef>,
+    },
+}
+
+/// Most ranges on an answer's "Sources:" line.
+const MAX_ANSWER_SOURCES: usize = 8;
+
+/// The ranges an answer's "Sources:" line offers: the citations the
+/// answer itself names first, then the others that were read, each
+/// on a sheet the workbook has.
+fn answer_sources(
+    answer: &str,
+    citations: &[String],
     wb: &gridtalk_graph::WorkbookSnapshot,
-    sel: &RangeRef,
-) -> String {
-    let mut out = format!("selected {}:\n", sel.a1());
-    let header_len = out.len();
-    // The node the whole selection sits in (as the `expand` tool
-    // picks it): its exact node, else the smallest region or
-    // column covering it, not merely the one holding its first
-    // cell, so B1:C3 reads the region rather than column B alone.
-    let covering = graph
-        .nodes
-        .iter()
-        .find(|n| n.range.as_ref() == Some(sel))
-        .or_else(|| {
-            graph
-                .nodes
-                .iter()
-                .filter(|n| matches!(n.kind, NodeKind::Region | NodeKind::Column))
-                .filter(|n| {
-                    n.range.as_ref().is_some_and(|r| {
-                        gridtalk_graph::sheet_name_eq(&r.sheet, &sel.sheet)
-                            && r.contains(sel.r0, sel.c0)
-                            && r.contains(sel.r1, sel.c1)
-                    })
-                })
-                .min_by_key(|n| {
-                    n.range
-                        .as_ref()
-                        .map_or(u128::MAX, gridtalk_graph::range_area)
-                })
-        })
-        .map(|n| n.id);
-    if let Some(id) = covering {
-        if let Some(node) = graph.nodes.iter().find(|n| n.id == id) {
-            out.push_str(&format!("node {} ({})\n", node.id, node.cited_label()));
-            let mut shown = 0usize;
-            for e in &graph.edges {
-                let (other, arrow) = if e.from == id {
-                    (e.to, "->")
-                } else if e.to == id {
-                    (e.from, "<-")
-                } else {
-                    continue;
-                };
-                if shown >= 50 {
-                    out.push_str(" ... (more edges)\n");
-                    break;
-                }
-                if let Some(t) = graph.nodes.iter().find(|n| n.id == other) {
-                    out.push_str(&format!(" {}{} {}\n", arrow, e.kind, t.cited_label()));
-                    shown += 1;
-                }
-            }
+) -> Vec<RangeRef> {
+    let (named, other): (Vec<&String>, Vec<&String>) =
+        citations.iter().partition(|c| contains_bounded(answer, c));
+    let mut sources: Vec<RangeRef> = Vec::new();
+    for citation in named.into_iter().chain(other) {
+        let Some((sheet, r0, c0, r1, c1)) = parse_range_uncapped(citation) else {
+            continue;
+        };
+        let Some(sheet) = wb
+            .sheets
+            .iter()
+            .find(|s| gridtalk_graph::sheet_name_eq(&s.name, &sheet))
+        else {
+            continue;
+        };
+        let range = RangeRef {
+            sheet: sheet.name.clone(),
+            r0,
+            c0,
+            r1,
+            c1,
+        };
+        if !sources.contains(&range) {
+            sources.push(range);
+        }
+        if sources.len() == MAX_ANSWER_SOURCES {
+            break;
         }
     }
-    if let Some(sheet) = wb
-        .sheets
-        .iter()
-        .find(|s| gridtalk_graph::sheet_name_eq(&s.name, &sel.sheet))
-    {
-        out.push_str("cells:\n");
-        let mut cells = 0usize;
-        let last_row = sel.r1.min(sel.r0 + 99);
-        let mut cut = false;
-        'rows: for r in sel.r0..=last_row {
-            let mut line = Vec::new();
-            for c in sel.c0..=sel.c1 {
-                if cells >= 300 {
-                    // Keep the part of the row already read.
-                    if !line.is_empty() {
-                        out.push_str(&line.join(" | "));
-                        out.push('\n');
-                    }
-                    cut = true;
-                    break 'rows;
-                }
-                line.push(sheet.get(r, c).display());
-                cells += 1;
-            }
-            out.push_str(&line.join(" | "));
-            out.push('\n');
-        }
-        if cut || last_row < sel.r1 {
-            // Say so, so a cut selection never reads as complete.
-            out.push_str("... (selection cut at 100 rows / 300 cells)\n");
-        }
-    }
-    // Nothing behind the header (no node, no such sheet): empty,
-    // so the caller treats it as no context at all.
-    if out.len() == header_len {
-        return String::new();
-    }
-    out
+    sources
 }
 
 pub struct GridTalkApp {
@@ -526,11 +483,11 @@ pub struct GridTalkApp {
     pending_open: Option<std::path::PathBuf>,
     close_armed: bool,
     graph_version: u64,
-    chat_rx: Option<std::sync::mpsc::Receiver<(String, String, String)>>,
+    chat_rx: Option<std::sync::mpsc::Receiver<ChatEvent>>,
+    /// The tool call the answer in progress made last.
+    chat_progress: String,
     chat_busy: bool,
     chat_started: Option<std::time::Instant>,
-    /// The context ranges of the answer being generated.
-    chat_sources: Vec<RangeRef>,
     /// The range the last ask() selected itself (its top hit). While
     /// it is still the selection the user has not pointed at it, so
     /// "is it right?" does not read it as the user's selection.
@@ -644,9 +601,9 @@ impl GridTalkApp {
             close_armed: false,
             graph_version: 0,
             chat_rx: None,
+            chat_progress: String::new(),
             chat_busy: false,
             chat_started: None,
-            chat_sources: Vec::new(),
             ask_selected: None,
             chat_dropped: 0,
             history: History::default(),
@@ -884,7 +841,6 @@ impl GridTalkApp {
                 self.chat_cancel = None;
                 self.chat.clear();
                 self.chat_dropped = 0;
-                self.chat_sources.clear();
                 self.history.clear();
                 self.find_matches.clear();
                 self.find_for = None;
@@ -1044,18 +1000,15 @@ impl GridTalkApp {
         true
     }
 
-    /// Adapter prompt text for chat, built by the same
-    /// `gridtalk_adapter` code the CLI uses: rules, trigger-matched
-    /// skills, then the per-workbook `.gridtalk.md` sidecar (which
-    /// applies with or without an active adapter). Returns the
-    /// capped text and the adapter's `top_k`.
-    fn active_adapter_prompt(&self, question: &str) -> (String, usize) {
+    /// The active adapter, if one is chosen, and the per-workbook
+    /// `.gridtalk.md` sidecar's rules (which apply with or without
+    /// an adapter): what the shared planner and tool loop layer on
+    /// the built-in prompt, as the CLI does.
+    fn active_adapter(&self) -> (Option<gridtalk_adapter::Adapter>, Option<String>) {
         let sidecar = self.current_path.as_deref().and_then(sidecar_rules);
         let adapter = (!self.active_adapter.is_empty())
             .then(|| load_adapter(&adapters_root(), &self.active_adapter));
-        let top_k = adapter.as_ref().map_or(3, |a| a.top_k.clamp(1, 25));
-        let text = prompt_text(adapter.as_ref(), question, sidecar.as_deref());
-        (cap_prompt(text), top_k)
+        (adapter, sidecar)
     }
 
     /// Refresh the adapter picker cache (filesystem reads happen
@@ -1109,21 +1062,11 @@ impl GridTalkApp {
             self.push_chat("gridtalk", "Open a workbook first.".into());
             return;
         };
-        let (adapter_prompt, adapter_top_k) = self.active_adapter_prompt(&standalone);
-        let hits = index.search(&standalone, adapter_top_k);
-        // A question about the selection stands on the selection
-        // even when its own words match no region.
-        let selection_section = match (&asked_selection, &self.inc) {
-            (Some(sel), Some(inc)) => selection_context(&self.graph, inc.snapshot(), sel),
-            _ => String::new(),
-        };
-        if hits.is_empty() && selection_section.is_empty() {
-            self.push_chat(
-                "gridtalk",
-                format!("No matching region found for \"{question}\"."),
-            );
-            return;
-        }
+        let (adapter, sidecar) = self.active_adapter();
+        let top_k = adapter.as_ref().map_or(3, |a| a.top_k.clamp(1, 25));
+        // The search here only moves the selection to the top hit;
+        // the worker below searches again as part of answering.
+        let hits = index.search(&standalone, top_k);
         // A question about the selection keeps it selected, so a
         // follow-up ("and what reads it?") still points at it.
         if let Some(first) = hits.first().filter(|_| asked_selection.is_none()) {
@@ -1136,33 +1079,15 @@ impl GridTalkApp {
                 self.ask_selected = self.sync.selected_range.clone();
             }
         }
-        self.chat_sources = hits.iter().map(|h| h.range.clone()).collect();
-        if let Some(sel) = &asked_selection {
-            if !selection_section.is_empty() && !self.chat_sources.contains(sel) {
-                self.chat_sources.insert(0, sel.clone());
-            }
-        }
-        let mut context = hits
-            .iter()
-            .map(|h| format!("[{}]\n{}", h.range.a1(), h.passage))
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-        // The selection leads the context, ahead of the hits.
-        if !selection_section.is_empty() {
-            context = if context.is_empty() {
-                selection_section
-            } else {
-                format!("{selection_section}\n---\n{context}")
-            };
-        }
-        // The conversation so far, for the prompt: recent turns,
-        // each cut so one long turn cannot crowd out the rest.
-        let history_text = gridtalk_index::history_prompt(&history);
-        let searched_as = if standalone != question {
-            format!("(searched as: {standalone})\n")
-        } else {
-            String::new()
+        // The worker answers from its own copy of the workbook as it
+        // stands now (rows and embedding vectors are shared, not
+        // copied), so edits made while it runs do not reach it.
+        let Some(snapshot) = self.inc.as_ref().map(|inc| inc.snapshot().clone()) else {
+            self.push_chat("gridtalk", "Open a workbook first.".into());
+            return;
         };
+        let graph = self.graph.clone();
+        let index = index.clone();
         let config_path = self.config_path.clone();
         let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         self.chat_cancel = Some(cancel.clone());
@@ -1171,9 +1096,10 @@ impl GridTalkApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_rx = Some(rx);
         self.chat_busy = true;
+        self.chat_progress.clear();
         self.chat_started = Some(std::time::Instant::now());
-        // Generation (potentially seconds on a local model) runs on
-        // a worker thread; the UI polls the channel each frame.
+        // Answering (potentially many seconds on a local model) runs
+        // on a worker thread; the UI polls the channel each frame.
         std::thread::spawn(move || {
             let cfg = if config_path.is_empty() {
                 // Blank means the platform default the docs
@@ -1190,24 +1116,104 @@ impl GridTalkApp {
             };
             let backend = backend_from_config(&cfg.inference);
             let cleartext = cleartext_warning(&cfg.inference);
-            let req = ChatRequest {
-                system: format!(
-                    "You answer questions about a spreadsheet using only the cited context. Always cite the range.{adapter_prompt}"
-                ),
-                user: format!("{history_text}Question: {question}\n{searched_as}\nContext:\n{context}"),
-                max_tokens: 512,
+            let calc = gridtalk_graph::eval::EvalCache::new();
+            let tools = Tools {
+                wb: &snapshot,
+                graph: &graph,
+                hybrid: &index,
+                calc: &calc,
             };
-            let mut out = String::new();
-            let mut msg = match backend.stream(&req, &cancel, &mut |tok| out.push_str(tok)) {
-                Ok(()) => (workbook_tag.clone(), backend.name().to_string(), out),
-                Err(e) => (workbook_tag.clone(), "error".to_string(), e.to_string()),
+            let selection = asked_selection.as_ref().map(|sel| sel.a1());
+            let steps = tx.clone();
+            let outcome = investigate_run(
+                &Ask {
+                    question: &question,
+                    max_steps: adapter.as_ref().map_or(8, |a| a.max_steps),
+                    adapter: adapter.as_ref(),
+                    sidecar: sidecar.as_deref(),
+                    history: &history,
+                    selection: selection.as_deref(),
+                },
+                &tools,
+                backend.as_ref(),
+                &mut Run {
+                    cancel,
+                    on_token: &mut |_| {},
+                    on_step: &mut |step| {
+                        let _ = steps.send(ChatEvent::Step(format!("{} {}", step.tool, step.args)));
+                    },
+                    trace: None,
+                    tool_loop: true,
+                },
+            );
+            let (who, mut text, sources) = match outcome {
+                Ok(inv) => {
+                    let sources = answer_sources(&inv.answer, &inv.citations, &snapshot);
+                    (backend.name().to_string(), inv.answer, sources)
+                }
+                Err(e) => ("error".to_string(), e.to_string(), Vec::new()),
             };
             // Every answer that travelled over cleartext says so.
             if let Some(warning) = cleartext {
-                msg.2 = format!("Warning: {warning}\n\n{}", msg.2);
+                text = format!("Warning: {warning}\n\n{text}");
             }
-            let _ = tx.send(msg);
+            let _ = tx.send(ChatEvent::Done {
+                workbook: workbook_tag,
+                who,
+                text,
+                sources,
+            });
         });
+    }
+
+    /// Take what the chat worker has sent: the tool calls it has made
+    /// (the last one is shown while it works) and, at the end, the
+    /// answer.
+    fn poll_chat(&mut self, ctx: &egui::Context) {
+        loop {
+            let Some(rx) = &self.chat_rx else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(ChatEvent::Step(step)) => {
+                    self.chat_progress = step;
+                    ctx.request_repaint();
+                }
+                Ok(ChatEvent::Done {
+                    workbook,
+                    who,
+                    text,
+                    sources,
+                }) => {
+                    // Drop answers generated for a workbook that is
+                    // no longer open.
+                    if workbook == self.chat_workbook && workbook == self.workbook_name {
+                        self.push_chat_with_sources(&who, text, sources);
+                    }
+                    self.chat_rx = None;
+                    self.chat_busy = false;
+                    self.chat_progress.clear();
+                    self.chat_started = None;
+                    self.chat_cancel = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.push_chat(
+                        "error",
+                        "Generation stopped: the worker thread disconnected.".into(),
+                    );
+                    self.status = "Chat worker disconnected.".into();
+                    self.chat_rx = None;
+                    self.chat_busy = false;
+                    self.chat_progress.clear();
+                    self.chat_started = None;
+                    self.chat_cancel = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+            }
+        }
     }
 
     /// Pick a file to open (the Open button and Ctrl+O).
@@ -1986,41 +1992,7 @@ impl eframe::App for GridTalkApp {
             self.chat_cancel = None;
             self.status = "Generation timed out after 10 minutes; chat is ready again.".into();
         }
-        // Collect finished chat generations (worker thread).
-        if let Some(rx) = &self.chat_rx {
-            match rx.try_recv() {
-                Ok((wb_tag, role, text)) => {
-                    // Drop answers generated for a workbook that is
-                    // no longer open.
-                    if wb_tag == self.chat_workbook && wb_tag == self.workbook_name {
-                        let sources = if role == "error" {
-                            Vec::new()
-                        } else {
-                            std::mem::take(&mut self.chat_sources)
-                        };
-                        self.push_chat_with_sources(&role, text, sources);
-                    }
-                    self.chat_rx = None;
-                    self.chat_busy = false;
-                    self.chat_started = None;
-                    self.chat_cancel = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.push_chat(
-                        "error",
-                        "Generation stopped: the worker thread disconnected.".into(),
-                    );
-                    self.status = "Chat worker disconnected.".into();
-                    self.chat_rx = None;
-                    self.chat_busy = false;
-                    self.chat_started = None;
-                    self.chat_cancel = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                }
-            }
-        }
+        self.poll_chat(&ctx);
         // After a flush, drop edit buffers that now match the cell.
         if let Some(inc) = &self.inc {
             if inc.pending_edits() == 0 && !self.edit_buffers.is_empty() {
@@ -2919,7 +2891,13 @@ impl GridTalkApp {
         if self.chat_busy {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Generating…");
+                if self.chat_progress.is_empty() {
+                    ui.label("Reading the workbook…");
+                } else {
+                    // The tool call made last, cut to one line.
+                    let step: String = self.chat_progress.chars().take(60).collect();
+                    ui.label(format!("Read: {step}"));
+                }
                 if ui.button("Cancel").clicked() {
                     if let Some(cancel) = &self.chat_cancel {
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3339,78 +3317,73 @@ mod tests {
         );
     }
 
+    /// The chat answers through the shared planner: the worker reads
+    /// the workbook with the tools (here for the echo backend, which
+    /// takes the fixed pipeline) and the answer's citations become its
+    /// sources.
     #[test]
-    fn selection_context_names_neighbours_and_cells() {
-        let wb = gridtalk_graph::parse_delimited(
-            "demo",
-            "Sheet1",
-            "Item,Qty,Price,Total\nApples,2,3,=B2*C2\n",
-            ',',
+    fn the_chat_answers_through_the_shared_planner() {
+        let (mut app, dir) = app_with(
+            "chat-planner",
+            "Item,Qty,Price,Total\nApples,2,3,=B2*C2\nPears,4,5,=B3*C3\n",
         );
-        let (graph, violations) = gridtalk_graph::build_graph(&wb);
-        assert!(violations.is_empty());
-        let sel = RangeRef {
-            sheet: "Sheet1".into(),
-            r0: 0,
-            c0: 3,
-            r1: 1,
-            c1: 3,
-        };
-        let text = selection_context(&graph, &wb, &sel);
-        assert!(text.contains("selected Sheet1!D1:D2"), "{text}");
-        assert!(text.contains("depends_on"), "{text}");
-        assert!(text.contains("Qty"), "{text}");
-        assert!(text.contains("Total"), "{text}");
-        assert!(!text.contains("cut"), "{text}");
-        // A selection on no sheet and no node is no context at all.
-        let gone = RangeRef {
-            sheet: "Gone".into(),
-            ..sel.clone()
-        };
-        assert_eq!(selection_context(&graph, &wb, &gone), "");
-        // A selection longer than the 100-row cap says it was cut.
-        let rows: String = (0..250).map(|i| format!("{i}\n")).collect();
-        let tall = gridtalk_graph::parse_delimited("tall", "Sheet1", &format!("N\n{rows}"), ',');
-        let (graph, _) = gridtalk_graph::build_graph(&tall);
-        let sel = RangeRef {
-            sheet: "Sheet1".into(),
-            r0: 0,
-            c0: 0,
-            r1: 250,
-            c1: 0,
-        };
-        let text = selection_context(&graph, &tall, &sel);
-        assert!(text.contains("selection cut"), "{text}");
-        // And one cut mid-row by the 300-cell cap keeps that row's
-        // cells read so far.
-        let wide: String = (0..7)
-            .map(|c| format!("c{c}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let body: String = (0..50)
-            .map(|_| format!("{}\n", ["1"; 7].join(",")))
-            .collect();
-        let wide_wb =
-            gridtalk_graph::parse_delimited("wide", "Sheet1", &format!("{wide}\n{body}"), ',');
-        let (graph, _) = gridtalk_graph::build_graph(&wide_wb);
-        let sel = RangeRef {
-            sheet: "Sheet1".into(),
-            r0: 0,
-            c0: 0,
-            r1: 50,
-            c1: 6,
-        };
-        let text = selection_context(&graph, &wide_wb, &sel);
-        assert!(text.contains("selection cut"), "{text}");
-        // 300 cells = 42 full rows of 7 plus 6 cells of the 43rd.
-        let cell_lines: Vec<&str> = text
-            .lines()
-            .skip_while(|l| *l != "cells:")
-            .skip(1)
-            .filter(|l| !l.starts_with("..."))
-            .collect();
-        assert_eq!(cell_lines.len(), 43, "{text}");
-        assert_eq!(cell_lines[42].split(" | ").count(), 6, "{text}");
+        // A config file that is not there: the echo backend, never
+        // the machine's own configured model.
+        app.config_path = dir.join("none.toml").to_string_lossy().into_owned();
+        app.chat_input = "How is the Total worked out?".into();
+        app.ask();
+        assert!(app.chat_busy);
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        let mut steps = Vec::new();
+        while app.chat_busy {
+            assert!(started.elapsed().as_secs() < 60, "the chat worker hung");
+            app.poll_chat(&ctx);
+            if !app.chat_progress.is_empty() && steps.last() != Some(&app.chat_progress) {
+                steps.push(app.chat_progress.clone());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let answer = app.chat.last().unwrap();
+        assert_eq!(answer.role, "echo-local");
+        // The planner's reads reached the prompt the echo backend
+        // repeats: the column's formula with its address.
+        assert!(
+            answer.text.contains("Sheet1!D2 = B2*C2 -> 6"),
+            "{}",
+            answer.text
+        );
+        assert!(
+            answer.sources.iter().any(|r| r.a1() == "Sheet1!A1:D3"),
+            "{:?}",
+            answer.sources
+        );
+        assert!(app.chat_progress.is_empty() && app.chat_rx.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn answer_sources_lead_with_what_the_answer_cites() {
+        let wb = parse_delimited("d", "Sheet1", "Item,Qty\nApples,2\n", ',');
+        let citations: Vec<String> = [
+            "Sheet1!A1:B2",
+            "sheet1!B2",
+            "Gone!A1",
+            "not a range",
+            "Sheet1!A1:B2",
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+        let sources = answer_sources("Qty is 2 (Sheet1!B2).", &citations, &wb);
+        // The cited cell first, in the workbook's own spelling; the
+        // range that was only read after it; a sheet the workbook
+        // lacks, an unparseable string and a repeat left out.
+        let named: Vec<String> = sources.iter().map(|r| r.a1()).collect();
+        assert_eq!(named, ["Sheet1!B2:B2", "Sheet1!A1:B2"]);
+        // No more than the line can show.
+        let many: Vec<String> = (1..=20).map(|r| format!("Sheet1!A{r}")).collect();
+        assert_eq!(answer_sources("", &many, &wb).len(), MAX_ANSWER_SOURCES);
     }
 
     #[test]

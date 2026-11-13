@@ -6,7 +6,7 @@
 //! over the tasks and writes a CARD.md score report, for the echo
 //! backend (the floor) or the configured local model.
 
-use crate::investigate::{contains_word, investigate_with_context};
+use crate::investigate::{contains_bounded, contains_word, investigate_run, Ask, Run};
 use crate::tools::Tools;
 use gridtalk_graph::eval::{EvalCache, Value};
 use gridtalk_graph::lineage::Lineage;
@@ -420,6 +420,21 @@ pub fn judge_want(
     history: &[gridtalk_index::ChatTurn],
 ) -> bool {
     let answer = answer.to_lowercase();
+    let carried = carried_text(tool_results, question, history);
+    want.iter()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .any(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
+}
+
+/// The tool results as the judges read them: lower-cased, with the
+/// question, its stand-alone form and the history's questions taken
+/// out (a "no regions matched" result quotes the question back).
+fn carried_text(
+    tool_results: &str,
+    question: &str,
+    history: &[gridtalk_index::ChatTurn],
+) -> String {
     let mut carried = tool_results.to_lowercase();
     let standalone = gridtalk_index::standalone_query(question, history);
     for strip in std::iter::once(question)
@@ -431,10 +446,31 @@ pub fn judge_want(
             carried = carried.replace(&strip, " ");
         }
     }
-    want.iter()
+    carried
+}
+
+/// Whether the tool results held what the task wants, whatever the
+/// answer then made of it: one of its `want` strings, its
+/// `expected_text`, or its expected number. A task that failed with
+/// this true was read right and worded wrong; one that failed with
+/// it false never had the answer in front of the model.
+pub fn task_carried(task: &BenchTask, tool_results: &str) -> bool {
+    let carried = carried_text(tool_results, &task.question, &task.history);
+    let wants: Vec<String> = task
+        .want
+        .iter()
         .map(|w| w.trim().to_lowercase())
         .filter(|w| !w.is_empty())
-        .any(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
+        .collect();
+    if !wants.is_empty() {
+        return wants.iter().any(|w| contains_word(&carried, w));
+    }
+    match task.expected_text.as_deref().map(str::trim) {
+        Some(text) if !text.is_empty() => contains_word(&carried, &text.to_lowercase()),
+        _ => extract_numbers(&carried)
+            .iter()
+            .any(|n| (n - task.expected).abs() <= 1e-6 * task.expected.abs().max(1.0)),
+    }
 }
 
 /// Whether `rest` holds nothing but citations (any token with a `!`,
@@ -464,6 +500,12 @@ pub struct TaskResult {
     pub citation_hit: Option<bool>,
     pub latency_ms: f64,
     pub trail_steps: usize,
+    /// Whether the tool results held what the task wants
+    /// ([`task_carried`]).
+    pub carried: bool,
+    /// Model turns taken: 1 in the fixed pipeline, one per turn of
+    /// the tool loop.
+    pub model_turns: usize,
     /// Backend/investigation error, when the task could not run.
     pub error: Option<String>,
 }
@@ -471,41 +513,6 @@ pub struct TaskResult {
 /// Citation precision is scored on structured citations only: a
 /// cited *range* counts when it contains the expected cell. An
 /// answer merely restating the question's citation does not.
-/// `answer` mentions `needle` as a standalone reference, not as a
-/// substring of a longer ref (Sheet1!A1 inside Sheet1!A10:B20).
-pub(crate) fn contains_bounded(answer: &str, needle: &str) -> bool {
-    // ASCII case-insensitive (offsets preserved; matches the
-    // case-insensitive sheet comparison in citation_hit).
-    let answer = &answer.to_ascii_lowercase();
-    let needle = &needle.to_ascii_lowercase();
-    let boundary = |c: char| !(c.is_alphanumeric() || matches!(c, '!' | ':' | '.' | '$'));
-    let first_char_len = needle.chars().next().map_or(1, |c| c.len_utf8());
-    let mut from = 0;
-    while let Some(pos) = answer[from..].find(needle.as_str()) {
-        let start = from + pos;
-        let end = start + needle.len();
-        let before_ok = answer[..start].chars().next_back().is_none_or(boundary);
-        // Sentence punctuation (`... Sheet1!D2.` / `Sheet1!D2: 6`)
-        // ends a reference; a '.'/':' that continues a longer ref
-        // (Sheet1!A1:B2) does not.
-        let mut tail = answer[end..].chars();
-        let after_ok = match tail.next() {
-            None => true,
-            Some(c) if boundary(c) => true,
-            Some('.') | Some(':') => tail.next().is_none_or(|n| n.is_whitespace()),
-            Some(_) => false,
-        };
-        if before_ok && after_ok {
-            return true;
-        }
-        from = start + first_char_len;
-        if from >= answer.len() {
-            break;
-        }
-    }
-    false
-}
-
 fn citation_hit(citations: &[String], citation: &str, answer: &str) -> bool {
     // The cited range must also be *used* in the answer text —
     // retrieval alone does not count as citing.
@@ -581,9 +588,13 @@ pub fn run_bench(
     split: &str,
     max_steps: usize,
 ) -> Result<BenchReport, gridtalk_infer::InferError> {
-    run_bench_with(tasks, tools, backend, split, max_steps, None)
+    run_bench_with(tasks, tools, backend, split, max_steps, None, true)
 }
 
+/// Run and score `tasks`. `tool_loop` is the caller's say on whether
+/// the model may choose its own tool calls (the backend and the
+/// adapter have theirs, see `investigate_run`); `false` scores the
+/// fixed pipeline with the same backend, for comparison.
 pub fn run_bench_with(
     tasks: &[BenchTask],
     tools: &Tools,
@@ -591,55 +602,72 @@ pub fn run_bench_with(
     split: &str,
     max_steps: usize,
     adapter: Option<&gridtalk_adapter::Adapter>,
+    tool_loop: bool,
 ) -> Result<BenchReport, gridtalk_infer::InferError> {
     let mut results = Vec::new();
     for task in tasks.iter().filter(|t| split == "all" || t.split == split) {
         let started = std::time::Instant::now();
         // A backend error fails that one task; the run still
         // produces a (partial) CARD for the rest.
-        let (passed, cited, steps, error) = match investigate_with_context(
-            &task.question,
+        let outcome = investigate_run(
+            &Ask {
+                question: &task.question,
+                max_steps,
+                adapter,
+                sidecar: None,
+                history: &task.history,
+                selection: task.selection.as_deref(),
+            },
             tools,
             backend,
-            max_steps,
-            adapter,
-            None,
-            &task.history,
-            task.selection.as_deref(),
-        ) {
-            Ok(inv) => (
-                // A `want` list scores answers that are not a
-                // single value; below it, blank text falls back
-                // to the number, as hermit's score() does.
-                if task.want.iter().any(|w| !w.trim().is_empty()) {
-                    let tool_results = inv
-                        .trail
-                        .iter()
-                        .map(|s| s.result.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    judge_want(
-                        &inv.answer,
-                        &task.want,
-                        &tool_results,
-                        &task.question,
-                        &task.history,
-                    )
-                } else {
-                    match task.expected_text.as_deref() {
-                        Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
-                        _ => judge_number(&inv.answer, task.expected),
-                    }
-                },
-                task.citation
-                    .as_deref()
-                    .map(|c| citation_hit(&inv.citations, c, &inv.answer)),
-                inv.trail.len(),
-                None,
-            ),
+            &mut Run {
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                on_token: &mut |_| {},
+                on_step: &mut |_| {},
+                trace: None,
+                tool_loop,
+            },
+        );
+        let (passed, cited, steps, carried, model_turns, error) = match outcome {
+            Ok(inv) => {
+                let tool_results = inv
+                    .trail
+                    .iter()
+                    .map(|s| s.result.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    // A `want` list scores answers that are not a
+                    // single value; below it, blank text falls back
+                    // to the number, as hermit's score() does.
+                    if task.want.iter().any(|w| !w.trim().is_empty()) {
+                        judge_want(
+                            &inv.answer,
+                            &task.want,
+                            &tool_results,
+                            &task.question,
+                            &task.history,
+                        )
+                    } else {
+                        match task.expected_text.as_deref() {
+                            Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
+                            _ => judge_number(&inv.answer, task.expected),
+                        }
+                    },
+                    task.citation
+                        .as_deref()
+                        .map(|c| citation_hit(&inv.citations, c, &inv.answer)),
+                    inv.trail.len(),
+                    task_carried(task, &tool_results),
+                    inv.model_turns,
+                    None,
+                )
+            }
             Err(e) => (
                 false,
                 task.citation.as_ref().map(|_| false),
+                0,
+                false,
                 0,
                 Some(e.to_string()),
             ),
@@ -652,6 +680,8 @@ pub fn run_bench_with(
             citation_hit: cited,
             latency_ms: started.elapsed().as_secs_f64() * 1000.0,
             trail_steps: steps,
+            carried,
+            model_turns,
             error,
         });
     }
@@ -727,12 +757,43 @@ pub fn render_card_with_skipped(
             report.mean_latency(split).unwrap_or(0.0)
         ));
     }
+    // By kind of question, in order of first appearance. "Carried"
+    // counts the tasks whose tool results held the answer, so a kind
+    // that is carried and not passed was read right and worded
+    // wrong, and one that is not carried was never read.
+    let mut kinds: Vec<&str> = Vec::new();
+    for r in &report.results {
+        if !kinds.contains(&r.kind.as_str()) {
+            kinds.push(&r.kind);
+        }
+    }
+    out.push_str("\n## By kind of question\n\n");
+    out.push_str(
+        "Carried: the tool results held what the task wants, whatever the answer made of it.\n\n",
+    );
+    out.push_str("| Kind | Tasks | Passed | Carried | Mean tool calls | Mean model turns |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|\n");
+    for kind in kinds {
+        let rs: Vec<&TaskResult> = report.results.iter().filter(|r| r.kind == kind).collect();
+        let n = rs.len() as f64;
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {:.1} | {:.1} |\n",
+            esc(kind),
+            rs.len(),
+            rs.iter().filter(|r| r.passed).count(),
+            rs.iter().filter(|r| r.carried).count(),
+            rs.iter().map(|r| r.trail_steps).sum::<usize>() as f64 / n,
+            rs.iter().map(|r| r.model_turns).sum::<usize>() as f64 / n,
+        ));
+    }
     out.push_str("\n## Per-task results\n\n");
-    out.push_str("| Task | Kind | Split | Verdict | Cited | Trail steps |\n");
-    out.push_str("|---|---|---|---|---|---:|\n");
+    out.push_str(
+        "| Task | Kind | Split | Verdict | Carried | Cited | Trail steps | Model turns |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---:|---:|\n");
     for r in &report.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             esc(&r.id),
             esc(&r.kind),
             esc(&r.split),
@@ -743,12 +804,14 @@ pub fn render_card_with_skipped(
             } else {
                 "FAIL"
             },
+            if r.carried { "yes" } else { "no" },
             match r.citation_hit {
                 Some(true) => "yes",
                 Some(false) => "no",
                 None => "n/a",
             },
-            r.trail_steps
+            r.trail_steps,
+            r.model_turns
         ));
     }
     out
@@ -1038,6 +1101,8 @@ mod tests {
                     citation_hit: Some(true),
                     latency_ms: 0.0,
                     trail_steps: 1,
+                    carried: true,
+                    model_turns: 1,
                     error: None,
                 },
                 TaskResult {
@@ -1048,6 +1113,8 @@ mod tests {
                     citation_hit: None,
                     latency_ms: 0.0,
                     trail_steps: 1,
+                    carried: true,
+                    model_turns: 1,
                     error: None,
                 },
             ],

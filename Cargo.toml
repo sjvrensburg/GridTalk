@@ -5,6 +5,7 @@ members = [
     "crates/gridtalk-graph",
     "crates/gridtalk-index",
     "crates/gridtalk-infer",
+    "crates/gridtalk-agent",
     "crates/gridtalk-app",
     "crates/gridtalk-ui",
 ]

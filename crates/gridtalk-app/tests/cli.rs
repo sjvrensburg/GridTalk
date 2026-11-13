@@ -391,3 +391,50 @@ fn graph_and_view_print_each_node_with_its_range() {
     let view = stdout(&expect(&["view", &demo], 0));
     assert!(view.contains("  3 Item  Sheet1!A1:A4\n"), "{view}");
 }
+
+/// The tool loop's flags parse, and with the echo backend (which
+/// takes no tool turns) the fixed pipeline answers either way.
+#[test]
+fn tool_loop_flags_are_accepted() {
+    let demo = demo();
+    let dir = no_config().with_extension("trace");
+    std::fs::create_dir_all(&dir).unwrap();
+    let trace = dir.join("trace.jsonl");
+    let out = stdout(&expect(
+        &[
+            "investigate",
+            &demo,
+            "--trace",
+            trace.to_str().unwrap(),
+            "--no-tool-loop",
+            "what is the total?",
+        ],
+        0,
+    ));
+    assert!(out.contains("--- answer (echo-local) ---"), "{out}");
+    // The trace records the tool loop only, so here it is empty.
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "");
+    // A trace that cannot be written is unreadable input (3), found
+    // before any work is done.
+    let missing = dir.join("no-such-dir").join("trace.jsonl");
+    let err = expect(
+        &[
+            "investigate",
+            &demo,
+            "--trace",
+            missing.to_str().unwrap(),
+            "what is the total?",
+        ],
+        3,
+    );
+    assert!(stderr(&err).contains("trace.jsonl"), "{}", stderr(&err));
+    // The CARD breaks the score down by kind and says what was
+    // carried.
+    let card = stdout(&expect(&["bench", "run", &demo, "--no-tool-loop"], 0));
+    assert!(
+        card.contains("| Kind | Tasks | Passed | Carried | Mean tool calls | Mean model turns |"),
+        "{card}"
+    );
+    expect(&["bench", "run", &demo, "--no-tool-loop", "yes"], 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -46,6 +46,16 @@ pub struct Adapter {
     /// so a fresh adapter never reads less than none; an adapter
     /// whose `adapter.toml` says `ref_context = false` turns it off.
     pub ref_context: bool,
+    /// Let the model choose its own tool calls when the backend can
+    /// take tool turns (default). `tool_loop = false` keeps the
+    /// fixed pipeline: the planner reads, the model only words the
+    /// answer.
+    pub tool_loop: bool,
+    /// In the tool loop, make the model's first turn a tool call
+    /// (default): a small model otherwise answers from the question's
+    /// own words. `first_call = false` lets it answer at once from
+    /// what the planner already read.
+    pub first_call: bool,
     pub skills: Vec<Skill>,
 }
 
@@ -58,6 +68,8 @@ impl Adapter {
             top_k: 3,
             max_steps: 8,
             ref_context: true,
+            tool_loop: true,
+            first_call: true,
             skills: Vec::new(),
         }
     }
@@ -171,18 +183,38 @@ fn clean_value(raw: &str) -> String {
     v.split(" #").next().unwrap_or(v).trim().to_string()
 }
 
-fn parse_knobs(text: &str) -> (u32, usize, usize, bool) {
-    parse_knobs_seeded(text, 3, 8, true)
+/// The values `adapter.toml` holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Knobs {
+    version: u32,
+    top_k: usize,
+    max_steps: usize,
+    ref_context: bool,
+    tool_loop: bool,
+    first_call: bool,
 }
 
-fn parse_knobs_seeded(
-    text: &str,
-    seed_top_k: usize,
-    seed_max_steps: usize,
-    seed_ref_context: bool,
-) -> (u32, usize, usize, bool) {
-    let (mut version, mut top_k, mut max_steps) = (0u32, seed_top_k, seed_max_steps);
-    let mut ref_context = seed_ref_context;
+impl Default for Knobs {
+    fn default() -> Self {
+        Knobs {
+            version: 0,
+            top_k: 3,
+            max_steps: 8,
+            ref_context: true,
+            tool_loop: true,
+            first_call: true,
+        }
+    }
+}
+
+fn parse_knobs(text: &str) -> Knobs {
+    parse_knobs_seeded(text, Knobs::default())
+}
+
+/// The knobs in `text`; one it does not set keeps `seed`'s value
+/// (the version always starts at 0).
+fn parse_knobs_seeded(text: &str, seed: Knobs) -> Knobs {
+    let mut knobs = Knobs { version: 0, ..seed };
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with('[') {
@@ -193,35 +225,38 @@ fn parse_knobs_seeded(
             let warn = |key: &str| {
                 eprintln!("gridtalk: warning: malformed adapter knob {key}={raw:?}; using default");
             };
+            let switch = |key: &str, slot: &mut bool| match value.to_ascii_lowercase().as_str() {
+                "true" => *slot = true,
+                "false" => *slot = false,
+                _ => warn(key),
+            };
             match key.trim() {
                 "version" => match value.parse() {
-                    Ok(v) => version = v,
+                    Ok(v) => knobs.version = v,
                     Err(_) => warn("version"),
                 },
                 "top_k" => match value.parse::<usize>() {
-                    Ok(v) => top_k = v.clamp(1, 25),
+                    Ok(v) => knobs.top_k = v.clamp(1, 25),
                     Err(_) => warn("top_k"),
                 },
                 "max_steps" => match value.parse::<usize>() {
-                    Ok(v) => max_steps = v.clamp(1, 64),
+                    Ok(v) => knobs.max_steps = v.clamp(1, 64),
                     Err(_) => warn("max_steps"),
                 },
-                "ref_context" => match value.to_ascii_lowercase().as_str() {
-                    "true" => ref_context = true,
-                    "false" => ref_context = false,
-                    _ => warn("ref_context"),
-                },
+                "ref_context" => switch("ref_context", &mut knobs.ref_context),
+                "tool_loop" => switch("tool_loop", &mut knobs.tool_loop),
+                "first_call" => switch("first_call", &mut knobs.first_call),
                 _ => {}
             }
         }
     }
-    (version, top_k, max_steps, ref_context)
+    knobs
 }
 
 fn knob_text(a: &Adapter) -> String {
     format!(
-        "# GridTalk adapter knobs for {}\nversion = {}\ntop_k = {}\nmax_steps = {}\nref_context = {}\n",
-        a.name, a.version, a.top_k, a.max_steps, a.ref_context
+        "# GridTalk adapter knobs for {}\nversion = {}\ntop_k = {}\nmax_steps = {}\nref_context = {}\ntool_loop = {}\nfirst_call = {}\n",
+        a.name, a.version, a.top_k, a.max_steps, a.ref_context, a.tool_loop, a.first_call
     )
 }
 
@@ -296,31 +331,23 @@ fn load_skills(dir: &Path) -> Vec<Skill> {
     skills
 }
 
-fn load_from_dir(
-    dir: &Path,
-    name: &str,
-    version: u32,
-    top_k: usize,
-    max_steps: usize,
-    ref_context: bool,
-) -> Adapter {
+fn load_from_dir(dir: &Path, name: &str, version: u32, seed: Knobs) -> Adapter {
     // Per-version knobs win over the root pointer file (the root
     // file holds only the version pointer plus a convenience copy).
-    let (top_k, max_steps, ref_context) = match std::fs::read_to_string(dir.join("adapter.toml")) {
-        Ok(text) if !text.is_empty() => {
-            let (_, tk, ms, rc) = parse_knobs_seeded(&text, top_k, max_steps, ref_context);
-            (tk, ms, rc)
-        }
-        _ => (top_k, max_steps, ref_context),
+    let knobs = match std::fs::read_to_string(dir.join("adapter.toml")) {
+        Ok(text) if !text.is_empty() => parse_knobs_seeded(&text, seed),
+        _ => seed,
     };
     let rules = std::fs::read_to_string(dir.join("ADAPTER.md")).unwrap_or_default();
     Adapter {
         name: name.into(),
         version,
         rules,
-        top_k,
-        max_steps,
-        ref_context,
+        top_k: knobs.top_k,
+        max_steps: knobs.max_steps,
+        ref_context: knobs.ref_context,
+        tool_loop: knobs.tool_loop,
+        first_call: knobs.first_call,
         skills: load_skills(dir),
     }
 }
@@ -334,20 +361,21 @@ pub fn load_adapter(root: &Path, name: &str) -> Adapter {
     }
     let dir = adapter_dir(root, name);
     let knobs_text = std::fs::read_to_string(dir.join("adapter.toml")).unwrap_or_default();
-    let (version, top_k, max_steps, ref_context) = parse_knobs(&knobs_text);
+    let knobs = parse_knobs(&knobs_text);
+    let version = knobs.version;
     if version > 0 {
         let vdir = dir.join(format!("v{version}"));
         if vdir.is_dir() {
-            return load_from_dir(&vdir, name, version, top_k, max_steps, ref_context);
+            return load_from_dir(&vdir, name, version, knobs);
         }
         // Pointer names a version that is not on disk: report v0
         // rather than claiming a version we did not load.
         eprintln!(
             "gridtalk: warning: adapter {name} points at missing v{version}; loading root copies as v0"
         );
-        return load_from_dir(&dir, name, 0, top_k, max_steps, ref_context);
+        return load_from_dir(&dir, name, 0, knobs);
     }
-    load_from_dir(&dir, name, version, top_k, max_steps, ref_context)
+    load_from_dir(&dir, name, version, knobs)
 }
 
 pub fn list_adapters(root: &Path) -> Vec<String> {
@@ -568,7 +596,7 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
         current.version
     } else {
         let raw = std::fs::read_to_string(dir.join("adapter.toml"))
-            .map(|t| parse_knobs(&t).0)
+            .map(|t| parse_knobs(&t).version)
             .unwrap_or(0);
         let on_disk_max = std::fs::read_dir(&dir)
             .map(|entries| {
@@ -628,9 +656,10 @@ pub fn rollback(root: &Path, name: &str) -> Result<u32, String> {
             &dir.join(format!("v{target}")),
             name,
             target,
-            Adapter::empty(name).top_k,
-            Adapter::empty(name).max_steps,
-            false,
+            Knobs {
+                ref_context: false,
+                ..Knobs::default()
+            },
         )
     };
     pointer.version = target;
@@ -696,8 +725,12 @@ pub fn export_agents_md(adapter: &Adapter) -> String {
     out.push_str("answering questions about this workbook with GridTalk's\n");
     out.push_str("tools (`gridtalk tools`, MCP, or the desktop UI).\n\n");
     out.push_str(&format!(
-        "Harness knobs: top_k={}, max_steps={}, ref_context={}.\n",
-        adapter.top_k, adapter.max_steps, adapter.ref_context
+        "Harness knobs: top_k={}, max_steps={}, ref_context={}, tool_loop={}, first_call={}.\n",
+        adapter.top_k,
+        adapter.max_steps,
+        adapter.ref_context,
+        adapter.tool_loop,
+        adapter.first_call
     ));
     if !adapter.rules.trim().is_empty() {
         out.push_str("\n## Rules\n\n");

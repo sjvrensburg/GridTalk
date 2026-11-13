@@ -123,6 +123,20 @@ impl Lineage {
     }
 }
 
+/// A formula's shape with its position taken out: the R1C1 form of
+/// `expr` as it stands in the cell at 0-based (`row`, `col`). Two
+/// cells whose formulas were filled down from one another give the
+/// same text (`=B2*C2` in D2 and `=B3*C3` in D3 are both
+/// `RC[-2]*RC[-1]`), so a cell that breaks a column's pattern can be
+/// told apart. `None` when the formula does not parse.
+pub fn formula_pattern(expr: &str, row: usize, col: usize) -> Option<String> {
+    let parsed = gridcraft_formula::parse(expr.strip_prefix('=').unwrap_or(expr)).ok()?;
+    Some(gridcraft_formula::print_r1c1(
+        &parsed,
+        gridcraft_core::CellRef::new(row as u32, col as u32),
+    ))
+}
+
 fn bounds(r: GcRange) -> Bounds {
     (
         r.start.row as usize,

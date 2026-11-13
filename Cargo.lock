@@ -1759,10 +1759,23 @@ name = "gridtalk-adapter"
 version = "0.2.0"
 
 [[package]]
+name = "gridtalk-agent"
+version = "0.2.0"
+dependencies = [
+ "gridtalk-adapter",
+ "gridtalk-graph",
+ "gridtalk-index",
+ "gridtalk-infer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "gridtalk-app"
 version = "0.2.0"
 dependencies = [
  "gridtalk-adapter",
+ "gridtalk-agent",
  "gridtalk-graph",
  "gridtalk-index",
  "gridtalk-infer",
@@ -1812,6 +1825,7 @@ dependencies = [
  "eframe",
  "egui",
  "gridtalk-adapter",
+ "gridtalk-agent",
  "gridtalk-graph",
  "gridtalk-index",
  "gridtalk-infer",

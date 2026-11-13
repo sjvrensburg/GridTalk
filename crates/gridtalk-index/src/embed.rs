@@ -20,6 +20,7 @@ pub trait EmbeddingModel: Send + Sync {
 /// features, L2-normalised. Captures morphological similarity
 /// (e.g. "provision" / "provisions") with zero downloads and zero
 /// runtime dependencies — data never leaves the machine.
+#[derive(Clone)]
 pub struct NGramEmbedding {
     dim: usize,
 }
@@ -265,6 +266,7 @@ fn embed_chunks(
     )
 }
 
+#[derive(Clone)]
 pub struct VectorIndex {
     pub model_name: String,
     /// Minimum cosine for a hit. Calibrated for the signed
