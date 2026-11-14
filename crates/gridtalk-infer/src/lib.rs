@@ -61,7 +61,8 @@ pub mod transport;
 pub mod turns;
 
 pub use turns::{
-    Message, Role, ToolCall, ToolChoice, ToolSession, ToolSpec, Turn, TurnRequest, Usage,
+    Message, Role, StopReason, ToolCall, ToolChoice, ToolSession, ToolSpec, Turn, TurnRequest,
+    Usage,
 };
 
 pub mod llama_backend;
@@ -650,6 +651,16 @@ fn wire_message(message: &Message) -> serde_json::Value {
     }
 }
 
+/// Why a chat-completions reply stopped: `finish_reason: "length"`
+/// is a turn cut at its token limit.
+fn stop_reason(value: &serde_json::Value) -> StopReason {
+    if value["choices"][0]["finish_reason"] == "length" {
+        StopReason::Length
+    } else {
+        StopReason::Stop
+    }
+}
+
 impl ToolSession for OpenAiSession<'_> {
     fn turn(
         &mut self,
@@ -764,7 +775,12 @@ impl ToolSession for OpenAiSession<'_> {
                 .unwrap_or(0) as usize,
             generated_tokens: count("completion_tokens").unwrap_or(0),
         });
-        Ok(Turn { text, calls, usage })
+        Ok(Turn {
+            text,
+            calls,
+            usage,
+            stop: stop_reason(&value),
+        })
     }
 
     fn context_tokens(&self) -> Option<usize> {
@@ -824,6 +840,7 @@ impl OpenAiSession<'_> {
                 .unwrap_or(0) as usize,
             generated_tokens: count("completion_tokens").unwrap_or(0),
         });
+        turn.stop = stop_reason(&value);
         Ok(turn)
     }
 }
@@ -1295,6 +1312,11 @@ mod tests {
                 "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"length\"}]}"
                     .into(),
             ),
+            (
+                200,
+                "{\"choices\":[{\"message\":{\"content\":\"Three of the four\"},\"finish_reason\":\"length\"}]}"
+                    .into(),
+            ),
         ]);
         let backend = OpenAiCompatibleBackend {
             base_url: format!("http://127.0.0.1:{port}/v1"),
@@ -1364,6 +1386,7 @@ mod tests {
                 )?;
                 assert!(second.calls.is_empty());
                 assert_eq!(second.text, "It is 6 (Sheet1!B2).");
+                assert_eq!(second.stop, StopReason::Stop);
                 assert_eq!(streamed, "It is 6 (Sheet1!B2).");
                 // A turn spent before any reply is an error, not an
                 // empty answer.
@@ -1381,11 +1404,25 @@ mod tests {
                     matches!(&spent, Err(InferError::Http(m)) if m.contains("all 64 tokens")),
                     "{spent:?}"
                 );
+                // Some text and then the limit: the text is kept, and
+                // the turn says it was cut.
+                let cut = session.turn(
+                    &TurnRequest {
+                        messages: &messages,
+                        tools: &tools,
+                        choice: ToolChoice::None,
+                        max_tokens: 64,
+                    },
+                    &cancel,
+                    &mut |_| {},
+                )?;
+                assert_eq!(cut.text, "Three of the four");
+                assert_eq!(cut.stop, StopReason::Length);
                 Ok(())
             })
             .unwrap();
         let sent = server.join().unwrap();
-        assert_eq!(sent.len(), 4);
+        assert_eq!(sent.len(), 5);
         assert_eq!(sent[0]["tool_choice"], "required");
         assert_eq!(sent[1]["tool_choice"], "auto");
         assert_eq!(sent[2]["tool_choice"], "auto");

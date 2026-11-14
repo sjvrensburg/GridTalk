@@ -416,16 +416,12 @@ def _bounded(haystack: str, needle: str) -> bool:
     return False
 
 
-def _want_present(answer: str, want, tool_results: str, question: str, history=None) -> bool:
-    """Mirror of bench.rs `judge_want`: any one wanted string is in
-    the answer (case-blind, not flanked by word characters) and a
-    tool result carried it. The question and every history question
-    are stripped from the tool results first, because a no-match
-    result quotes back the condensed query built from them. bench.rs
-    strips that condensed query too; it is joined from these same
-    pieces (each history question cut to 500 characters), so
-    stripping the pieces strips it."""
-    answer = answer.lower()
+def _carried_text(tool_results: str, question: str, history=None) -> str:
+    """The tool results as bench.rs `carried_text` reads them:
+    lower-cased, with the question and every history question taken
+    out. bench.rs strips the condensed query too; it is joined from
+    these same pieces (each history question cut to 500 characters),
+    so stripping the pieces strips it."""
     carried = tool_results.lower()
     strips = [str(question)]
     for turn in history or []:
@@ -436,6 +432,17 @@ def _want_present(answer: str, want, tool_results: str, question: str, history=N
         s = s.strip().lower()
         if s:
             carried = carried.replace(s, " ")
+    return carried
+
+
+def _want_present(answer: str, want, tool_results: str, question: str, history=None) -> bool:
+    """Mirror of bench.rs `judge_want`: any one wanted string is in
+    the answer (case-blind, not flanked by word characters) and a
+    tool result carried it. The question and every history question
+    are stripped from the tool results first, because a no-match
+    result quotes back the condensed query built from them."""
+    answer = answer.lower()
+    carried = _carried_text(tool_results, question, history)
     for w in want or []:
         w = str(w).strip().lower()
         if w and _bounded(answer, w) and _bounded(carried, w):
@@ -443,19 +450,73 @@ def _want_present(answer: str, want, tool_results: str, question: str, history=N
     return False
 
 
+def _all_present(answer: str, want_all, tool_results: str, question: str, history=None) -> bool:
+    """Mirror of bench.rs `judge_want_all`: every non-blank wanted
+    string is in the answer and in a tool result."""
+    answer = answer.lower()
+    carried = _carried_text(tool_results, question, history)
+    for w in want_all or []:
+        w = str(w).strip().lower()
+        if w and not (_bounded(answer, w) and _bounded(carried, w)):
+            return False
+    return True
+
+
+# Mirrors of bench.rs DUMP_MIN_WORDS, DUMP_RUN and DUMP_SHARE_TENTHS.
+DUMP_MIN_WORDS = 60
+DUMP_RUN = 4
+DUMP_SHARE_TENTHS = 6
+
+
+def _is_dump(answer: str, tool_results: str) -> bool:
+    """Mirror of bench.rs `is_dump`: the answer is at least
+    DUMP_MIN_WORDS words and three-fifths or more of its words lie
+    in four-word runs the tool results also hold (white-space
+    words, case-blind), so it repeats the results back."""
+    words = answer.lower().split()
+    if len(words) < DUMP_MIN_WORDS:
+        return False
+    # The CLI prints a result's line breaks as " | " (see `run`), which
+    # the answer, printed as it is, does not have: leave them out.
+    theirs = [w for w in tool_results.lower().split() if w != "|"]
+    known = {tuple(theirs[i : i + DUMP_RUN]) for i in range(len(theirs) - DUMP_RUN + 1)}
+    copied = [False] * len(words)
+    for at in range(len(words) - DUMP_RUN + 1):
+        if tuple(words[at : at + DUMP_RUN]) in known:
+            for i in range(at, at + DUMP_RUN):
+                copied[i] = True
+    return sum(copied) * 10 >= len(words) * DUMP_SHARE_TENTHS
+
+
+def _nonblank(values) -> list[str]:
+    return [w for w in (values or []) if isinstance(w, str) and w.strip()]
+
+
 def score(task: dict, output: RunOutput) -> JudgeResult:
-    want = [w for w in (task.get("want") or []) if isinstance(w, str) and w.strip()]
-    if want:
-        # An answer that is not a single value (bench.rs `want`).
+    want = _nonblank(task.get("want"))
+    want_all = _nonblank(task.get("want_all"))
+    if want or want_all:
+        # An answer that is not a single value (bench.rs `judge_wanted`):
+        # not a dump of the tool results, one of `want` and all of
+        # `want_all`.
         extra = getattr(output, "extra", None) or {}
-        passed = _want_present(
-            str(output.output),
-            want,
-            str(extra.get("tool_results", "")),
-            str(task.get("question", "")),
-            task.get("history") if isinstance(task.get("history"), list) else None,
-        )
-        return _judged(task, output, passed, f"wanted any of {want!r} {'found' if passed else 'missing'}")
+        answer = str(output.output)
+        results = str(extra.get("tool_results", ""))
+        question = str(task.get("question", ""))
+        history = task.get("history") if isinstance(task.get("history"), list) else None
+        if _is_dump(answer, results):
+            passed, why = False, "the answer repeats the tool results"
+        else:
+            passed = (not want or _want_present(answer, want, results, question, history)) and (
+                not want_all or _all_present(answer, want_all, results, question, history)
+            )
+            parts = []
+            if want:
+                parts.append(f"any of {want!r}")
+            if want_all:
+                parts.append(f"all of {want_all!r}")
+            why = f"wanted {' and '.join(parts)} {'found' if passed else 'missing'}"
+        return _judged(task, output, passed, why)
     text = task.get("expected_text")
     if isinstance(text, str) and text.strip():
         # A text or boolean answer (bench.rs `expected_text`).
@@ -531,8 +592,13 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
     for row in rows:
         if not isinstance(row, dict) or not row.get("id") or "question" not in row:
             raise ValueError("each bench row needs id/question")
-        if "expected" not in row and not row.get("expected_text") and not row.get("want"):
-            raise ValueError("each bench row needs expected, expected_text or want")
+        if (
+            "expected" not in row
+            and not row.get("expected_text")
+            and not row.get("want")
+            and not row.get("want_all")
+        ):
+            raise ValueError("each bench row needs expected, expected_text, want or want_all")
         if not isinstance(row["id"], str) or not row["id"]:
             raise ValueError("bench task id must be a non-empty string")
         if (
@@ -554,6 +620,12 @@ def prepare_data(tasks_array_json: str, out_dir: str) -> None:
             or any(not isinstance(w, str) or not w.strip() for w in row["want"])
         ):
             raise ValueError(f"task {row['id']}: want must be a non-empty list of strings")
+        if row.get("want_all") is not None and (
+            not isinstance(row["want_all"], list)
+            or not row["want_all"]
+            or any(not isinstance(w, str) or not w.strip() for w in row["want_all"])
+        ):
+            raise ValueError(f"task {row['id']}: want_all must be a non-empty list of strings")
         if row.get("selection") is not None and (
             not isinstance(row["selection"], str) or "!" not in row["selection"]
         ):

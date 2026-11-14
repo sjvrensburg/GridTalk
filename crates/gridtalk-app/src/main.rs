@@ -465,6 +465,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                             cli::Flag::Value("--card"),
                             cli::Flag::Value("--adapter"),
                             cli::Flag::Switch("--no-tool-loop"),
+                            cli::Flag::Switch("--no-floor"),
                         ],
                         None,
                     )?;
@@ -520,8 +521,10 @@ fn run(args: &[String]) -> Result<(), CliError> {
                             // when the file omits it — a truncated
                             // hand-written task would score as a
                             // 0-task instead of being caught here.
-                            let blank_want =
-                                !t.want.is_empty() && t.want.iter().all(|w| w.trim().is_empty());
+                            let blank_want = !t.want.is_empty()
+                                && t.want.iter().all(|w| w.trim().is_empty())
+                                || !t.want_all.is_empty()
+                                    && t.want_all.iter().all(|w| w.trim().is_empty());
                             if blank_want {
                                 eprintln!(
                                     "gridtalk: warning: task {} has only blank want strings; they are ignored",
@@ -534,6 +537,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
                             );
                             let no_truth = !generated_kind
                                 && t.want.iter().all(|w| w.trim().is_empty())
+                                && t.want_all.iter().all(|w| w.trim().is_empty())
                                 && t.expected_text
                                     .as_deref()
                                     .is_none_or(|x| x.trim().is_empty())
@@ -568,8 +572,24 @@ fn run(args: &[String]) -> Result<(), CliError> {
                         !parsed.switch("--no-tool-loop"),
                     )
                     .map_err(|e| CliError::Backend(format!("bench run failed: {e}")))?;
-                    let card =
+                    let mut card =
                         bench::render_card_with_skipped(&report, tasks.len(), skipped_formulas);
+                    // The same tasks through the echo backend: what
+                    // retrieval alone earns, which a model's score is
+                    // read against.
+                    if !parsed.switch("--no-floor") && backend.name() != "echo-local" {
+                        let floor = bench::run_bench_with(
+                            &tasks,
+                            &toolset,
+                            &gridtalk_infer::EchoBackend,
+                            &split,
+                            bench_adapter.as_ref().map(|a| a.max_steps).unwrap_or(8),
+                            bench_adapter.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| CliError::Backend(format!("bench floor failed: {e}")))?;
+                        card.push_str(&bench::render_floor(&report, &floor));
+                    }
                     match parsed.flag("--card") {
                         Some(path) => {
                             std::fs::write(path, &card).map_err(|e| format!("{path}: {e}"))?;

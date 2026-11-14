@@ -10,7 +10,7 @@ local agent on a workbook shape *without retraining the model*.
 <config>/gridtalk/adapters/<name>/
   ADAPTER.md     learned rules (plain markdown, human-reviewable)
   adapter.toml   version pointer + knobs: top_k, max_steps, ref_context,
-                 tool_loop, first_call
+                 tool_loop, first_call, turn_tokens
   CARD.md        eval record appended every optimise round
   skills/*.md    optional skills; the first `Triggers: a, b` line
                  scopes a skill to matching questions (no line =
@@ -35,7 +35,12 @@ list; search hits and graph expansions do not count) and its reads
 reached the model whole; `false` lets the model answer at once from
 what the planner read in every case). In the tool loop `max_steps` bounds
 the model's calls; the planner's opening reads, at most four, come
-on top.
+on top. `turn_tokens` (default 1536, held to 64 to 32768) is the most a
+model turn may generate there: room for the call or the answer, and for
+the thinking a reasoning model does first. A turn that runs out before
+it writes anything fails the question, so raise it (4096, say) for such
+a model. The loop still holds a turn to a quarter of the backend's
+context window, so a small window leaves the conversation its room.
 
 Loading order: built-in prompt → adapter rules → matched skills
 → per-workbook sidecar. The sidecar is `<workbook>.gridtalk.md`,

@@ -44,6 +44,12 @@ pub struct BenchTask {
     /// precedence over `expected_text`/`expected` when non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub want: Vec<String>,
+    /// For an answer that must name several things ("which two
+    /// columns does it read?"): strings **all** of which the answer
+    /// must carry, each one also in a tool result, judged as `want`
+    /// is. May be used with `want`, and then both must hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub want_all: Vec<String>,
     /// Earlier turns of the conversation, for follow-up questions
     /// ("and what reads its Hrs column?"): the run condenses the
     /// question against them before searching.
@@ -274,6 +280,7 @@ pub fn generate_tasks_ex(
                 citation: Some(citation),
                 expected_text,
                 want: Vec::new(),
+                want_all: Vec::new(),
                 history: Vec::new(),
                 selection: None,
             }
@@ -427,6 +434,95 @@ pub fn judge_want(
         .any(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
 }
 
+/// Judge for [`BenchTask::want_all`]: every wanted string is in the
+/// answer and in a tool result, as [`judge_want`] reads them. Blank
+/// strings are ignored; with none left it is `true`.
+pub fn judge_want_all(
+    answer: &str,
+    want_all: &[String],
+    tool_results: &str,
+    question: &str,
+    history: &[gridtalk_index::ChatTurn],
+) -> bool {
+    let answer = answer.to_lowercase();
+    let carried = carried_text(tool_results, question, history);
+    want_all
+        .iter()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .all(|w| contains_word(&answer, &w) && contains_word(&carried, &w))
+}
+
+/// An answer shorter than this many words is never a dump.
+pub const DUMP_MIN_WORDS: usize = 60;
+/// Words in a run that counts as copied.
+const DUMP_RUN: usize = 4;
+/// Tenths of an answer's words that must be copied for it to be a dump.
+const DUMP_SHARE_TENTHS: usize = 6;
+
+/// Whether the answer is the tool results repeated back, not an
+/// answer made from them. A judge that passes any answer holding a
+/// wanted string that a tool result also held would pass a backend
+/// that prints its context (the echo backend scored 69% that way),
+/// so a `want` answer fails when it is at least [`DUMP_MIN_WORDS`]
+/// words long and three-fifths or more of its words lie in
+/// four-word runs that the tool results also hold (words split on
+/// white space, case-blind). Quoting a formula or two in a few
+/// sentences is far from that.
+pub fn is_dump(answer: &str, tool_results: &str) -> bool {
+    let answer = answer.to_lowercase();
+    let words: Vec<&str> = answer.split_whitespace().collect();
+    if words.len() < DUMP_MIN_WORDS {
+        return false;
+    }
+    let results = tool_results.to_lowercase();
+    let theirs: Vec<&str> = results.split_whitespace().collect();
+    let known: std::collections::HashSet<&[&str]> = theirs.windows(DUMP_RUN).collect();
+    // A word is copied when it lies in a run the results hold.
+    let mut copied = vec![false; words.len()];
+    for (at, run) in words.windows(DUMP_RUN).enumerate() {
+        if known.contains(run) {
+            copied[at..at + DUMP_RUN].iter_mut().for_each(|c| *c = true);
+        }
+    }
+    let copied = copied.iter().filter(|c| **c).count();
+    copied * 10 >= words.len() * DUMP_SHARE_TENTHS
+}
+
+/// Whether the task is scored by `want` or `want_all`.
+fn has_want(task: &BenchTask) -> bool {
+    task.want
+        .iter()
+        .chain(&task.want_all)
+        .any(|w| !w.trim().is_empty())
+}
+
+/// Judge a task scored by `want` and/or `want_all`: an answer that
+/// is a dump of the tool results fails ([`is_dump`]); otherwise any
+/// one `want` string and every `want_all` string must hold.
+pub fn judge_wanted(task: &BenchTask, answer: &str, tool_results: &str) -> bool {
+    if is_dump(answer, tool_results) {
+        return false;
+    }
+    let blank = |list: &[String]| list.iter().all(|w| w.trim().is_empty());
+    (blank(&task.want)
+        || judge_want(
+            answer,
+            &task.want,
+            tool_results,
+            &task.question,
+            &task.history,
+        ))
+        && (blank(&task.want_all)
+            || judge_want_all(
+                answer,
+                &task.want_all,
+                tool_results,
+                &task.question,
+                &task.history,
+            ))
+}
+
 /// The tool results as the judges read them: lower-cased, with the
 /// question, its stand-alone form and the history's questions taken
 /// out (a "no regions matched" result quotes the question back).
@@ -456,14 +552,16 @@ fn carried_text(
 /// it false never had the answer in front of the model.
 pub fn task_carried(task: &BenchTask, tool_results: &str) -> bool {
     let carried = carried_text(tool_results, &task.question, &task.history);
-    let wants: Vec<String> = task
-        .want
-        .iter()
-        .map(|w| w.trim().to_lowercase())
-        .filter(|w| !w.is_empty())
-        .collect();
-    if !wants.is_empty() {
-        return wants.iter().any(|w| contains_word(&carried, w));
+    let strings = |list: &[String]| -> Vec<String> {
+        list.iter()
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect()
+    };
+    let (wants, all) = (strings(&task.want), strings(&task.want_all));
+    if !wants.is_empty() || !all.is_empty() {
+        return (wants.is_empty() || wants.iter().any(|w| contains_word(&carried, w)))
+            && all.iter().all(|w| contains_word(&carried, w));
     }
     match task.expected_text.as_deref().map(str::trim) {
         Some(text) if !text.is_empty() => contains_word(&carried, &text.to_lowercase()),
@@ -640,14 +738,8 @@ pub fn run_bench_with(
                     // A `want` list scores answers that are not a
                     // single value; below it, blank text falls back
                     // to the number, as hermit's score() does.
-                    if task.want.iter().any(|w| !w.trim().is_empty()) {
-                        judge_want(
-                            &inv.answer,
-                            &task.want,
-                            &tool_results,
-                            &task.question,
-                            &task.history,
-                        )
+                    if has_want(task) {
+                        judge_wanted(task, &inv.answer, &tool_results)
                     } else {
                         match task.expected_text.as_deref() {
                             Some(text) if !text.trim().is_empty() => judge_text(&inv.answer, text),
@@ -786,14 +878,40 @@ pub fn render_card_with_skipped(
             rs.iter().map(|r| r.model_turns).sum::<usize>() as f64 / n,
         ));
     }
+    // Why tasks errored, most common first.
+    let mut reasons: Vec<(&'static str, usize)> = Vec::new();
+    for reason in report
+        .results
+        .iter()
+        .filter_map(|r| r.error.as_deref())
+        .map(error_reason)
+    {
+        match reasons.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, n)) => *n += 1,
+            None => reasons.push((reason, 1)),
+        }
+    }
+    if !reasons.is_empty() {
+        reasons.sort_by_key(|a| std::cmp::Reverse(a.1));
+        let total: usize = reasons.iter().map(|(_, n)| n).sum();
+        let list: Vec<String> = reasons
+            .iter()
+            .map(|(why, n)| format!("{why}: {n}"))
+            .collect();
+        out.push_str(&format!(
+            "\nERROR verdicts: {total} of {} ({}). They count as failures in the accuracy above.\n",
+            report.results.len(),
+            list.join("; ")
+        ));
+    }
     out.push_str("\n## Per-task results\n\n");
     out.push_str(
-        "| Task | Kind | Split | Verdict | Carried | Cited | Trail steps | Model turns |\n",
+        "| Task | Kind | Split | Verdict | Carried | Cited | Trail steps | Model turns | Error |\n",
     );
-    out.push_str("|---|---|---|---|---|---|---:|---:|\n");
+    out.push_str("|---|---|---|---|---|---|---:|---:|---|\n");
     for r in &report.results {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             esc(&r.id),
             esc(&r.kind),
             esc(&r.split),
@@ -811,7 +929,106 @@ pub fn render_card_with_skipped(
                 None => "n/a",
             },
             r.trail_steps,
-            r.model_turns
+            r.model_turns,
+            r.error.as_deref().map_or(String::new(), error_line),
+        ));
+    }
+    out
+}
+
+/// What kind of failure an error text names, for the CARD's count
+/// (the text itself is in the per-task table).
+pub fn error_reason(error: &str) -> &'static str {
+    let error = error.to_lowercase();
+    if error.contains("tokens of its turn") {
+        "ran out of tokens"
+    } else if error.contains("grammar") {
+        "grammar failure"
+    } else if error.contains("max_steps") || error.contains("step budget") {
+        "exceeded max_steps"
+    } else if error.contains("cancel") {
+        "cancelled"
+    } else if error.contains("http") || error.contains("endpoint") || error.contains("connect") {
+        "backend HTTP error"
+    } else if error.starts_with("engine unavailable") {
+        "engine error"
+    } else {
+        "other"
+    }
+}
+
+/// The first line of an error, cut to a length a table can hold.
+fn error_line(error: &str) -> String {
+    const MAX: usize = 100;
+    let first = error.lines().next().unwrap_or("").trim();
+    let mut line: String = first.chars().take(MAX).collect();
+    if first.chars().count() > MAX {
+        line.push('…');
+    }
+    esc(&line)
+}
+
+/// Compare a run with the echo backend's run of the same tasks. The
+/// echo backend answers by printing what the planner read, so what it
+/// scores is what retrieval alone earns; a model's score above it is
+/// the part answering added. `floor` is the echo run. Empty when
+/// `report` is the echo run itself.
+pub fn render_floor(report: &BenchReport, floor: &BenchReport) -> String {
+    if report.backend == floor.backend || floor.results.is_empty() {
+        return String::new();
+    }
+    let echo_passed = |id: &str| floor.results.iter().find(|f| f.id == id).map(|f| f.passed);
+    let mut gained: Vec<&str> = Vec::new();
+    let mut lost: Vec<&str> = Vec::new();
+    for r in &report.results {
+        match (r.passed, echo_passed(&r.id)) {
+            (true, Some(false)) => gained.push(&r.id),
+            (false, Some(true)) => lost.push(&r.id),
+            _ => {}
+        }
+    }
+    let mut out = String::from("\n## Against the echo floor\n\n");
+    out.push_str(
+        "The echo backend answers with what the planner read, so its score is what retrieval earns without a model.\n\n",
+    );
+    out.push_str("| Split | Tasks | This run | Echo | Passed where echo failed | Failed where echo passed |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|\n");
+    for split in ["train", "dev", "all"] {
+        let ids: Vec<&TaskResult> = report
+            .results
+            .iter()
+            .filter(|r| split == "all" || r.split == split)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let (mut up, mut down, mut echo) = (0usize, 0usize, 0usize);
+        for r in &ids {
+            let floor_passed = echo_passed(&r.id).unwrap_or(false);
+            echo += floor_passed as usize;
+            up += (r.passed && !floor_passed) as usize;
+            down += (!r.passed && floor_passed) as usize;
+        }
+        let n = ids.len() as f64;
+        let share = |k: usize| format!("{:.1}%", k as f64 / n * 100.0);
+        let this = ids.iter().filter(|r| r.passed).count();
+        out.push_str(&format!(
+            "| {split} | {} | {} | {} | {up} | {down} |\n",
+            ids.len(),
+            share(this),
+            share(echo)
+        ));
+    }
+    if !gained.is_empty() {
+        out.push_str(&format!(
+            "\nPassed where echo failed: {}\n",
+            gained.join(", ")
+        ));
+    }
+    if !lost.is_empty() {
+        out.push_str(&format!(
+            "\nFailed where echo passed: {}\n",
+            lost.join(", ")
         ));
     }
     out
@@ -1085,6 +1302,195 @@ mod tests {
         .unwrap();
         assert_eq!(old.citation.as_deref(), Some("Sheet1!B2"));
         assert!(old.want.is_empty());
+    }
+
+    fn task_with(want: &[&str], want_all: &[&str]) -> BenchTask {
+        BenchTask {
+            id: "w".into(),
+            kind: "column_reads".into(),
+            split: "dev".into(),
+            question: "What does the Total column read?".into(),
+            expected: 0.0,
+            citation: None,
+            expected_text: None,
+            want: want.iter().map(|w| w.to_string()).collect(),
+            want_all: want_all.iter().map(|w| w.to_string()).collect(),
+            history: Vec::new(),
+            selection: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_that_repeats_the_tool_results_is_a_dump() {
+        let results = "node 6 (Total Sheet1!D1:D4) <-contains- Sheet1 region Sheet1!A1:D4 \
+            -depends_on-> Qty Sheet1!B1:B4 -depends_on-> Price Sheet1!C1:C4 \
+            Sheet1!A2: Apples Sheet1!B2: 2 Sheet1!C2: 3 Sheet1!D2: 6 [=B2*C2] \
+            Sheet1!A3: Pears Sheet1!B3: 4 Sheet1!C3: 5 Sheet1!D3: 20 [=B3*C3] \
+            Sheet1!A4: Provision Sheet1!B4: 1 Sheet1!C4: 1200 Sheet1!D4: 1200 [=B4*C4] \\
+            Sheet1!A5: Plums Sheet1!B5: 7 Sheet1!C5: 2 Sheet1!D5: 14 [=B5*C5] \\
+            Sheet1!A6: Figs Sheet1!B6: 9 Sheet1!C6: 4 Sheet1!D6: 36 [=B6*C6]";
+        let task = task_with(&["Qty", "Price"], &[]);
+        // The echo backend's answer: a heading, then the results.
+        let echoed =
+            format!("Based on the workbook context:\nQuestion: q\n{results}\n(end of context)");
+        assert!(is_dump(&echoed, results));
+        assert!(!judge_wanted(&task, &echoed, results));
+        // A short answer quoting the results is not a dump, however
+        // much of it is copied.
+        let short = "Total reads Qty (Sheet1!B1:B4) and Price (Sheet1!C1:C4): Sheet1!D2 = B2*C2.";
+        assert!(!is_dump(short, results));
+        assert!(judge_wanted(&task, short, results));
+        // A long answer in the model's own words is not one either.
+        let own = "The Total column multiplies two other columns together row by row, \
+            so each Total is the Qty on that row times the Price on that row, as the \
+            formulas in Sheet1!D2:D4 show for all three rows of the table, where the \
+            first row is apples and the second is pears and the third a provision, and \
+            nothing else feeds into it, which is why the three figures are small";
+        assert!(own.split_whitespace().count() >= DUMP_MIN_WORDS);
+        assert!(!is_dump(own, results));
+        assert!(judge_wanted(&task, own, results));
+    }
+
+    #[test]
+    fn want_all_needs_every_string_and_both_lists_must_hold() {
+        let results = "-depends_on-> Qty Sheet1!B1:B4 -depends_on-> Price Sheet1!C1:C4";
+        let all = task_with(&[], &["Qty", "Price"]);
+        assert!(judge_wanted(&all, "It reads Qty and Price.", results));
+        // One of two is not enough, as it is for `want`.
+        assert!(!judge_wanted(&all, "It reads Qty.", results));
+        // Each string must also have come from a tool result.
+        assert!(!judge_wanted(&all, "It reads Qty and Discount.", results));
+        assert!(!judge_wanted(
+            &task_with(&[], &["Qty", "Discount"]),
+            "Qty and Discount",
+            results
+        ));
+        // With both lists, one `want` string and all of `want_all`.
+        let both = task_with(&["Price", "Cost"], &["Qty"]);
+        assert!(judge_wanted(&both, "Qty and Price.", results));
+        assert!(!judge_wanted(&both, "Price only.", results));
+        assert!(!judge_wanted(&both, "Qty only.", results));
+        assert!(has_want(&all));
+        assert!(!has_want(&task_with(&[" "], &[])));
+        // Carried: all of `want_all`, and one of `want`.
+        assert!(task_carried(&all, results));
+        assert!(!task_carried(
+            &task_with(&[], &["Qty", "Discount"]),
+            results
+        ));
+        assert!(task_carried(&both, results));
+        // The field round-trips and is optional.
+        let task: BenchTask = serde_json::from_str(
+            r#"{"id":"t","kind":"k","split":"dev","question":"q","want_all":["a","b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(task.want_all, ["a", "b"]);
+        assert!(!serde_json::to_string(&task_with(&["x"], &[]))
+            .unwrap()
+            .contains("want_all"));
+    }
+
+    fn result(id: &str, passed: bool, error: Option<&str>) -> TaskResult {
+        TaskResult {
+            id: id.into(),
+            kind: "k".into(),
+            split: "dev".into(),
+            passed,
+            citation_hit: None,
+            latency_ms: 0.0,
+            trail_steps: 1,
+            carried: true,
+            model_turns: 1,
+            error: error.map(String::from),
+        }
+    }
+
+    #[test]
+    fn the_card_says_why_a_task_errored() {
+        let report = BenchReport {
+            workbook: "w".into(),
+            backend: "llama".into(),
+            results: vec![
+                result("t1", true, None),
+                result(
+                    "t2",
+                    false,
+                    Some("http error: the model used all 1536 tokens of its turn before replying"),
+                ),
+                result(
+                    "t3",
+                    false,
+                    Some("http error: the model used all 1536 tokens of its turn before replying"),
+                ),
+                result(
+                    "t4",
+                    false,
+                    Some("http error: endpoint returned HTTP 500: boom\nsecond line"),
+                ),
+                result("t5", false, Some("something | odd")),
+            ],
+        };
+        let card = render_card(&report, 5);
+        assert!(
+            card.contains(
+                "ERROR verdicts: 4 of 5 (ran out of tokens: 2; backend HTTP error: 1; other: 1)."
+            ),
+            "{card}"
+        );
+        assert!(card.contains(
+            "| t2 | k | dev | ERROR | yes | n/a | 1 | 1 | http error: the model used all 1536 tokens of its turn before replying |"
+        ), "{card}");
+        // Only the first line, and the table stays a table.
+        assert!(
+            card.contains("| http error: endpoint returned HTTP 500: boom |"),
+            "{card}"
+        );
+        assert!(card.contains("| something \\| odd |"), "{card}");
+        // A task that did not error has an empty cell, and a run
+        // with no errors has no summary line.
+        assert!(
+            card.contains("| t1 | k | dev | PASS | yes | n/a | 1 | 1 |  |"),
+            "{card}"
+        );
+        let clean = BenchReport {
+            results: vec![result("t1", true, None)],
+            ..report
+        };
+        assert!(!render_card(&clean, 1).contains("ERROR verdicts"));
+    }
+
+    #[test]
+    fn a_run_is_compared_with_the_echo_floor_on_the_same_tasks() {
+        let run = BenchReport {
+            workbook: "w".into(),
+            backend: "llama".into(),
+            results: vec![
+                result("t1", true, None),
+                result("t2", true, None),
+                result("t3", false, None),
+                result("t4", false, None),
+            ],
+        };
+        let floor = BenchReport {
+            backend: "echo-local".into(),
+            results: vec![
+                result("t1", true, None),
+                result("t2", false, None),
+                result("t3", true, None),
+                result("t4", false, None),
+            ],
+            ..run.clone()
+        };
+        let text = render_floor(&run, &floor);
+        assert!(text.contains("## Against the echo floor"), "{text}");
+        assert!(
+            text.contains("| dev | 4 | 50.0% | 50.0% | 1 | 1 |"),
+            "{text}"
+        );
+        assert!(text.contains("Passed where echo failed: t2"), "{text}");
+        assert!(text.contains("Failed where echo passed: t3"), "{text}");
+        // The echo run has nothing to be compared with.
+        assert_eq!(render_floor(&floor, &floor), "");
     }
 
     #[test]

@@ -126,6 +126,24 @@ pub struct TurnRequest<'a> {
     pub max_tokens: usize,
 }
 
+/// Why a turn stopped generating.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StopReason {
+    /// The model finished: end of its turn, or a stop marker.
+    #[default]
+    Stop,
+    /// The turn reached its `max_tokens` with the model still
+    /// writing, so its text may end mid-sentence.
+    Length,
+}
+
+impl StopReason {
+    pub fn is_stop(&self) -> bool {
+        *self == StopReason::Stop
+    }
+}
+
 /// The model's reply: `calls` to run, or, when there are none, `text`
 /// as the answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +153,10 @@ pub struct Turn {
     /// What the turn cost, when the backend reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Why generation ended; [`StopReason::Length`] when the turn was
+    /// cut at its token limit.
+    #[serde(default, skip_serializing_if = "StopReason::is_stop")]
+    pub stop: StopReason,
 }
 
 /// Token counts of one turn.
@@ -441,6 +463,7 @@ pub fn parse_text_turn(text: &str, id: &str) -> Turn {
             text: strip_answer_mark(text).to_string(),
             calls: Vec::new(),
             usage: None,
+            stop: StopReason::Stop,
         };
     }
     // The first JSON value; a model without a grammar may add words
@@ -476,6 +499,7 @@ pub fn parse_text_turn(text: &str, id: &str) -> Turn {
         text: String::new(),
         calls: vec![call],
         usage: None,
+        stop: StopReason::Stop,
     }
 }
 
