@@ -159,7 +159,12 @@ case-insensitively, and cells must lie inside the sheet grid
   value disagrees with Gridcraft's recalculation; volatile functions
   such as `NOW()` are skipped), `external_reference` (reads another
   workbook) and `constant_in_formula` (a number other than 0 or 1
-  written into the formula's arithmetic, `=B5*1.05`). Cells of one
+  written into the formula's arithmetic, `=B5*1.05`), `typed_over_formula`
+  (a typed value in a column that is otherwise one formula filled
+  down) and `different_formula` (a formula whose shape differs from its
+  column's), the last two as `list_formulas` reports them, headings
+  left out, and listed after the errors and ahead of the other
+  warnings. Cells of one
   column with the same problem and detail are one issue. An optional
   `range` checks one sheet's range and leaves defined names out. At
   most 40 issues are listed; `errors`, `warnings` and `total` count

@@ -6,6 +6,8 @@ import json
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 spec = importlib.util.spec_from_file_location(
     "gridtalk_task", pathlib.Path(__file__).with_name("gridtalk_task.py")
@@ -124,6 +126,39 @@ def test_want_mirrors_rust_word_bounds_and_history_strip():
         history,
     )
     assert mod._want_present("It reads Labour.", ["Labour"], "region Labour!A1:C9", "q", history)
+
+
+def test_want_all_and_dumps_mirror_bench_rs():
+    results = "-depends_on-> Qty Sheet1!B1:B4 -depends_on-> Price Sheet1!C1:C4"
+    task = {"id": "t1", "question": "What does it read?", "want_all": ["Qty", "Price"]}
+
+    def judged(answer, task=task, results=results):
+        return mod.score(task, mod.RunOutput(output=answer, extra={"tool_results": results})).extra["passed"]
+
+    assert judged("It reads Qty and Price.")
+    assert not judged("It reads Qty.")
+    assert not judged("It reads Qty and Discount.")
+    both = {"id": "t2", "question": "What does it read?", "want": ["Price", "Cost"], "want_all": ["Qty"]}
+    assert judged("Qty and Price.", both)
+    assert not judged("Qty only.", both)
+    # The echo backend's answer, the tool results printed back, fails.
+    rows = " ".join(f"Sheet1!A{r}: Item{r} Sheet1!B{r}: {r} Sheet1!C{r}: {r + 1}" for r in range(2, 16))
+    echoed = f"Based on the workbook context:\nQuestion: q\n{results} {rows}\n(end of context)"
+    assert mod._is_dump(echoed, f"{results} {rows}")
+    assert not judged(echoed, {"id": "t3", "question": "What does it read?", "want": ["Qty"]}, f"{results} {rows}")
+    # A short answer quoting the results is not a dump.
+    assert not mod._is_dump("Total reads Qty (Sheet1!B1:B4) and Price (Sheet1!C1:C4).", results)
+
+
+def test_prepare_data_accepts_want_all_alone(tmp_path):
+    tasks = [{"id": "t-0001", "kind": "k", "question": "Which?", "want_all": ["a", "b"], "split": "dev"}]
+    src = tmp_path / "tasks.json"
+    src.write_text(json.dumps(tasks))
+    mod.prepare_data(src, tmp_path / "data")
+    tasks[0]["want_all"] = []
+    src.write_text(json.dumps(tasks))
+    with pytest.raises(ValueError):
+        mod.prepare_data(src, tmp_path / "data2")
 
 
 def _fake_gridtalk(tmp_path, monkeypatch, stdout):

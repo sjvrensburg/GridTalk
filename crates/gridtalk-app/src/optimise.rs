@@ -211,7 +211,7 @@ pub fn optimise_round(
      -> Result<(Option<f64>, Vec<TaskResult>), String> {
         let key = match adapter {
             Some(a) => format!(
-                "{}|{}|{}|{}|{}|{}|{}|{:?}",
+                "{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
                 split,
                 a.rules,
                 a.top_k,
@@ -219,6 +219,7 @@ pub fn optimise_round(
                 a.ref_context,
                 a.tool_loop,
                 a.first_call,
+                a.turn_tokens,
                 a.skills
                     .iter()
                     .map(|sk| format!("{}:{:?}:{}", sk.name, sk.triggers, sk.body))

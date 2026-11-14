@@ -26,7 +26,7 @@ pub(crate) struct Engine {
 impl Engine {
     pub(crate) fn new(snapshot: &WorkbookSnapshot) -> Self {
         let mut wb = to_gridcraft_workbook(snapshot);
-        poison_unparsed(&mut wb);
+        settle_unparsed(&mut wb);
         let mut calc = Calc::new();
         calc.recalc_all(&mut wb);
         Engine { wb, calc }
@@ -82,11 +82,20 @@ impl Engine {
     }
 }
 
-/// Give every formula Gridcraft cannot parse a `#NAME?` value. Such a
+/// Settle every formula Gridcraft cannot parse.
+///
+/// One that reads another workbook (`=[1]Parameters!$B$2`) cannot be
+/// calculated, because GridTalk cannot open that workbook, but the file
+/// holds the result it had when it was saved. That result becomes the
+/// cell's value, and what reads the cell is calculated from it, so a
+/// link does not turn everything downstream into an error. The `issues`
+/// tool still reports the link.
+///
+/// Any other formula that does not parse gets a `#NAME?` value. Such a
 /// formula never enters the dependency graph, so recalculation leaves
 /// its cached value in place, and its dependents would silently
 /// compute with that stale number. As an error it propagates instead.
-fn poison_unparsed(wb: &mut Workbook) {
+fn settle_unparsed(wb: &mut Workbook) {
     for i in 0..wb.sheets.len() {
         let unparsed: Vec<(CellRef, Cell)> = wb.sheets[i]
             .cells
@@ -99,7 +108,15 @@ fn poison_unparsed(wb: &mut Workbook) {
         }
         if let Some(sheet) = wb.sheet_mut(i) {
             for (at, mut cell) in unparsed {
-                cell.value = GcValue::Error(CellError::Name);
+                let linked = cell
+                    .formula
+                    .as_ref()
+                    .is_some_and(|f| !crate::issues::external_sheets(&f.text).is_empty());
+                if linked && cell.value != GcValue::Empty {
+                    cell.formula = None;
+                } else {
+                    cell.value = GcValue::Error(CellError::Name);
+                }
                 sheet.set_cell(at, cell);
             }
         }
@@ -192,6 +209,28 @@ mod tests {
         assert!(matches!(engine.value(0, 0, 0), Err(EvalError::Parse(_))));
         assert!(matches!(engine.value(0, 0, 1), Err(EvalError::Parse(_))));
         assert!(matches!(engine.value(0, 1, 1), Err(EvalError::Parse(_))));
+    }
+
+    #[test]
+    fn a_link_to_another_workbook_keeps_its_saved_value_for_what_reads_it() {
+        let wb = workbook(vec![
+            vec![
+                formula("[1]Parameters!$B$2", Some(1.25)),
+                formula("A1*100", Some(0.0)),
+                formula("B1+1", None),
+            ],
+            // A link whose result was not saved has nothing to offer.
+            vec![formula("[1]Parameters!$B$3", None), formula("A2*2", None)],
+        ]);
+        let mut engine = Engine::new(&wb);
+        assert_eq!(engine.value(0, 0, 0).unwrap(), Value::Number(1.25));
+        assert_eq!(engine.value(0, 0, 1).unwrap(), Value::Number(125.0));
+        assert_eq!(engine.value(0, 0, 2).unwrap(), Value::Number(126.0));
+        assert!(matches!(engine.value(0, 1, 0), Err(EvalError::Parse(_))));
+        assert!(matches!(engine.value(0, 1, 1), Err(EvalError::Parse(_))));
+        // What-if can change the linked value as it can any input.
+        engine.set_number(0, 0, 0, 2.0).unwrap();
+        assert_eq!(engine.value(0, 0, 2).unwrap(), Value::Number(201.0));
     }
 
     #[test]

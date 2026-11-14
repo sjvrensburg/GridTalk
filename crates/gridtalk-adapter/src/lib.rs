@@ -7,7 +7,7 @@
 //! ```text
 //! <name>/
 //!   ADAPTER.md     learned rules for the model (plain markdown)
-//!   adapter.toml   knobs: version, top_k, max_steps
+//!   adapter.toml   knobs: version, top_k, max_steps, turn_tokens, …
 //!   CARD.md        eval record, appended on every optimise round
 //!   skills/*.md    optional domain skills with `Triggers:` lines
 //!   v1/ v2/ …      committed versions (same files inside)
@@ -22,6 +22,12 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// What a model turn in the tool loop may generate when no adapter
+/// says otherwise.
+pub const DEFAULT_TURN_TOKENS: usize = 1_536;
+/// The bounds `turn_tokens` is held to.
+pub const TURN_TOKENS_RANGE: std::ops::RangeInclusive<usize> = 64..=32_768;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
@@ -58,6 +64,13 @@ pub struct Adapter {
     /// from the question's own words. `first_call = false` lets it answer at
     /// once from what the planner read in every case.
     pub first_call: bool,
+    /// In the tool loop, the most tokens one model turn may generate
+    /// (default [`DEFAULT_TURN_TOKENS`]). A reasoning model thinks
+    /// before it writes a call or an answer, and a turn that runs out
+    /// of tokens first has produced nothing; raise this for such a
+    /// model. The loop still holds a turn to a quarter of the
+    /// backend's context window.
+    pub turn_tokens: usize,
     pub skills: Vec<Skill>,
 }
 
@@ -72,6 +85,7 @@ impl Adapter {
             ref_context: true,
             tool_loop: true,
             first_call: true,
+            turn_tokens: DEFAULT_TURN_TOKENS,
             skills: Vec::new(),
         }
     }
@@ -194,6 +208,7 @@ struct Knobs {
     ref_context: bool,
     tool_loop: bool,
     first_call: bool,
+    turn_tokens: usize,
 }
 
 impl Default for Knobs {
@@ -205,6 +220,7 @@ impl Default for Knobs {
             ref_context: true,
             tool_loop: true,
             first_call: true,
+            turn_tokens: DEFAULT_TURN_TOKENS,
         }
     }
 }
@@ -248,6 +264,13 @@ fn parse_knobs_seeded(text: &str, seed: Knobs) -> Knobs {
                 "ref_context" => switch("ref_context", &mut knobs.ref_context),
                 "tool_loop" => switch("tool_loop", &mut knobs.tool_loop),
                 "first_call" => switch("first_call", &mut knobs.first_call),
+                "turn_tokens" => match value.parse::<usize>() {
+                    Ok(v) => {
+                        knobs.turn_tokens =
+                            v.clamp(*TURN_TOKENS_RANGE.start(), *TURN_TOKENS_RANGE.end())
+                    }
+                    Err(_) => warn("turn_tokens"),
+                },
                 _ => {}
             }
         }
@@ -257,8 +280,15 @@ fn parse_knobs_seeded(text: &str, seed: Knobs) -> Knobs {
 
 fn knob_text(a: &Adapter) -> String {
     format!(
-        "# GridTalk adapter knobs for {}\nversion = {}\ntop_k = {}\nmax_steps = {}\nref_context = {}\ntool_loop = {}\nfirst_call = {}\n",
-        a.name, a.version, a.top_k, a.max_steps, a.ref_context, a.tool_loop, a.first_call
+        "# GridTalk adapter knobs for {}\nversion = {}\ntop_k = {}\nmax_steps = {}\nref_context = {}\ntool_loop = {}\nfirst_call = {}\nturn_tokens = {}\n",
+        a.name,
+        a.version,
+        a.top_k,
+        a.max_steps,
+        a.ref_context,
+        a.tool_loop,
+        a.first_call,
+        a.turn_tokens
     )
 }
 
@@ -350,6 +380,7 @@ fn load_from_dir(dir: &Path, name: &str, version: u32, seed: Knobs) -> Adapter {
         ref_context: knobs.ref_context,
         tool_loop: knobs.tool_loop,
         first_call: knobs.first_call,
+        turn_tokens: knobs.turn_tokens,
         skills: load_skills(dir),
     }
 }
@@ -727,12 +758,13 @@ pub fn export_agents_md(adapter: &Adapter) -> String {
     out.push_str("answering questions about this workbook with GridTalk's\n");
     out.push_str("tools (`gridtalk tools`, MCP, or the desktop UI).\n\n");
     out.push_str(&format!(
-        "Harness knobs: top_k={}, max_steps={}, ref_context={}, tool_loop={}, first_call={}.\n",
+        "Harness knobs: top_k={}, max_steps={}, ref_context={}, tool_loop={}, first_call={}, turn_tokens={}.\n",
         adapter.top_k,
         adapter.max_steps,
         adapter.ref_context,
         adapter.tool_loop,
-        adapter.first_call
+        adapter.first_call,
+        adapter.turn_tokens
     ));
     if !adapter.rules.trim().is_empty() {
         out.push_str("\n## Rules\n\n");
@@ -835,6 +867,26 @@ mod tests {
         // Rolling back to v0 clears the rules entirely.
         assert_eq!(rollback(&root, "demo").unwrap(), 0);
         assert!(load_adapter(&root, "demo").rules.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn turn_tokens_is_a_knob_that_round_trips_and_is_bounded() {
+        assert_eq!(Adapter::empty("x").turn_tokens, DEFAULT_TURN_TOKENS);
+        assert_eq!(parse_knobs("").turn_tokens, DEFAULT_TURN_TOKENS);
+        assert_eq!(parse_knobs("turn_tokens = 4096").turn_tokens, 4_096);
+        assert_eq!(parse_knobs("turn_tokens = 1").turn_tokens, 64);
+        assert_eq!(parse_knobs("turn_tokens = 9999999").turn_tokens, 32_768);
+        assert_eq!(
+            parse_knobs("turn_tokens = lots").turn_tokens,
+            DEFAULT_TURN_TOKENS
+        );
+        let root = temp_root("turn-tokens");
+        let mut a = Adapter::empty("big");
+        a.turn_tokens = 4_096;
+        commit_version(&root, &a).unwrap();
+        assert_eq!(load_adapter(&root, "big").turn_tokens, 4_096);
+        assert!(export_agents_md(&a).contains("turn_tokens=4096"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

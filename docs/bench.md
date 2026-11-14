@@ -57,6 +57,23 @@ followed only by citations, punctuation and words such as
 fails) plus citation precision (did the answer
 cite the expected range?).
 
+The CARD also says why tasks errored: an `Error` column in the per-task
+table with the first line of the error, and, when any task errored, a
+line that counts the ERROR verdicts by reason (ran out of tokens,
+backend HTTP error, grammar failure, engine error, other). An ERROR
+counts as a failure in the accuracy. A final answer cut at the turn's
+token limit is marked "(answer cut at the turn's token limit)" and the
+trace's `response` event has `"stop": "length"`; `turn_tokens` in the
+adapter raises the limit.
+
+With a model configured, the run is followed by the same tasks through
+the echo backend, and the CARD ends with an "Against the echo floor"
+section: the model's accuracy and the echo's side by side per split, the
+tasks the model passed where echo failed and those it failed where echo
+passed. Echo answers with what the planner read, so its score is what
+retrieval earns; only the part above it is the model's. `--no-floor`
+leaves the section out.
+
 Bench runs execute sequentially: task order, trails and CARD
 rows are deterministic, and there is no parallelism to tune.
 
@@ -100,11 +117,19 @@ tasks.
 A task with no ground truth at all (no non-blank `want` or
 `expected_text`, and no `expected` for a hand-written kind) is
 judged against `expected`'s default of 0; `bench run` warns about
-each such task. Under the echo backend (no model configured) the
-answer is the prompt itself, so want tasks pass whenever retrieval
-found the string; the CARD says so, and those scores are not a
-model floor.
-A task scored by `want` or `expected_text` needs no `expected`,
+each such task. An answer that is mostly the tool results repeated back fails: a `want`
+answer of 60 words or more, three-fifths or more of whose words lie in
+four-word runs that the tool results also hold, is a dump (`is_dump`;
+`scripts/hermit` mirrors it). Without this the echo backend, whose
+answer is the prompt itself, passed every want task whose string the
+planner had read (69% on a benchmark of 145 tasks, above every model).
+Quoting a formula or two in a few sentences is nowhere near the limit.
+A task may carry `want_all` in place of `want`, or with it: every
+string in it must be in the answer and in a tool result (judged like
+`want`), where `want` needs only one. Use it for an answer that must
+name several things ("which two columns does it read?"). With both,
+one `want` string and all of `want_all` must hold.
+A task scored by `want`, `want_all` or `expected_text` needs no `expected`,
 and a task with no cell to cite ("How many sheets are there?")
 needs no `citation` — it simply stays out of citation precision
 (the CARD shows `n/a` where no task in a split carries one).

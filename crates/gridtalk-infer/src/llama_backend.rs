@@ -127,6 +127,9 @@ struct Generated {
     /// so not evaluated again.
     reused_tokens: usize,
     generated_tokens: usize,
+    /// Generation stopped at `max_tokens`, not at the model's end of
+    /// turn.
+    cut: bool,
     first_token_ms: Option<f64>,
     gen_ms: f64,
 }
@@ -338,6 +341,7 @@ impl<'m> LocalSession<'m> {
         let mut scanned_len = 0usize;
         let mut emitted_len = 0usize;
         let mut n_cur = prompt_tokens.len() as i32;
+        let mut ended = false;
 
         while generated < max_tokens {
             if cancel.load(Ordering::Relaxed) {
@@ -354,6 +358,7 @@ impl<'m> LocalSession<'m> {
             // Stop on EOG, and on end-of-turn (<|im_end|> etc.) which
             // some GGUFs do not register as EOG.
             if vocab.is_eog(token) || token == vocab.eot() || token == vocab.eos() {
+                ended = true;
                 break;
             }
             let piece = vocab.token_to_piece(token, true, None);
@@ -427,6 +432,7 @@ impl<'m> LocalSession<'m> {
             }
             generated += 1;
             if stop_marker {
+                ended = true;
                 break;
             }
             // Hold back a trailing "<|..." fragment that may
@@ -474,6 +480,7 @@ impl<'m> LocalSession<'m> {
             prompt_tokens: prompt_tokens.len(),
             reused_tokens: keep,
             generated_tokens: generated,
+            cut: !ended,
             first_token_ms,
             gen_ms: decode_started.elapsed().as_secs_f64() * 1000.0,
         })
@@ -547,6 +554,9 @@ impl ToolSession for LocalSession<'_> {
             reused_tokens: generated.reused_tokens,
             generated_tokens: generated.generated_tokens,
         });
+        if generated.cut {
+            turn.stop = turns::StopReason::Length;
+        }
         Ok(turn)
     }
 

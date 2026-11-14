@@ -32,16 +32,15 @@ use crate::tools::{parse_range_uncapped, ToolRequest, Tools};
 use gridtalk_graph::sheet_name_eq;
 use gridtalk_index::history_prompt;
 use gridtalk_infer::{
-    ChatBackend, InferError, Message, Role, ToolCall, ToolChoice, ToolSession, ToolSpec,
-    TurnRequest,
+    ChatBackend, InferError, Message, Role, StopReason, ToolCall, ToolChoice, ToolSession,
+    ToolSpec, Turn, TurnRequest,
 };
 use std::sync::atomic::Ordering;
 
 /// Most tool calls the planner makes before the model's first turn.
 pub const OPENING_STEPS: usize = 4;
-/// Tokens a turn may generate: room for the answer, and for the
-/// thinking a reasoning model behind an external endpoint does first.
-pub const ANSWER_TOKENS: usize = 1_536;
+/// Added to an answer the turn's token limit cut short.
+pub const CUT_NOTE: &str = "(answer cut at the turn's token limit)";
 /// The context assumed when the backend does not report one.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 16_384;
 /// Most characters of one tool result the model is sent.
@@ -342,6 +341,25 @@ fn conversation_chars(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// The tokens one turn may generate: `wanted`, held to a quarter of
+/// the window so a small window still leaves room for the
+/// conversation.
+fn turn_tokens_for(wanted: usize, window: usize) -> usize {
+    wanted.min(window / 4).max(64)
+}
+
+/// What an answer is when its turn ended at the token limit: the
+/// text with [`CUT_NOTE`] after it, which is also sent on to the
+/// consumer of the streamed text.
+fn finished_answer(turn: Turn, on_token: &mut dyn FnMut(&str)) -> String {
+    if turn.stop != StopReason::Length {
+        return turn.text;
+    }
+    let note = format!("\n\n{CUT_NOTE}");
+    on_token(&note);
+    format!("{}{note}", turn.text.trim_end())
+}
+
 /// What the loop has to stay inside.
 struct Budget {
     /// The backend's context, in tokens.
@@ -415,6 +433,12 @@ pub(crate) fn tool_loop(
         .map(|s| s.name.len() + s.description.len() + s.parameters.to_string().len())
         .sum();
     let first_call = ask.adapter.is_none_or(|a| a.first_call);
+    // What a turn may generate: room for the answer, and for the
+    // thinking a reasoning model does first (the adapter's
+    // `turn_tokens`).
+    let turn_tokens_knob = ask
+        .adapter
+        .map_or(gridtalk_adapter::DEFAULT_TURN_TOKENS, |a| a.turn_tokens);
     // Whether the planner read some of the workbook's content: a call
     // that ran and returned cells, formulas, figures, problems or the
     // sheet list. Such reads put tool results in front of the model,
@@ -438,7 +462,7 @@ pub(crate) fn tool_loop(
     };
     trace(serde_json::json!({
         "event": "session", "backend": backend.name(), "question": question,
-        "max_steps": ask.max_steps, "first_call": first_call, "opening_read": opening_read, "tools": specs,
+        "max_steps": ask.max_steps, "turn_tokens": turn_tokens_knob, "first_call": first_call, "opening_read": opening_read, "tools": specs,
         "opening": trail.iter().map(|s| serde_json::json!({
             "tool": s.tool, "args": s.args, "result": s.result
         })).collect::<Vec<_>>(),
@@ -457,7 +481,7 @@ pub(crate) fn tool_loop(
         // A turn may generate up to a quarter of a small window; the
         // rest, less a margin for the chat template, is the
         // conversation's.
-        let turn_tokens = ANSWER_TOKENS.min(window / 4).max(64);
+        let turn_tokens = turn_tokens_for(turn_tokens_knob, window);
         let budget = Budget {
             window,
             turn_tokens,
@@ -552,7 +576,7 @@ pub(crate) fn tool_loop(
             )?;
             trace(serde_json::json!({
                 "event": "response", "turn": model_turns, "text": turn.text,
-                "calls": turn.calls, "usage": turn.usage,
+                "calls": turn.calls, "usage": turn.usage, "stop": turn.stop,
             }));
             if let Some(usage) = turn.usage.filter(|u| u.prompt_tokens > 0) {
                 chars_per_token = (sent_chars as f64 / usage.prompt_tokens as f64).clamp(1.5, 5.0);
@@ -583,13 +607,13 @@ pub(crate) fn tool_loop(
                     ));
                     continue;
                 }
-                answer = turn.text;
+                answer = finished_answer(turn, &mut *run.on_token);
                 return Ok(());
             }
             if choice == ToolChoice::None {
                 // A call where only an answer was allowed: take what
                 // text there is.
-                answer = turn.text;
+                answer = finished_answer(turn, &mut *run.on_token);
                 return Ok(());
             }
             messages.push(Message::assistant(turn.text.clone(), turn.calls.clone()));
@@ -819,6 +843,8 @@ mod tests {
     struct Scripted {
         turns: Mutex<Vec<Turn>>,
         asked: Mutex<Vec<(ToolChoice, Vec<Message>)>>,
+        /// The `max_tokens` of each turn asked for.
+        turn_limits: Mutex<Vec<usize>>,
         context: Option<usize>,
         /// When set, the session counts a prompt's tokens itself, at
         /// this many characters to the token.
@@ -830,12 +856,16 @@ mod tests {
             Scripted {
                 turns: Mutex::new(turns.into_iter().rev().collect()),
                 asked: Mutex::new(Vec::new()),
+                turn_limits: Mutex::new(Vec::new()),
                 context: None,
                 chars_per_token: None,
             }
         }
         fn asked(&self) -> Vec<(ToolChoice, Vec<Message>)> {
             self.asked.lock().unwrap().clone()
+        }
+        fn turn_limits(&self) -> Vec<usize> {
+            self.turn_limits.lock().unwrap().clone()
         }
     }
 
@@ -853,6 +883,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((req.choice, req.messages.to_vec()));
+            self.0.turn_limits.lock().unwrap().push(req.max_tokens);
             // Like a real backend, a turn that may only answer skips
             // the calls the script still holds.
             let mut turns = self.0.turns.lock().unwrap();
@@ -913,6 +944,7 @@ mod tests {
             text: String::new(),
             calls,
             usage: None,
+            stop: StopReason::Stop,
         }
     }
     fn says(text: &str) -> Turn {
@@ -920,6 +952,14 @@ mod tests {
             text: text.into(),
             calls: Vec::new(),
             usage: None,
+            stop: StopReason::Stop,
+        }
+    }
+    /// An answer the turn's token limit cut off.
+    fn says_cut(text: &str) -> Turn {
+        Turn {
+            stop: StopReason::Length,
+            ..says(text)
         }
     }
 
@@ -1226,6 +1266,103 @@ mod tests {
     }
 
     #[test]
+    fn a_larger_turn_budget_reaches_the_backend_and_shrinks_the_conversation() {
+        let fixture = Fixture::new();
+        let script = |window: usize| {
+            let mut backend = Scripted::new(vec![
+                calls(vec![call(1, "workbook_info", serde_json::json!({}))]),
+                says("Four people are paid by the hour (Staff!A1:B5)."),
+            ]);
+            backend.context = Some(window);
+            backend.chars_per_token = Some(2);
+            backend
+        };
+        let ask = |backend: &Scripted, adapter: Option<&gridtalk_adapter::Adapter>| {
+            let (_, seen) = run_with(
+                &fixture,
+                backend,
+                "How is the labour cost worked out?",
+                8,
+                adapter,
+                true,
+            );
+            seen
+        };
+
+        // The default.
+        let backend = script(32_000);
+        ask(&backend, None);
+        assert_eq!(
+            backend.turn_limits(),
+            [gridtalk_adapter::DEFAULT_TURN_TOKENS; 2]
+        );
+
+        // The adapter's budget is what each turn is asked for, and
+        // what the conversation leaves room for.
+        let mut adapter = gridtalk_adapter::Adapter::empty("reasoning");
+        adapter.turn_tokens = 4_096;
+        let backend = script(32_000);
+        let seen = ask(&backend, Some(&adapter));
+        assert_eq!(backend.turn_limits(), [4_096; 2]);
+        assert_eq!(seen.events[0]["turn_tokens"], 4_096);
+        for (_, messages) in backend.asked() {
+            let tokens = conversation_chars(&messages) / 2;
+            assert!(tokens + 4_096 <= 32_000, "{tokens}");
+        }
+
+        // A small window still holds a turn to a quarter of itself.
+        let mut adapter = gridtalk_adapter::Adapter::empty("greedy");
+        adapter.turn_tokens = 32_768;
+        let backend = script(16_000);
+        ask(&backend, Some(&adapter));
+        assert_eq!(backend.turn_limits(), [4_000; 2]);
+        assert_eq!(turn_tokens_for(32_768, 100), 64);
+    }
+
+    #[test]
+    fn an_answer_cut_at_the_token_limit_says_so() {
+        let fixture = Fixture::new();
+        let backend = Scripted::new(vec![says_cut("The cost is hours times rate:\n- E1 is 3")]);
+        let (inv, seen) = run_with(
+            &fixture,
+            &backend,
+            "How is the labour cost worked out?",
+            8,
+            None,
+            true,
+        );
+        // The note comes right after the cut text, before any Sources.
+        let cut = format!("The cost is hours times rate:\n- E1 is 3\n\n{CUT_NOTE}");
+        assert!(inv.answer.starts_with(&cut), "{}", inv.answer);
+        // The streamed text matches the answer, note included.
+        assert_eq!(seen.tokens, cut);
+        let response = seen
+            .events
+            .iter()
+            .find(|e| e["event"] == "response")
+            .unwrap();
+        assert_eq!(response["stop"], "length");
+
+        // A whole answer has no note, and the trace says "stop".
+        let backend = Scripted::new(vec![says("Hours times rate (Labour!E2).")]);
+        let (inv, seen) = run_with(
+            &fixture,
+            &backend,
+            "How is the labour cost worked out?",
+            8,
+            None,
+            true,
+        );
+        assert_eq!(inv.answer, "Hours times rate (Labour!E2).");
+        let response = seen
+            .events
+            .iter()
+            .find(|e| e["event"] == "response")
+            .unwrap();
+        assert_eq!(response["stop"], "stop");
+    }
+
+    #[test]
     fn a_call_that_cannot_run_is_explained_to_the_model() {
         let fixture = Fixture::new();
         let backend = Scripted::new(vec![
@@ -1401,7 +1538,7 @@ mod tests {
         backend.context = Some(4_000);
         backend.chars_per_token = Some(2);
         let (inv, _) = run_with(&fixture, &backend, "What is the first cost?", 8, None, true);
-        let turn_tokens = ANSWER_TOKENS.min(4_000 / 4);
+        let turn_tokens = turn_tokens_for(gridtalk_adapter::DEFAULT_TURN_TOKENS, 4_000);
         for (_, messages) in backend.asked() {
             let tokens = conversation_chars(&messages) / 2;
             assert!(tokens + turn_tokens <= 4_000, "{tokens}");

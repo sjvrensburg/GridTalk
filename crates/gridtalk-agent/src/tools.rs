@@ -275,7 +275,7 @@ impl ToolRequest {
                         "additionalProperties": false
                     }},
                 }), &["range"])),
-                tool("issues", format!("Problems in the workbook's formulas, errors first: formulas that evaluate to an error (and those that only pass on an error from a cell they read), references to a missing sheet, #REF! left by deleted cells, broken defined names, values saved in the file that recalculation disagrees with, links to other workbooks, and numbers written into a formula's arithmetic (=B5*1.05). Cells with the same problem in one column are one issue. range: check one sheet's range only (e.g. Sheet1!A1:F200); absent checks the whole workbook. At most {MAX_ISSUES_LISTED} issues are listed; the counts cover all."), schema(serde_json::json!({"range": range}), &[])),
+                tool("issues", format!("Problems in the workbook's formulas, errors first: formulas that evaluate to an error (or only pass one on from a cell they read), references to a missing sheet, #REF! from deleted cells, broken defined names, saved values that recalculation disagrees with, links to other workbooks, numbers written into a formula's arithmetic (=B5*1.05), and, in a column of one formula filled down, a typed value (typed_over_formula) or a different formula (different_formula). Cells with the same problem in one column are one issue. range: check one sheet's range only (e.g. Sheet1!A1:F200); absent checks the whole workbook. At most {MAX_ISSUES_LISTED} issues are listed; the counts cover all."), schema(serde_json::json!({"range": range}), &[])),
                 tool("what_if", "Simulate setting one cell to a number and report a target cell before and after, e.g. cell Sheet1!B2, value 10, target Sheet1!D2. A cell without a sheet uses the target's sheet. Read-only: evaluates on a copy, never writes.".into(), schema(serde_json::json!({"cell": {"type": "string", "description": "The cell to override, e.g. Sheet1!B2"}, "value": {"type": "number"}, "target": {"type": "string", "description": "The cell to report, e.g. Sheet1!D2"}}), &["cell", "value", "target"])),
                 tool("graph_overview", "Graph nodes and edges (capped at 500 nodes / 2000 edges; see total_nodes/total_edges/truncated)".into(), schema(serde_json::json!({}), &[]))
             ]
@@ -1067,7 +1067,8 @@ impl<'a> Tools<'a> {
                 "result": typed, "error": error
             }));
         }
-        let (columns, mut text) = self.column_patterns(sheet, (r0, c0, r1, c1));
+        let patterns = self.column_patterns(sheet, (r0, c0, r1, c1));
+        let (columns, mut text) = self.render_patterns(sheet, &patterns);
         if !text.is_empty() {
             text.push('\n');
         }
@@ -1091,12 +1092,8 @@ impl<'a> Tools<'a> {
         &self,
         sheet: &gridtalk_graph::SheetSnapshot,
         (r0, c0, r1, c1): (usize, usize, usize, usize),
-    ) -> (Vec<serde_json::Value>, String) {
-        let quoted = quote_sheet(&sheet.name);
-        let address =
-            |r: usize, c: usize| format!("{quoted}!{}{}", gridtalk_graph::col_name(c), r + 1);
-        let mut columns = Vec::new();
-        let mut lines = Vec::new();
+    ) -> Vec<ColumnPattern> {
+        let mut found = Vec::new();
         for c in c0..=c1 {
             // (row, formula, shape) for each formula cell, top down.
             let cells: Vec<(usize, &str, String)> = (r0..=r1)
@@ -1129,35 +1126,62 @@ impl<'a> Tools<'a> {
             }
             let (pattern, same) = best;
             let example = cells.iter().find(|(_, _, s)| s == pattern).unwrap();
-            let other: Vec<String> = cells
+            let other: Vec<usize> = cells
                 .iter()
                 .filter(|(_, _, s)| s != pattern)
-                .map(|(r, _, _)| address(*r, c))
+                .map(|(r, _, _)| *r)
                 .collect();
             // The rows the column's formulas run over, widened to the
-            // graph column they sit in (below its heading), so a value
-            // typed over the first or last formula is still inside.
+            // table they sit in (below its heading row, when it has
+            // one), so a value typed over the first or last formula
+            // is still inside.
             let (first, last) = (cells[0].0, cells[cells.len() - 1].0);
             let (mut top, mut bottom) = (first, last);
-            if let Some(node) = self.graph.nodes.iter().find_map(|n| {
-                let r = n.range.as_ref()?;
-                (n.kind == gridtalk_graph::NodeKind::Column
-                    && sheet_name_eq(&r.sheet, &sheet.name)
-                    && r.c0 == c
-                    && r.c1 == c
-                    && r.r0 <= first
-                    && r.r1 >= last
-                    && r.r1 > r.r0)
-                    .then_some(r)
-            }) {
-                let heading = matches!(sheet.get_ref(node.r0, c), CellValue::Text(_));
-                top = top.min(node.r0 + usize::from(heading)).max(r0);
-                bottom = bottom.max(node.r1).min(r1);
+            let table = self
+                .graph
+                .regions
+                .iter()
+                .filter(|g| {
+                    let t = &g.range;
+                    sheet_name_eq(&t.sheet, &sheet.name)
+                        && t.c0 <= c
+                        && c <= t.c1
+                        && t.r0 <= first
+                        && t.r1 >= last
+                })
+                .min_by_key(|g| (g.range.r1 - g.range.r0 + 1) * (g.range.c1 - g.range.c0 + 1));
+            let (table_c0, table_c1) = table.map_or((c0, c1), |t| (t.range.c0, t.range.c1));
+            if let Some(table) = table {
+                let t = &table.range;
+                top = top
+                    .min(t.r0 + usize::from(table.header_row == Some(t.r0)))
+                    .max(r0);
+                bottom = bottom.max(t.r1).min(r1);
             }
+            // The heading rows at the top are not part of the column.
+            while top < first
+                && (text_heading_row(sheet, top, table_c0, table_c1)
+                    || numeric_heading_row(sheet, top, table_c0, table_c1))
+            {
+                top += 1;
+            }
+            let heading = (first > 0)
+                .then(|| sheet.get_ref(first - 1, c))
+                .and_then(|cell| match cell {
+                    CellValue::Text(text) => Some(text.trim().to_lowercase()),
+                    _ => None,
+                });
             let typed: Vec<(usize, String)> = (top..=bottom)
                 .filter_map(|r| match sheet.get_ref(r, c) {
                     CellValue::Empty | CellValue::Formula { .. } => None,
-                    value => Some((r, value.display())),
+                    value => {
+                        let heading_like = r < first
+                            && numeric_heading_row(sheet, r, table_c0, table_c1)
+                            || text_heading_row(sheet, r, table_c0, table_c1)
+                            || matches!(value, CellValue::Text(t)
+                                if heading.as_deref() == Some(t.trim().to_lowercase().as_str()));
+                        (!heading_like).then(|| (r, value.display()))
+                    }
                 })
                 .collect();
             // A column that is mostly typed values is mixed by
@@ -1167,25 +1191,54 @@ impl<'a> Tools<'a> {
             } else {
                 Vec::new()
             };
+            found.push(ColumnPattern {
+                col: c,
+                top,
+                bottom,
+                formulas: cells.len(),
+                same,
+                pattern: pattern.to_string(),
+                example: (example.0, example.1.to_string()),
+                other,
+                typed,
+            });
+        }
+        found
+    }
+
+    /// The `list_formulas` lines and JSON for [`ColumnPattern`]s.
+    fn render_patterns(
+        &self,
+        sheet: &gridtalk_graph::SheetSnapshot,
+        patterns: &[ColumnPattern],
+    ) -> (Vec<serde_json::Value>, String) {
+        let quoted = quote_sheet(&sheet.name);
+        let address =
+            |r: usize, c: usize| format!("{quoted}!{}{}", gridtalk_graph::col_name(c), r + 1);
+        let mut columns = Vec::new();
+        let mut lines = Vec::new();
+        for p in patterns {
+            let c = p.col;
             let span = gridtalk_graph::RangeRef {
                 sheet: sheet.name.clone(),
-                r0: top,
+                r0: p.top,
                 c0: c,
-                r1: bottom,
+                r1: p.bottom,
                 c1: c,
             }
             .a1();
+            let other: Vec<String> = p.other.iter().map(|r| address(*r, c)).collect();
             let mut line = format!(
                 "column {} ({span}): {} formulas, {} like {} = {}",
                 gridtalk_graph::col_name(c),
-                cells.len(),
-                if same == cells.len() {
+                p.formulas,
+                if p.same == p.formulas {
                     "all".to_string()
                 } else {
-                    same.to_string()
+                    p.same.to_string()
                 },
-                address(example.0, c),
-                example.1
+                address(p.example.0, c),
+                p.example.1
             );
             if !other.is_empty() {
                 line.push_str(&format!(
@@ -1193,8 +1246,9 @@ impl<'a> Tools<'a> {
                     listed(&other, MAX_PATTERN_EXCEPTIONS)
                 ));
             }
-            if !typed.is_empty() {
-                let cells: Vec<String> = typed
+            if !p.typed.is_empty() {
+                let cells: Vec<String> = p
+                    .typed
                     .iter()
                     .map(|(r, v)| format!("{} ({v})", address(*r, c)))
                     .collect();
@@ -1203,16 +1257,16 @@ impl<'a> Tools<'a> {
                     listed(&cells, MAX_PATTERN_EXCEPTIONS)
                 ));
             }
-            if other.is_empty() && typed.is_empty() {
+            if other.is_empty() && p.typed.is_empty() {
                 line.push_str("; no cell breaks the pattern");
             }
             lines.push(line);
             columns.push(serde_json::json!({
                 "column": gridtalk_graph::col_name(c), "range": span,
-                "formulas": cells.len(), "same_pattern": same, "pattern": pattern,
-                "example": {"address": address(example.0, c), "formula": example.1},
+                "formulas": p.formulas, "same_pattern": p.same, "pattern": p.pattern,
+                "example": {"address": address(p.example.0, c), "formula": p.example.1},
                 "other_formulas": other,
-                "typed_values": typed.iter().map(|(r, v)| serde_json::json!({"address": address(*r, c), "value": v})).collect::<Vec<_>>(),
+                "typed_values": p.typed.iter().map(|(r, v)| serde_json::json!({"address": address(*r, c), "value": v})).collect::<Vec<_>>(),
             }));
         }
         (columns, lines.join("\n"))
@@ -1515,7 +1569,7 @@ impl<'a> Tools<'a> {
     /// [`gridtalk_graph::issues`]), errors first, at most
     /// [`MAX_ISSUES_LISTED`] of them with their first cells.
     fn issues(&self, range: Option<&str>) -> ToolResult {
-        use gridtalk_graph::issues::{find_issues, IssueKind, Severity};
+        use gridtalk_graph::issues::{find_issues, Severity};
         let scope = match range {
             None => None,
             Some(range) => {
@@ -1538,13 +1592,15 @@ impl<'a> Tools<'a> {
             }
         };
         let found = find_issues(self.wb, self.calc.get(self.wb), scope);
+        let patterns = self.pattern_findings(scope);
         let errors = found
             .iter()
             .filter(|i| i.severity() == Severity::Error)
             .count();
-        let warnings = found.len() - errors;
+        let warnings = found.len() - errors + patterns.len();
+        let total = found.len() + patterns.len();
         let place = range.map_or("the workbook".to_string(), |r| r.to_string());
-        if found.is_empty() {
+        if total == 0 {
             return ToolResult::ok(
                 "issues",
                 serde_json::json!({"range": range, "errors": 0, "warnings": 0, "total": 0, "listed": 0, "truncated": false, "issues": []}),
@@ -1555,107 +1611,35 @@ impl<'a> Tools<'a> {
             "{errors} {} and {warnings} {} in {place}{}",
             if errors == 1 { "error" } else { "errors" },
             if warnings == 1 { "warning" } else { "warnings" },
-            if found.len() > MAX_ISSUES_LISTED {
-                format!(" (the first {MAX_ISSUES_LISTED} of {} listed)", found.len())
+            if total > MAX_ISSUES_LISTED {
+                format!(" (the first {MAX_ISSUES_LISTED} of {total} listed)")
             } else {
                 String::new()
             }
         )];
+        // Errors first, then a value or formula that breaks its
+        // column's pattern (likelier a fault than the other
+        // warnings), then the rest.
+        enum Listed<'a> {
+            Issue(&'a gridtalk_graph::issues::Issue),
+            Pattern(&'a PatternFinding),
+        }
+        let listing: Vec<Listed> = found
+            .iter()
+            .take(errors)
+            .map(Listed::Issue)
+            .chain(patterns.iter().map(Listed::Pattern))
+            .chain(found.iter().skip(errors).map(Listed::Issue))
+            .collect();
         let mut listed_issues = Vec::new();
         let mut saved_note = false;
-        for issue in found.iter().take(MAX_ISSUES_LISTED) {
-            let sheet = issue.sheet.as_deref().unwrap_or_default();
-            let address = |row: usize| {
-                issue
-                    .col
-                    .map(|col| gridtalk_graph::issues::cell_range(sheet, row, col, row))
-                    .unwrap_or_default()
+        for item in listing.iter().take(MAX_ISSUES_LISTED) {
+            let (line, entry) = match item {
+                Listed::Issue(issue) => render_issue(issue, &mut saved_note),
+                Listed::Pattern(finding) => render_pattern_finding(finding),
             };
-            let cells: Vec<serde_json::Value> = issue
-                .cells
-                .iter()
-                .take(MAX_ISSUE_CELLS_JSON)
-                .map(|cell| {
-                    let (result, error) = match &cell.result {
-                        Ok(v) => (Some(value_json(v)), None),
-                        Err(e) => (None, Some(e.to_string())),
-                    };
-                    serde_json::json!({
-                        "address": address(cell.row), "formula": cell.formula,
-                        "result": result, "error": error, "saved": cell.saved
-                    })
-                })
-                .collect();
-            let message = match issue.kind {
-                IssueKind::FormulaError => format!("evaluates to {}", issue.detail),
-                IssueKind::ErrorFromPrecedent => {
-                    format!("passes on an error from a cell it reads: {}", issue.detail)
-                }
-                IssueKind::MissingSheet => {
-                    format!("refers to a sheet the workbook lacks: {}", issue.detail)
-                }
-                IssueKind::DeletedReference => {
-                    "holds #REF!, a reference whose cells were deleted".to_string()
-                }
-                IssueKind::BrokenName => issue.detail.clone(),
-                IssueKind::SavedValueDiffers => {
-                    saved_note = true;
-                    "the value saved in the file differs from the recalculated one".to_string()
-                }
-                IssueKind::ExternalReference => format!(
-                    "reads another workbook ({}), which GridTalk cannot open; the value shown is the one the file saved",
-                    issue.detail
-                ),
-                IssueKind::ConstantInFormula => format!(
-                    "writes {} into the formula's arithmetic; an assumption written there cannot be changed or traced from a cell",
-                    issue.detail
-                ),
-            };
-            let place = match (&issue.name, issue.range()) {
-                (Some(name), _) => format!("name {name}"),
-                (None, Some(range)) if issue.cells.len() > 1 => {
-                    format!("{range} ({} cells)", issue.cells.len())
-                }
-                (None, Some(range)) => range,
-                (None, None) => String::new(),
-            };
-            let mut line = format!(
-                "{} {} {place}: {message}",
-                issue.severity().as_str(),
-                issue.kind.as_str()
-            );
-            let examples: Vec<String> = issue
-                .cells
-                .iter()
-                .map(|cell| {
-                    let mut text = format!("{} = {}", address(cell.row), cell.formula);
-                    if issue.kind == IssueKind::SavedValueDiffers {
-                        let now = match &cell.result {
-                            Ok(v) => v.display(),
-                            Err(e) => e.to_string(),
-                        };
-                        text.push_str(&format!(
-                            " saved {}, recalculates to {now}",
-                            cell.saved.as_deref().unwrap_or("nothing")
-                        ));
-                    } else if issue.kind == IssueKind::ExternalReference {
-                        if let Some(saved) = &cell.saved {
-                            text.push_str(&format!(" (saved {saved})"));
-                        }
-                    }
-                    text
-                })
-                .collect();
-            if !examples.is_empty() {
-                line.push_str(&format!("; {}", listed(&examples, MAX_ISSUE_CELLS_TEXT)));
-            }
             lines.push(line);
-            listed_issues.push(serde_json::json!({
-                "kind": issue.kind, "severity": issue.severity(), "sheet": issue.sheet,
-                "range": issue.range(), "name": issue.name, "detail": issue.detail,
-                "message": message, "count": issue.cells.len(), "cells": cells,
-                "cells_truncated": issue.cells.len() > MAX_ISSUE_CELLS_JSON,
-            }));
+            listed_issues.push(entry);
         }
         if saved_note {
             lines.push("(a saved value differs when the file was saved without recalculating, a cell it reads changed since, or Gridcraft computes a function differently from the program that saved it)".into());
@@ -1663,12 +1647,92 @@ impl<'a> Tools<'a> {
         ToolResult::ok(
             "issues",
             serde_json::json!({
-                "range": range, "errors": errors, "warnings": warnings, "total": found.len(),
-                "listed": listed_issues.len(), "truncated": found.len() > MAX_ISSUES_LISTED,
+                "range": range, "errors": errors, "warnings": warnings, "total": total,
+                "listed": listed_issues.len(), "truncated": total > MAX_ISSUES_LISTED,
                 "issues": listed_issues
             }),
             lines.join("\n"),
         )
+    }
+
+    /// What [`Tools::column_patterns`] finds across the workbook (or
+    /// the scope): the typed value in a column of formulas, and the
+    /// formula that is not its column's, one finding per column and
+    /// kind. Each table is checked as `list_formulas` would check it.
+    fn pattern_findings(
+        &self,
+        scope: Option<(usize, (usize, usize, usize, usize))>,
+    ) -> Vec<PatternFinding> {
+        let mut out: Vec<PatternFinding> = Vec::new();
+        for (index, sheet) in self.wb.sheets.iter().enumerate() {
+            if scope.is_some_and(|(only, _)| only != index) {
+                continue;
+            }
+            for table in self
+                .graph
+                .regions
+                .iter()
+                .filter(|g| sheet_name_eq(&g.range.sheet, &sheet.name))
+            {
+                let t = &table.range;
+                let (mut r0, mut c0, mut r1, mut c1) = (t.r0, t.c0, t.r1, t.c1);
+                if let Some((_, (sr0, sc0, sr1, sc1))) = scope {
+                    (r0, c0, r1, c1) = (r0.max(sr0), c0.max(sc0), r1.min(sr1), c1.min(sc1));
+                }
+                if r0 > r1 || c0 > c1 {
+                    continue;
+                }
+                for p in self.column_patterns(sheet, (r0, c0, r1, c1)) {
+                    let kinds = [
+                        (
+                            "different_formula",
+                            p.other
+                                .iter()
+                                .map(|&r| {
+                                    let CellValue::Formula { expr, .. } = sheet.get_ref(r, p.col)
+                                    else {
+                                        unreachable!("a different formula is a formula")
+                                    };
+                                    (r, expr.clone())
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        ("typed_over_formula", p.typed.clone()),
+                    ];
+                    for (kind, cells) in kinds {
+                        let finding = PatternFinding {
+                            kind,
+                            sheet: sheet.name.clone(),
+                            col: p.col,
+                            top: p.top,
+                            bottom: p.bottom,
+                            formulas: p.formulas,
+                            same: p.same,
+                            example: p.example.clone(),
+                            cells,
+                        };
+                        // Tables whose boxes overlap find a column twice.
+                        let seen = out.iter().any(|f| {
+                            f.kind == kind
+                                && f.col == finding.col
+                                && sheet_name_eq(&f.sheet, &finding.sheet)
+                                && f.cells == finding.cells
+                        });
+                        if !finding.cells.is_empty() && !seen {
+                            out.push(finding);
+                        }
+                    }
+                }
+            }
+        }
+        let sheet_order = |name: &str| {
+            self.wb
+                .sheets
+                .iter()
+                .position(|s| sheet_name_eq(&s.name, name))
+        };
+        out.sort_by_key(|f| (sheet_order(&f.sheet), f.col, f.cells[0].0, f.kind));
+        out
     }
 
     /// Legacy string interface kept for the planner's text context:
@@ -1836,6 +1900,266 @@ pub const MAX_ADDRESSED_CELLS: usize = 60;
 /// Fewest formulas in a column before `list_formulas` describes the
 /// column's pattern.
 pub const MIN_PATTERN_FORMULAS: usize = 3;
+
+/// One finding of [`Tools::pattern_findings`].
+struct PatternFinding {
+    /// `typed_over_formula` or `different_formula`.
+    kind: &'static str,
+    sheet: String,
+    col: usize,
+    /// The rows the column's pattern was checked over.
+    top: usize,
+    bottom: usize,
+    /// The column's formulas, and how many share its commonest shape.
+    formulas: usize,
+    same: usize,
+    /// A formula of the commonest shape: its row and text.
+    example: (usize, String),
+    /// The cells at fault, top down: row and its formula, or the
+    /// typed value as displayed.
+    cells: Vec<(usize, String)>,
+}
+
+impl PatternFinding {
+    fn range(&self) -> String {
+        gridtalk_graph::issues::cell_range(&self.sheet, self.top, self.col, self.bottom)
+    }
+
+    fn address(&self, row: usize) -> String {
+        gridtalk_graph::issues::cell_range(&self.sheet, row, self.col, row)
+    }
+
+    fn message(&self) -> String {
+        let like = format!(
+            "{} like {} = {}",
+            if self.same == self.formulas {
+                format!("all {}", self.formulas)
+            } else {
+                format!("{} of {}", self.same, self.formulas)
+            },
+            self.address(self.example.0),
+            self.example.1
+        );
+        if self.kind == "typed_over_formula" {
+            format!("a typed value, not a formula, in a column of formulas ({like})")
+        } else {
+            format!("a formula that differs from its column's ({like})")
+        }
+    }
+}
+
+/// The line and JSON an issue is listed as; sets `saved_note` when
+/// the issue is one the saved-values footnote explains.
+fn render_issue(
+    issue: &gridtalk_graph::issues::Issue,
+    saved_note: &mut bool,
+) -> (String, serde_json::Value) {
+    use gridtalk_graph::issues::IssueKind;
+    let sheet = issue.sheet.as_deref().unwrap_or_default();
+    let address = |row: usize| {
+        issue
+            .col
+            .map(|col| gridtalk_graph::issues::cell_range(sheet, row, col, row))
+            .unwrap_or_default()
+    };
+    let cells: Vec<serde_json::Value> = issue
+        .cells
+        .iter()
+        .take(MAX_ISSUE_CELLS_JSON)
+        .map(|cell| {
+            let (result, error) = match &cell.result {
+                Ok(v) => (Some(value_json(v)), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            serde_json::json!({
+                "address": address(cell.row), "formula": cell.formula,
+                "result": result, "error": error, "saved": cell.saved
+            })
+        })
+        .collect();
+    let message = match issue.kind {
+        IssueKind::FormulaError => format!("evaluates to {}", issue.detail),
+        IssueKind::ErrorFromPrecedent => {
+            format!("passes on an error from a cell it reads: {}", issue.detail)
+        }
+        IssueKind::MissingSheet => {
+            format!("refers to a sheet the workbook lacks: {}", issue.detail)
+        }
+        IssueKind::DeletedReference => {
+            "holds #REF!, a reference whose cells were deleted".to_string()
+        }
+        IssueKind::BrokenName => issue.detail.clone(),
+        IssueKind::SavedValueDiffers => {
+            *saved_note = true;
+            "the value saved in the file differs from the recalculated one".to_string()
+        }
+        IssueKind::ExternalReference => format!(
+            "reads another workbook ({}), which GridTalk cannot open; the value shown is the one the file saved",
+            issue.detail
+        ),
+        IssueKind::ConstantInFormula => format!(
+            "writes {} into the formula's arithmetic; an assumption written there cannot be changed or traced from a cell",
+            issue.detail
+        ),
+    };
+    let place = match (&issue.name, issue.range()) {
+        (Some(name), _) => format!("name {name}"),
+        (None, Some(range)) if issue.cells.len() > 1 => {
+            format!("{range} ({} cells)", issue.cells.len())
+        }
+        (None, Some(range)) => range,
+        (None, None) => String::new(),
+    };
+    let mut line = format!(
+        "{} {} {place}: {message}",
+        issue.severity().as_str(),
+        issue.kind.as_str()
+    );
+    let examples: Vec<String> = issue
+        .cells
+        .iter()
+        .map(|cell| {
+            let mut text = format!("{} = {}", address(cell.row), cell.formula);
+            if issue.kind == IssueKind::SavedValueDiffers {
+                let now = match &cell.result {
+                    Ok(v) => v.display(),
+                    Err(e) => e.to_string(),
+                };
+                text.push_str(&format!(
+                    " saved {}, recalculates to {now}",
+                    cell.saved.as_deref().unwrap_or("nothing")
+                ));
+            } else if issue.kind == IssueKind::ExternalReference {
+                if let Some(saved) = &cell.saved {
+                    text.push_str(&format!(" (saved {saved})"));
+                }
+            }
+            text
+        })
+        .collect();
+    if !examples.is_empty() {
+        line.push_str(&format!("; {}", listed(&examples, MAX_ISSUE_CELLS_TEXT)));
+    }
+    let entry = serde_json::json!({
+        "kind": issue.kind, "severity": issue.severity(), "sheet": issue.sheet,
+        "range": issue.range(), "name": issue.name, "detail": issue.detail,
+        "message": message, "count": issue.cells.len(), "cells": cells,
+        "cells_truncated": issue.cells.len() > MAX_ISSUE_CELLS_JSON,
+    });
+    (line, entry)
+}
+
+/// The line and JSON a [`PatternFinding`] is listed as.
+fn render_pattern_finding(finding: &PatternFinding) -> (String, serde_json::Value) {
+    let message = finding.message();
+    let items: Vec<String> = finding
+        .cells
+        .iter()
+        .map(|(row, text)| {
+            if finding.kind == "typed_over_formula" {
+                format!("{} ({text})", finding.address(*row))
+            } else {
+                format!("{} = {text}", finding.address(*row))
+            }
+        })
+        .collect();
+    let line = format!(
+        "warning {} {} ({} {}): {message}; {}",
+        finding.kind,
+        finding.range(),
+        finding.cells.len(),
+        if finding.cells.len() == 1 {
+            "cell"
+        } else {
+            "cells"
+        },
+        listed(&items, MAX_PATTERN_EXCEPTIONS)
+    );
+    let typed = finding.kind == "typed_over_formula";
+    let cells: Vec<serde_json::Value> = finding
+        .cells
+        .iter()
+        .take(MAX_ISSUE_CELLS_JSON)
+        .map(|(row, text)| {
+            serde_json::json!({
+                "address": finding.address(*row),
+                "formula": if typed { None } else { Some(text) },
+                "result": if typed { Some(text) } else { None },
+                "error": None::<String>, "saved": None::<String>,
+            })
+        })
+        .collect();
+    let entry = serde_json::json!({
+        "kind": finding.kind, "severity": "warning", "sheet": finding.sheet,
+        "range": finding.range(), "name": None::<String>, "detail": message,
+        "message": message, "count": finding.cells.len(), "cells": cells,
+        "cells_truncated": finding.cells.len() > MAX_ISSUE_CELLS_JSON,
+        "formulas": finding.formulas, "same_pattern": finding.same,
+        "example": {"address": finding.address(finding.example.0), "formula": finding.example.1},
+    });
+    (line, entry)
+}
+
+/// A column of formulas, and where it departs from its own pattern
+/// (see [`Tools::column_patterns`]). Rows are 0-based.
+struct ColumnPattern {
+    col: usize,
+    /// The rows the pattern is checked over.
+    top: usize,
+    bottom: usize,
+    formulas: usize,
+    /// How many formulas share the commonest shape.
+    same: usize,
+    pattern: String,
+    /// A formula of the commonest shape: its row and text.
+    example: (usize, String),
+    /// Rows holding a formula of another shape.
+    other: Vec<usize>,
+    /// Rows holding a typed value (as displayed) where the column
+    /// has formulas.
+    typed: Vec<(usize, String)>,
+}
+
+/// Whether row `r` of a table (columns `c0..=c1`) is a heading row:
+/// two or more text cells, no cell of another kind. Such a row sits
+/// above a table, over each section of one that is laid out in
+/// sections, or under a row of group headings; the text in it is not
+/// a value typed over a formula.
+fn text_heading_row(sheet: &gridtalk_graph::SheetSnapshot, r: usize, c0: usize, c1: usize) -> bool {
+    let mut texts = 0;
+    for c in c0..=c1 {
+        match sheet.get_ref(r, c) {
+            CellValue::Empty => {}
+            CellValue::Text(_) => texts += 1,
+            _ => return false,
+        }
+    }
+    texts >= 2
+}
+
+/// Whether row `r` of a table (columns `c0..=c1`) is a heading row of
+/// numbers (months 1 to 12, years): at least three numbers rising by
+/// one step, and nothing but text besides.
+fn numeric_heading_row(
+    sheet: &gridtalk_graph::SheetSnapshot,
+    r: usize,
+    c0: usize,
+    c1: usize,
+) -> bool {
+    let mut numbers: Vec<f64> = Vec::new();
+    for c in c0..=c1 {
+        match sheet.get_ref(r, c) {
+            CellValue::Empty | CellValue::Text(_) => {}
+            CellValue::Number(n) => numbers.push(*n),
+            _ => return false,
+        }
+    }
+    numbers.len() >= 3
+        && numbers[1] > numbers[0]
+        && numbers
+            .windows(2)
+            .all(|w| ((w[1] - w[0]) - (numbers[1] - numbers[0])).abs() < 1e-9)
+}
 /// Most cells named per kind of exception in a column's pattern line
 /// (the JSON lists them all).
 pub const MAX_PATTERN_EXCEPTIONS: usize = 12;
@@ -2515,6 +2839,134 @@ mod tests {
     /// `issues` over a CSV: an error that starts in one cell and is
     /// passed on, a number written into a column of formulas, the
     /// typed request with and without a range, and the legacy form.
+    /// A tools set over `csv`, and what a call of `request` says.
+    fn say(csv: &str, request: ToolRequest) -> ToolResult {
+        let wb = parse_delimited("w", "Sheet1", csv, ',');
+        let (g, _) = build_graph(&wb);
+        let hybrid = HybridIndex::build(&wb, &g);
+        Tools {
+            wb: &wb,
+            graph: &g,
+            hybrid: &hybrid,
+            calc: &gridtalk_graph::eval::EvalCache::new(),
+        }
+        .call(&request)
+    }
+
+    fn list(csv: &str, range: &str) -> ToolResult {
+        say(
+            csv,
+            ToolRequest::ListFormulas {
+                range: range.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn headings_are_not_values_typed_over_a_formula() {
+        // Group headings above the headings.
+        let grouped = list(
+            "Goods Received,Inputs,Inputs,Costs\nItem,Qty,Rate,Carriage\nA,2,3,=B3*C3\nB,4,5,=B4*C4\nC,6,7,=B5*C5\nD,8,9,=B6*C6\n",
+            "Sheet1!A1:D6",
+        );
+        assert_eq!(
+            grouped.text.lines().next().unwrap(),
+            "column D (Sheet1!D3:D6): 4 formulas, all like Sheet1!D3 = B3*C3; no cell breaks the pattern"
+        );
+        // A table in sections, each with its own heading row.
+        let sections = list(
+            "Hours report,,\nItem,Qty,Hours\nA,5,=B3*2\nB,6,=B4*2\nC,7,=B5*2\n,,\nItem,Qty,Hours\nD,5,=B8*2\nE,6,=B9*2\nF,7,=B10*2\n",
+            "Sheet1!A1:C10",
+        );
+        assert!(
+            sections
+                .text
+                .starts_with("column C (Sheet1!C3:C10): 6 formulas, all like Sheet1!C3 = B3*2; no cell breaks the pattern"),
+            "{}",
+            sections.text
+        );
+        // A heading row of numbers (months).
+        let months = list(
+            "Item,1,2,3\nA,5,6,7\nB,=B2*3,=C2*3,=D2*3\nC,=B3*3,=C3*3,=D3*3\nD,=B4*3,=C4*3,=D4*3\n",
+            "Sheet1!A1:D5",
+        );
+        assert!(
+            months
+                .text
+                .lines()
+                .take(3)
+                .all(|l| l.ends_with("no cell breaks the pattern")),
+            "{}",
+            months.text
+        );
+        // A value typed over a formula is still named, whatever the
+        // headings above it.
+        let typed = list(
+            "Goods Received,Inputs,Inputs,Costs\nItem,Qty,Rate,Carriage\nA,2,3,=B3*C3\nB,4,5,14\nC,6,7,=B5*C5\nD,8,9,=B6*C6\n",
+            "Sheet1!A1:D6",
+        );
+        assert_eq!(
+            typed.text.lines().next().unwrap(),
+            "column D (Sheet1!D3:D6): 3 formulas, all like Sheet1!D3 = B3*C3; a typed value, not a formula, in Sheet1!D4 (14)"
+        );
+    }
+
+    #[test]
+    fn issues_lists_what_list_formulas_finds_in_a_column() {
+        let csv = "Item,Qty,Cost\nA,5,=B2*2\nB,6,=B3*2\nC,7,9\nD,5,=B5*2\nE,6,=B6+1\n";
+        let res = say(csv, ToolRequest::Issues { range: None });
+        assert!(res.ok, "{}", res.text);
+        let issues = res.data["issues"].as_array().unwrap();
+        let typed = issues
+            .iter()
+            .find(|i| i["kind"] == "typed_over_formula")
+            .unwrap_or_else(|| panic!("{}", res.text));
+        assert_eq!(typed["range"], "Sheet1!C2:C6");
+        assert_eq!(typed["severity"], "warning");
+        assert_eq!(typed["count"], 1);
+        assert_eq!(typed["cells"][0]["address"], "Sheet1!C4");
+        assert_eq!(typed["cells"][0]["result"], "9");
+        let other = issues
+            .iter()
+            .find(|i| i["kind"] == "different_formula")
+            .unwrap_or_else(|| panic!("{}", res.text));
+        assert_eq!(other["cells"][0]["address"], "Sheet1!C6");
+        assert_eq!(other["cells"][0]["formula"], "B6+1");
+        assert!(
+            res.text.contains(
+                "warning typed_over_formula Sheet1!C2:C6 (1 cell): a typed value, not a formula, in a column of formulas (3 of 4 like Sheet1!C2 = B2*2)"
+            ),
+            "{}",
+            res.text
+        );
+        // They are counted with the warnings, and listed ahead of the
+        // other warnings (here a number written into the arithmetic).
+        let kinds: Vec<&str> = issues.iter().map(|i| i["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "typed_over_formula",
+                "different_formula",
+                "constant_in_formula"
+            ]
+        );
+        assert_eq!(res.data["warnings"], 3);
+        // A range limits them like the other checks.
+        let narrow = say(
+            csv,
+            ToolRequest::Issues {
+                range: Some("Sheet1!A1:B6".into()),
+            },
+        );
+        assert_eq!(narrow.data["total"], 0, "{}", narrow.text);
+        // A clean column, and a table's headings, are not findings.
+        let clean = say(
+            "Goods,Inputs,Inputs,Costs\nItem,Qty,Rate,Carriage\nA,2,3,=B3*C3\nB,4,5,=B4*C4\nC,6,7,=B5*C5\n",
+            ToolRequest::Issues { range: None },
+        );
+        assert_eq!(clean.text, "no issues found in the workbook");
+    }
+
     #[test]
     fn issues_lists_errors_first_and_groups_a_column() {
         let wb = parse_delimited(
@@ -2534,9 +2986,13 @@ mod tests {
         let res = tools.call(&ToolRequest::Issues { range: None });
         assert!(res.ok, "{}", res.text);
         assert_eq!(res.data["errors"], 1, "{}", res.text);
-        assert_eq!(res.data["warnings"], 2, "{}", res.text);
+        // The constant, the error D3 passes on, and D3 itself, whose
+        // formula is not its column's.
+        assert_eq!(res.data["warnings"], 3, "{}", res.text);
         let issues = res.data["issues"].as_array().unwrap();
         assert_eq!(issues[0]["kind"], "formula_error");
+        assert_eq!(issues[1]["kind"], "different_formula");
+        assert_eq!(issues[1]["cells"][0]["address"], "Calc!D3");
         assert_eq!(issues[0]["range"], "Calc!D2");
         assert_eq!(issues[0]["cells"][0]["address"], "Calc!D2");
         let net = issues
@@ -2550,7 +3006,7 @@ mod tests {
             .iter()
             .any(|i| i["kind"] == "error_from_precedent" && i["range"] == "Calc!D3"));
         let lines: Vec<&str> = res.text.lines().collect();
-        assert_eq!(lines[0], "1 error and 2 warnings in the workbook");
+        assert_eq!(lines[0], "1 error and 3 warnings in the workbook");
         assert!(
             lines[1].starts_with("error formula_error Calc!D2: evaluates to #DIV/0!"),
             "{}",
@@ -2582,10 +3038,10 @@ mod tests {
         );
         assert!(tools
             .execute("issues", "")
-            .starts_with("1 error and 2 warnings"));
+            .starts_with("1 error and 3 warnings"));
         assert!(tools
             .execute("issues", "range=Calc!D2:D4")
-            .starts_with("1 error and 1 warning in Calc!D2:D4"));
+            .starts_with("1 error and 2 warnings in Calc!D2:D4"));
     }
 
     /// `filter` on a table with a heading row: text compares ignoring

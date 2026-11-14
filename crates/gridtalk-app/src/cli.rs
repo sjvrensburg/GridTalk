@@ -103,9 +103,9 @@ pub const COMMANDS: &[Command] = &[
         name: "bench",
         usage: &[
             "gridtalk bench generate <file> [--out tasks.json] [--max <n>]",
-            "gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md] [--adapter <name>] [--no-tool-loop]",
+            "gridtalk bench run <file> [--tasks tasks.json] [--split train|dev|all] [--card CARD.md] [--adapter <name>] [--no-tool-loop] [--no-floor]",
         ],
-        summary: "Generate evaluation tasks from a workbook (default 100), or run them against the configured backend and print or write the CARD, which breaks the score down by kind of question and says how often the tool results carried the answer. --no-tool-loop scores the fixed pipeline with the same backend.",
+        summary: "Generate evaluation tasks from a workbook (default 100), or run them against the configured backend and print or write the CARD, which breaks the score down by kind of question, says how often the tool results carried the answer and why tasks errored, and compares the run with the echo backend on the same tasks (--no-floor leaves that out). --no-tool-loop scores the fixed pipeline with the same backend.",
     },
     Command {
         name: "optimise",
